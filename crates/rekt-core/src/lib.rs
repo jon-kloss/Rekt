@@ -4,6 +4,9 @@
 //! runtime. The money math that must be right lives here, where it can be
 //! tested exhaustively without mocks.
 
+pub mod market;
+pub mod portfolio;
+
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};

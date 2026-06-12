@@ -6,62 +6,221 @@
 <title>REKT</title>
 <style>
   :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
   body {
-    margin: 0; min-height: 100vh; display: grid; place-items: center;
-    background: #0d1117; color: #e6edf3;
+    margin: 0; background: #0d1117; color: #e6edf3;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
-  main { text-align: center; padding: 2rem; }
-  h1 { font-size: 3.5rem; letter-spacing: 0.3em; margin: 0 0 0.25rem; }
-  h1 span { color: #f85149; }
-  p.tag { color: #8b949e; margin: 0 0 2rem; }
-  form { display: flex; gap: 0.5rem; justify-content: center; }
-  input, button {
-    font: inherit; padding: 0.6rem 0.9rem; border-radius: 6px;
-    border: 1px solid #30363d; background: #161b22; color: inherit;
+  header {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 1.5rem;
+    padding: 1rem 1.5rem; border-bottom: 1px solid #21262d;
+    position: sticky; top: 0; background: #0d1117ee; backdrop-filter: blur(4px);
   }
-  input { width: 9ch; text-transform: uppercase; }
+  h1 { font-size: 1.6rem; letter-spacing: 0.25em; margin: 0; }
+  h1 span { color: #f85149; }
+  .stat { display: flex; flex-direction: column; }
+  .stat .label { font-size: 0.65rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.1em; }
+  .stat .val { font-size: 1.25rem; }
+  .badge {
+    margin-left: auto; align-self: center; font-size: 0.7rem;
+    padding: 0.25rem 0.6rem; border-radius: 999px; border: 1px solid #30363d; color: #8b949e;
+  }
+  .badge.open { color: #3fb950; border-color: #3fb95055; }
+  .badge.live { color: #58a6ff; border-color: #58a6ff55; }
+  main { padding: 1.5rem; display: grid; gap: 2rem; max-width: 1100px; margin: 0 auto; }
+  h2 { font-size: 0.8rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.15em; margin: 0 0 0.75rem; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th, td { text-align: right; padding: 0.45rem 0.6rem; border-bottom: 1px solid #21262d; white-space: nowrap; }
+  th { color: #8b949e; font-weight: normal; font-size: 0.7rem; text-transform: uppercase; }
+  th:first-child, td:first-child { text-align: left; }
+  .up { color: #3fb950; } .down { color: #f85149; } .muted { color: #8b949e; }
+  .empty { color: #8b949e; padding: 1.5rem 0; text-align: center; }
+  form.tx {
+    display: grid; gap: 0.5rem; align-items: end;
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  }
+  form.tx label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.65rem; color: #8b949e; text-transform: uppercase; }
+  input, select, button {
+    font: inherit; padding: 0.5rem 0.6rem; border-radius: 6px;
+    border: 1px solid #30363d; background: #161b22; color: inherit; min-width: 0;
+  }
   button { cursor: pointer; }
-  #out { margin-top: 1.5rem; min-height: 3rem; }
-  .px { font-size: 2rem; }
-  .up { color: #3fb950; }
-  .down { color: #f85149; }
-  .err { color: #d29922; max-width: 40ch; }
+  button.primary { background: #1f6feb; border-color: #1f6feb; }
+  button.danger { background: none; border: none; color: #f85149; padding: 0 0.4rem; }
+  #msg { min-height: 1.2rem; font-size: 0.8rem; color: #d29922; }
+  .csv { display: flex; gap: 0.75rem; align-items: center; font-size: 0.8rem; color: #8b949e; flex-wrap: wrap; }
+  .warn { color: #d29922; font-size: 0.8rem; }
 </style>
 </head>
 <body>
-<main>
+<header>
   <h1>R<span>E</span>KT</h1>
-  <p class="tag">Real-time Equity &amp; Capital Tracker — Phase 0 shell</p>
-  <form id="f">
-    <input id="sym" placeholder="AAPL" autocomplete="off" autofocus>
-    <button>quote</button>
-  </form>
-  <div id="out"></div>
+  <div class="stat"><span class="label">Equity</span><span class="val" id="equity">—</span></div>
+  <div class="stat"><span class="label">Day P&amp;L</span><span class="val" id="day">—</span></div>
+  <div class="stat"><span class="label">Unrealized</span><span class="val" id="unreal">—</span></div>
+  <div class="stat"><span class="label">Cash</span><span class="val" id="cash">—</span></div>
+  <span class="badge" id="market">…</span>
+  <span class="badge" id="feed">…</span>
+</header>
+<main>
+  <div id="warn" class="warn"></div>
+
+  <section>
+    <h2>Positions</h2>
+    <table>
+      <thead><tr>
+        <th>Symbol</th><th>Qty</th><th>Avg cost</th><th>Price</th>
+        <th>Mkt value</th><th>Day Δ</th><th>Total Δ</th><th>Realized</th>
+      </tr></thead>
+      <tbody id="positions"><tr><td colspan="8" class="empty">no positions yet — add a buy below</td></tr></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Add transaction</h2>
+    <form class="tx" id="txform">
+      <label>Kind
+        <select name="kind" id="kind">
+          <option value="buy">buy</option><option value="sell">sell</option>
+          <option value="deposit">deposit</option><option value="withdrawal">withdrawal</option>
+          <option value="dividend">dividend</option><option value="split">split</option>
+        </select>
+      </label>
+      <label>Symbol<input name="symbol" placeholder="AAPL" style="text-transform:uppercase"></label>
+      <label id="l-qty">Qty<input name="qty" inputmode="decimal"></label>
+      <label id="l-price">Price<input name="price" inputmode="decimal"></label>
+      <label>Fees<input name="fees" inputmode="decimal" placeholder="0"></label>
+      <label>When<input name="ts" type="datetime-local"></label>
+      <label>Note<input name="note"></label>
+      <button class="primary">add</button>
+    </form>
+    <div id="msg"></div>
+    <div class="csv">
+      <span>CSV import (<code>kind,symbol,qty,price,fees,taxes,ts,note</code>):</span>
+      <input type="file" id="csvfile" accept=".csv,text/csv">
+    </div>
+  </section>
+
+  <section>
+    <h2>Transactions</h2>
+    <table>
+      <thead><tr><th>When</th><th>Kind</th><th>Symbol</th><th>Qty</th><th>Price</th><th>Fees</th><th>Note</th><th></th></tr></thead>
+      <tbody id="txs"><tr><td colspan="8" class="empty">nothing yet</td></tr></tbody>
+    </table>
+  </section>
 </main>
 <script>
-const out = document.getElementById("out");
-document.getElementById("f").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const sym = document.getElementById("sym").value.trim().toUpperCase();
-  if (!sym) return;
-  out.textContent = "…";
-  try {
-    const res = await fetch(`/api/quote/${encodeURIComponent(sym)}`);
-    const body = await res.json();
-    if (!res.ok) {
-      out.innerHTML = `<div class="err">${body.error}</div>`;
-      return;
-    }
-    const dir = body.change.startsWith("-") ? "down" : "up";
-    const sign = dir === "up" ? "+" : "";
-    out.innerHTML =
-      `<div class="px">${body.symbol} $${body.price}</div>` +
-      `<div class="${dir}">${sign}${body.change} (${sign}${body.percent_change}%)</div>`;
-  } catch {
-    out.innerHTML = `<div class="err">server unreachable</div>`;
+const $ = (id) => document.getElementById(id);
+const fmt = (s, dash = "—") => {
+  if (s === null || s === undefined) return dash;
+  const n = Number(s);
+  return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+};
+const signed = (s) => {
+  if (s === null || s === undefined) return { text: "—", cls: "muted" };
+  const n = Number(s);
+  return { text: (n >= 0 ? "+" : "") + fmt(s), cls: n >= 0 ? "up" : "down" };
+};
+
+function renderPortfolio(payload) {
+  if (payload.type === "error") { $("warn").textContent = payload.error; return; }
+  $("warn").textContent = payload.portfolio.unpriced_symbols.length
+    ? `no price data for: ${payload.portfolio.unpriced_symbols.join(", ")} (equity excludes them)` : "";
+  const p = payload.portfolio;
+  $("equity").textContent = "$" + fmt(p.equity);
+  const day = signed(p.day_pnl); $("day").textContent = day.text; $("day").className = "val " + day.cls;
+  const un = signed(p.unrealized_pnl); $("unreal").textContent = un.text; $("unreal").className = "val " + un.cls;
+  $("cash").textContent = "$" + fmt(p.cash);
+  $("market").textContent = payload.market === "open" ? "market open" : "market closed";
+  $("market").className = "badge" + (payload.market === "open" ? " open" : "");
+  $("feed").textContent = payload.live_feed ? "live" : "no feed";
+  $("feed").className = "badge" + (payload.live_feed ? " live" : "");
+
+  const tbody = $("positions");
+  if (!p.positions.length) {
+    tbody.innerHTML = `<tr><td colspan="8" class="empty">no positions yet — add a buy below</td></tr>`;
+    return;
   }
+  tbody.innerHTML = p.positions.map((pos) => {
+    const day = signed(pos.day_pnl), tot = signed(pos.unrealized_pnl), re = signed(pos.realized_pnl);
+    const pct = pos.unrealized_pnl_pct === null ? "" : ` (${signed(pos.unrealized_pnl_pct).text}%)`;
+    return `<tr>
+      <td>${pos.symbol}</td><td>${pos.qty}</td><td>${fmt(pos.avg_cost)}</td>
+      <td>${fmt(pos.price)}</td><td>${fmt(pos.market_value)}</td>
+      <td class="${day.cls}">${day.text}</td>
+      <td class="${tot.cls}">${tot.text}${pct}</td>
+      <td class="${re.cls}">${re.text}</td>
+    </tr>`;
+  }).join("");
+}
+
+async function loadTxs() {
+  const txs = await (await fetch("/api/transactions")).json();
+  const tbody = $("txs");
+  if (!txs.length) { tbody.innerHTML = `<tr><td colspan="8" class="empty">nothing yet</td></tr>`; return; }
+  tbody.innerHTML = txs.map((t) => `<tr>
+    <td>${t.ts.slice(0, 16).replace("T", " ")}</td><td>${t.kind}</td>
+    <td>${t.symbol ?? ""}</td><td>${t.qty}</td><td>${fmt(t.price)}</td><td>${fmt(t.fees)}</td>
+    <td>${t.note}</td>
+    <td><button class="danger" data-id="${t.id}" title="delete">✕</button></td>
+  </tr>`).join("");
+}
+
+async function refresh() {
+  try {
+    renderPortfolio(await (await fetch("/api/portfolio")).json());
+    await loadTxs();
+  } catch { $("warn").textContent = "server unreachable"; }
+}
+
+// Live updates: websocket with polling fallback.
+let pollTimer = null;
+function connect() {
+  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/ws`);
+  ws.onmessage = (e) => renderPortfolio(JSON.parse(e.data));
+  ws.onopen = () => { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } };
+  ws.onclose = () => {
+    if (!pollTimer) pollTimer = setInterval(refresh, 15000);
+    setTimeout(connect, 3000);
+  };
+}
+
+$("txform").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  const body = { kind: f.get("kind") };
+  for (const k of ["symbol", "qty", "price", "fees", "note"]) {
+    const v = (f.get(k) || "").toString().trim();
+    if (v) body[k] = k === "symbol" ? v.toUpperCase() : v;
+  }
+  if (f.get("ts")) body.ts = new Date(f.get("ts")).toISOString();
+  const res = await fetch("/api/transactions", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  });
+  if (!res.ok) { $("msg").textContent = (await res.json()).error; return; }
+  $("msg").textContent = ""; e.target.reset();
+  refresh();
 });
+
+$("kind").addEventListener("change", () => {
+  const kind = $("kind").value;
+  $("l-qty").firstChild.textContent = kind === "split" ? "Ratio" : "Qty";
+  $("l-price").firstChild.textContent =
+    kind === "deposit" || kind === "withdrawal" || kind === "dividend" ? "Amount" : "Price";
+});
+
+$("csvfile").addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const res = await fetch("/api/import/csv", { method: "POST", body: await file.text() });
+  const json = await res.json();
+  $("msg").textContent = res.ok ? `imported ${json.imported} transactions` : json.error;
+  e.target.value = "";
+  refresh();
+});
+
+refresh();
+connect();
 </script>
 </body>
 </html>
