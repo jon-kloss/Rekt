@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>REKT</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    background: #0d1117; color: #e6edf3;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  main { text-align: center; padding: 2rem; }
+  h1 { font-size: 3.5rem; letter-spacing: 0.3em; margin: 0 0 0.25rem; }
+  h1 span { color: #f85149; }
+  p.tag { color: #8b949e; margin: 0 0 2rem; }
+  form { display: flex; gap: 0.5rem; justify-content: center; }
+  input, button {
+    font: inherit; padding: 0.6rem 0.9rem; border-radius: 6px;
+    border: 1px solid #30363d; background: #161b22; color: inherit;
+  }
+  input { width: 9ch; text-transform: uppercase; }
+  button { cursor: pointer; }
+  #out { margin-top: 1.5rem; min-height: 3rem; }
+  .px { font-size: 2rem; }
+  .up { color: #3fb950; }
+  .down { color: #f85149; }
+  .err { color: #d29922; max-width: 40ch; }
+</style>
+</head>
+<body>
+<main>
+  <h1>R<span>E</span>KT</h1>
+  <p class="tag">Real-time Equity &amp; Capital Tracker — Phase 0 shell</p>
+  <form id="f">
+    <input id="sym" placeholder="AAPL" autocomplete="off" autofocus>
+    <button>quote</button>
+  </form>
+  <div id="out"></div>
+</main>
+<script>
+const out = document.getElementById("out");
+document.getElementById("f").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const sym = document.getElementById("sym").value.trim().toUpperCase();
+  if (!sym) return;
+  out.textContent = "…";
+  try {
+    const res = await fetch(`/api/quote/${encodeURIComponent(sym)}`);
+    const body = await res.json();
+    if (!res.ok) {
+      out.innerHTML = `<div class="err">${body.error}</div>`;
+      return;
+    }
+    const dir = body.change.startsWith("-") ? "down" : "up";
+    const sign = dir === "up" ? "+" : "";
+    out.innerHTML =
+      `<div class="px">${body.symbol} $${body.price}</div>` +
+      `<div class="${dir}">${sign}${body.change} (${sign}${body.percent_change}%)</div>`;
+  } catch {
+    out.innerHTML = `<div class="err">server unreachable</div>`;
+  }
+});
+</script>
+</body>
+</html>
