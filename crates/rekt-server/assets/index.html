@@ -278,8 +278,9 @@ function renderPortfolio(payload) {
   $("cash").textContent = "$" + fmt(p.cash);
   $("market").textContent = payload.market === "open" ? "market open" : "market closed";
   $("market").className = "badge" + (payload.market === "open" ? " open" : "");
-  $("feed").textContent = payload.live_feed ? "live" : "no feed";
-  $("feed").className = "badge" + (payload.live_feed ? " live" : "");
+  const quotes = payload.quotes ?? (payload.live_feed ? "stream" : "none");
+  $("feed").textContent = quotes === "stream" ? "live" : quotes === "poll" ? "polling" : "no feed";
+  $("feed").className = "badge" + (quotes === "stream" ? " live" : "");
 
   const tbody = $("positions");
   renderDonut(p.positions);
@@ -326,7 +327,7 @@ function sigBadges(sig) {
     parts.push(`<span class="${v >= 0 ? "up" : "down"}" title="vs 50-day SMA">${v >= 0 ? "▲" : "▼"}50d ${esc(sig.vs_sma50_pct)}%</span>`);
   }
   if (sig.drawdown_pct !== null && sig.drawdown_pct !== undefined && Number(sig.drawdown_pct) >= 20) {
-    parts.push(`<span class="down" title="max drawdown (1y window)">DD ${esc(sig.drawdown_pct)}%</span>`);
+    parts.push(`<span class="down" title="max drawdown (last 250 trading days)">DD ${esc(sig.drawdown_pct)}%</span>`);
   }
   return parts.join(" ") || `<span class="muted">—</span>`;
 }
@@ -367,7 +368,8 @@ async function loadHistory() {
     const set = (id, v, money) => {
       const el = $(id);
       if (v === null || v === undefined) { el.textContent = "—"; el.className = "val muted"; return; }
-      const s = signed(v); el.textContent = money ? s.text : `${s.text}%`; el.className = "val " + s.cls;
+      // Money chips get the $ after the sign: "+$1,234.56".
+      const s = signed(v); el.textContent = money ? s.text.replace(/^([+-]?)/, "$1$$") : `${s.text}%`; el.className = "val " + s.cls;
     };
     set("m-twr", data.metrics?.twr_pct);
     set("m-irr", data.metrics?.irr_pct);
@@ -391,8 +393,11 @@ function drawChart(points) {
     benchmark: points.map((p) => p.benchmark === null ? null : Number(p.benchmark)),
     deposited: points.map((p) => Number(p.net_deposited)),
   };
+  // reduce, not Math.min(...spread): a multi-decade "all" range can exceed
+  // the JS engine's argument-count limit and throw.
   const all = [...series.equity, ...series.deposited, ...series.benchmark.filter((v) => v !== null)];
-  const min = Math.min(...all), max = Math.max(...all);
+  const min = all.reduce((a, v) => Math.min(a, v), Infinity);
+  const max = all.reduce((a, v) => Math.max(a, v), -Infinity);
   const span = max - min || 1;
   const x = (i) => PAD + (i / (points.length - 1)) * (W - 2 * PAD);
   const y = (v) => H - PAD - ((v - min) / span) * (H - 2 * PAD);
@@ -400,7 +405,9 @@ function drawChart(points) {
     .map((v, i) => v === null ? null : `${i === 0 || values[i - 1] === null ? "M" : "L"} ${x(i).toFixed(1)} ${y(v).toFixed(1)}`)
     .filter(Boolean).join(" ");
   const last = points[points.length - 1];
-  const fillTo = y(Math.max(min, 0));
+  // Clamp the fill baseline into the visible range (an all-negative series
+  // would otherwise anchor the fill above the viewBox).
+  const fillTo = y(Math.min(Math.max(0, min), max));
   svg.innerHTML = `
     <path d="${path(series.equity)} L ${x(points.length - 1).toFixed(1)} ${fillTo} L ${x(0).toFixed(1)} ${fillTo} Z"
           fill="#58a6ff18" stroke="none"/>

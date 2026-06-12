@@ -10,7 +10,7 @@ use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use serde::Serialize;
 
-use crate::portfolio::{compute_basis, Tx, TxKind};
+use crate::portfolio::{apply_tx, PortfolioBasis, Tx, TxKind};
 
 /// Daily closes per symbol (date → close).
 pub type Closes = BTreeMap<NaiveDate, Decimal>;
@@ -68,15 +68,18 @@ pub fn equity_series(
 
     let mut points = Vec::new();
     let mut tx_idx = 0;
-    let mut basis = compute_basis(&txs[..0]).expect("empty log is valid");
+    let mut basis = PortfolioBasis::default();
     let mut bench_shares = Decimal::ZERO;
-    let mut bench_dirty = benchmark_closes.is_some();
+    // External flows that arrived before the benchmark had a usable close
+    // (e.g. a deposit on a holiday before the first SPY candle). They buy
+    // in at the first close that appears instead of being dropped.
+    let mut bench_pending = Decimal::ZERO;
 
     let mut date = start;
-    while date <= end {
-        // Advance the replay to include this day's transactions.
+    'days: while date <= end {
+        // Advance the replay through this day's transactions, incrementally
+        // (replaying the whole prefix per day would be quadratic).
         let mut day_flow = Decimal::ZERO;
-        let mut day_had_tx = false;
         while tx_idx < txs.len() && txs[tx_idx].ts.date_naive() <= date {
             let tx = &txs[tx_idx];
             match tx.kind {
@@ -84,16 +87,12 @@ pub fn equity_series(
                 TxKind::Withdrawal => day_flow -= tx.price,
                 _ => {}
             }
+            // An inconsistent log can't be valued; stop the series here
+            // rather than charting garbage.
+            if apply_tx(&mut basis, tx).is_err() {
+                break 'days;
+            }
             tx_idx += 1;
-            day_had_tx = true;
-        }
-        if day_had_tx {
-            basis = match compute_basis(&txs[..tx_idx]) {
-                Ok(b) => b,
-                // An inconsistent prefix can't be valued; stop the series
-                // here rather than charting garbage.
-                Err(_) => break,
-            };
         }
         // Value the book at today's closes.
         let mut equity = basis.cash;
@@ -111,20 +110,20 @@ pub fn equity_series(
         }
 
         // Benchmark: route the same external flows into the benchmark asset
-        // at that day's close.
+        // at that day's close. Days before the first close emit None (not a
+        // fake $0) and their flows stay pending until a close exists.
         let benchmark = benchmark_closes.and_then(|spy| {
-            let close = close_at(spy, date)?;
-            if bench_dirty && day_flow != Decimal::ZERO && close > Decimal::ZERO {
-                bench_shares += day_flow / close;
+            bench_pending += day_flow;
+            let close = close_at(spy, date).filter(|c| *c > Decimal::ZERO)?;
+            if bench_pending != Decimal::ZERO {
+                bench_shares += bench_pending / close;
+                bench_pending = Decimal::ZERO;
                 if bench_shares < Decimal::ZERO {
                     bench_shares = Decimal::ZERO; // over-withdrawal clamps to flat
                 }
             }
             Some(bench_shares * close)
         });
-        if benchmark.is_none() {
-            bench_dirty = false;
-        }
 
         points.push(DayPoint {
             date,
@@ -158,46 +157,62 @@ pub fn metrics_for(points: &[DayPoint]) -> HistoryMetrics {
     }
 
     // Chain daily factors with flows applied at the start of each day.
+    // Sub-periods where capital sits at zero on BOTH ends (empty account)
+    // contribute nothing and are skipped; a period that moves through zero
+    // or negative equity has no representable return, so the whole metric
+    // honestly becomes None instead of a chain with a silent hole.
     let mut twr_factor = Decimal::ONE;
+    let mut twr_valid = true;
     let mut bench_factor: Option<Decimal> = points[0].benchmark.map(|_| Decimal::ONE);
+    let mut bench_valid = true;
     for window in points.windows(2) {
         let (prev, day) = (&window[0], &window[1]);
         let base = prev.equity + day.flow;
         if base > Decimal::ZERO && day.equity > Decimal::ZERO {
             twr_factor *= day.equity / base;
+        } else if day.equity != base {
+            twr_valid = false;
         }
-        if let (Some(factor), Some(prev_b), Some(day_b)) =
-            (bench_factor, prev.benchmark, day.benchmark)
-        {
+        if let (Some(prev_b), Some(day_b)) = (prev.benchmark, day.benchmark) {
             let base_b = prev_b + day.flow;
             if base_b > Decimal::ZERO && day_b > Decimal::ZERO {
-                bench_factor = Some(factor * day_b / base_b);
+                bench_factor = bench_factor.map(|f| f * day_b / base_b);
+            } else if day_b != base_b {
+                bench_valid = false;
             }
         }
     }
 
-    // IRR over the window: opening equity counts as an inflow.
+    // IRR over the window: opening equity counts as an inflow. A window
+    // that opens in negative equity has no honest IRR — report None.
     let first = &points[0];
     let last = points.last().expect("len >= 2");
-    let mut cash_flows: Vec<(NaiveDate, f64)> = Vec::new();
     let opening = first.equity - first.flow; // value before day-1 flows
-    if opening > Decimal::ZERO {
-        cash_flows.push((first.date, -f64::try_from(opening).unwrap_or(0.0)));
-    }
-    for point in points {
-        if point.flow != Decimal::ZERO {
-            cash_flows.push((point.date, -f64::try_from(point.flow).unwrap_or(0.0)));
+    let irr_pct = if opening < Decimal::ZERO {
+        None
+    } else {
+        let mut cash_flows: Vec<(NaiveDate, f64)> = Vec::new();
+        if opening > Decimal::ZERO {
+            cash_flows.push((first.date, -f64::try_from(opening).unwrap_or(0.0)));
         }
-    }
-    cash_flows.push((last.date, f64::try_from(last.equity).unwrap_or(0.0)));
-    let irr_pct =
-        xirr(&cash_flows).map(|r| Decimal::try_from(r * 100.0).unwrap_or_default().round_dp(2));
+        for point in points {
+            if point.flow != Decimal::ZERO {
+                cash_flows.push((point.date, -f64::try_from(point.flow).unwrap_or(0.0)));
+            }
+        }
+        cash_flows.push((last.date, f64::try_from(last.equity).unwrap_or(0.0)));
+        xirr(&cash_flows).map(|r| Decimal::try_from(r * 100.0).unwrap_or_default().round_dp(2))
+    };
 
     let to_pct = |f: Decimal| ((f - Decimal::ONE) * Decimal::ONE_HUNDRED).round_dp(2);
     HistoryMetrics {
-        twr_pct: Some(to_pct(twr_factor)),
+        twr_pct: twr_valid.then(|| to_pct(twr_factor)),
         irr_pct,
-        benchmark_twr_pct: bench_factor.map(to_pct),
+        benchmark_twr_pct: if bench_valid {
+            bench_factor.map(to_pct)
+        } else {
+            None
+        },
     }
 }
 
@@ -327,6 +342,66 @@ mod tests {
         assert_eq!(points[1].equity, dec("500")); // 100 × 5
         assert_eq!(points[1].benchmark.unwrap(), dec("1100")); // shoulda bought SPY
         assert_eq!(metrics.benchmark_twr_pct.unwrap(), dec("10.00"));
+    }
+
+    #[test]
+    fn benchmark_flows_pend_until_first_close() {
+        // Deposit lands on a day with NO benchmark candle yet (holiday /
+        // pre-listing). The flow must wait and buy in at the first close —
+        // not be dropped forever (the old one-way latch bug).
+        let txs = vec![tx(1, TxKind::Deposit, None, "0", "1000", "2026-01-01")];
+        let spy = closes(&[("2026-01-02", "100"), ("2026-01-03", "110")]);
+        let (points, metrics) = equity_series(&txs, &HashMap::new(), Some(&spy), d("2026-01-03"));
+
+        assert_eq!(points[0].benchmark, None); // no close yet → no fake $0
+        assert_eq!(points[1].benchmark.unwrap(), dec("1000")); // bought in at 100
+        assert_eq!(points[2].benchmark.unwrap(), dec("1100"));
+        // Window starts before the benchmark exists → no benchmark TWR.
+        assert!(metrics.benchmark_twr_pct.is_none());
+        // ...but a window that starts at the first benchmark value has one.
+        let windowed = metrics_for(&points[1..]);
+        assert_eq!(windowed.benchmark_twr_pct.unwrap(), dec("10.00"));
+    }
+
+    fn point(day: &str, equity: &str, flow: &str) -> DayPoint {
+        DayPoint {
+            date: d(day),
+            equity: dec(equity),
+            cash: Decimal::ZERO,
+            net_deposited: Decimal::ZERO,
+            benchmark: None,
+            flow: dec(flow),
+        }
+    }
+
+    #[test]
+    fn twr_declines_to_answer_through_zero_equity() {
+        // Equity collapses below zero mid-window: no chain of positive
+        // factors can represent that, so TWR must be None, not a spliced
+        // number that silently skips the loss.
+        let points = vec![
+            point("2026-01-01", "100", "100"),
+            point("2026-01-02", "-50", "0"),
+            point("2026-01-03", "25", "0"),
+        ];
+        assert!(metrics_for(&points).twr_pct.is_none());
+
+        // An empty account going flat (0 → 0, no flows) is fine to skip.
+        let flat = vec![
+            point("2026-01-01", "0", "0"),
+            point("2026-01-02", "0", "0"),
+            point("2026-01-03", "100", "100"),
+        ];
+        assert!(metrics_for(&flat).twr_pct.is_some());
+    }
+
+    #[test]
+    fn irr_declines_negative_opening_equity() {
+        let points = vec![
+            point("2026-01-01", "-100", "0"),
+            point("2026-06-01", "50", "0"),
+        ];
+        assert!(metrics_for(&points).irr_pct.is_none());
     }
 
     #[test]

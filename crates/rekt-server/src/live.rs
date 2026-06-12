@@ -12,10 +12,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use axum::extract::ws::{Message, WebSocket};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
+use rekt_core::history::DayPoint;
 use rekt_core::market::us_market_status;
-use rekt_core::portfolio::{compute_basis, value, PriceView};
+use rekt_core::portfolio::{compute_basis, value, PortfolioBasis, PriceView};
 use rust_decimal::Decimal;
 use tokio::sync::{broadcast, mpsc, watch, RwLock};
 
@@ -27,6 +29,14 @@ pub struct CacheEntry {
     pub prev_close: Option<Decimal>,
     pub ts: Option<DateTime<Utc>>,
 }
+
+/// Bars fed to the signal engine: ~250 trading days ≈ one year. The UI
+/// drawdown badge advertises exactly this window — keep them in sync.
+pub const SIGNAL_WINDOW_BARS: i64 = 250;
+
+/// Cached /api/history payload: (tx_rev, candles_rev, series end date) →
+/// full point series + range-independent metadata (totals etc.).
+type HistoryCache = ((u64, u64, NaiveDate), Arc<Vec<DayPoint>>, serde_json::Value);
 
 #[derive(Default)]
 pub struct Live {
@@ -40,6 +50,12 @@ pub struct Live {
     /// (tx_rev, candles_rev, per-symbol signals) — recomputed only when a
     /// revision moves, not on every price tick.
     signals_cache: RwLock<(u64, u64, HashMap<String, serde_json::Value>)>,
+    /// tx_rev → replayed basis: the broadcaster runs up to once a second on
+    /// price ticks, and the transaction log only changes when tx_rev moves.
+    basis_cache: RwLock<Option<(u64, Arc<PortfolioBasis>)>>,
+    /// See [`HistoryCache`] — makes the 4 range buttons (and any reload)
+    /// free once the series is built for the current revisions.
+    pub(crate) history_cache: RwLock<Option<HistoryCache>>,
 }
 
 pub struct LiveHandles {
@@ -84,6 +100,14 @@ impl Live {
         self.candles_revision.fetch_add(1, Ordering::Relaxed);
         self.mark_dirty();
     }
+
+    /// Current (tx, candles) revisions — cache keys for derived data.
+    pub fn revisions(&self) -> (u64, u64) {
+        (
+            self.tx_revision.load(Ordering::Relaxed),
+            self.candles_revision.load(Ordering::Relaxed),
+        )
+    }
 }
 
 /// Quant-signal badges per open position, cached by (tx, candles) revision
@@ -102,7 +126,7 @@ async fn position_signals(
     }
     let mut map = HashMap::new();
     for symbol in symbols {
-        match repo::recent_closes(&state.db, symbol, 250).await {
+        match repo::recent_closes(&state.db, symbol, SIGNAL_WINDOW_BARS).await {
             Ok(closes) if !closes.is_empty() => {
                 let summary = rekt_core::signals::summarize(&closes);
                 if let Ok(value) = serde_json::to_value(summary) {
@@ -129,7 +153,7 @@ pub fn start(state_factory: impl FnOnce(LiveHandles) -> AppState) -> AppState {
         symbols: symbols_tx,
     });
 
-    // Upstream ingest (only with a provider key).
+    // Upstream ingest (only with a streaming provider key).
     if let Some(token) = state.finnhub_token.clone() {
         let (trades_tx, mut trades_rx) = mpsc::channel(1024);
         tokio::spawn(rekt_data::stream::run_finnhub_stream(
@@ -155,18 +179,38 @@ pub fn start(state_factory: impl FnOnce(LiveHandles) -> AppState) -> AppState {
                 ingest_live.mark_dirty();
             }
         });
+    }
 
-        // Seed prev_close + a starting price for newly tracked symbols via
-        // REST (the trade stream carries neither).
+    // Seed prev_close + a starting price for newly tracked symbols via REST
+    // (the trade stream carries neither, and without a stream this is the
+    // only way symbols get a first price at all).
+    if state.market.is_some() {
         let seed_state = state.clone();
-        let mut seed_rx = symbols_rx;
+        let mut seed_rx = symbols_rx.clone();
         tokio::spawn(async move {
             loop {
                 let symbols: Vec<String> = seed_rx.borrow_and_update().clone();
-                seed_missing_quotes(&seed_state, &symbols).await;
+                refresh_quotes(&seed_state, &symbols, true).await;
                 if seed_rx.changed().await.is_err() {
                     return;
                 }
+            }
+        });
+    }
+
+    // No stream → poll: refresh EVERY tracked quote periodically so an
+    // Alpaca-only (or stream-down) deployment doesn't serve the startup
+    // seed as if it were live forever.
+    if state.finnhub_token.is_none() && state.market.is_some() {
+        let poll_state = state.clone();
+        let poll_rx = symbols_rx;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.tick().await; // the seed task covers startup
+            loop {
+                tick.tick().await;
+                let symbols: Vec<String> = poll_rx.borrow().clone();
+                refresh_quotes(&poll_state, &symbols, false).await;
             }
         });
     }
@@ -199,30 +243,39 @@ pub fn start(state_factory: impl FnOnce(LiveHandles) -> AppState) -> AppState {
 }
 
 pub async fn seed_missing_quotes(state: &AppState, symbols: &[String]) {
+    refresh_quotes(state, symbols, true).await;
+}
+
+/// REST-fetch quotes: only the symbols missing from the cache
+/// (`only_missing`, the cheap seed path) or all of them (the polling
+/// fallback's staleness refresh).
+pub async fn refresh_quotes(state: &AppState, symbols: &[String], only_missing: bool) {
     let Some(provider) = &state.market else {
         return;
     };
 
     // One lock to find the gaps, then fetch concurrently, then one lock to
     // store — never hold the cache across network calls.
-    let missing: Vec<String> = {
+    let wanted: Vec<String> = if only_missing {
         let prices = state.live.prices.read().await;
         symbols
             .iter()
             .filter(|s| !prices.contains_key(*s))
             .cloned()
             .collect()
+    } else {
+        symbols.to_vec()
     };
-    if missing.is_empty() {
+    if wanted.is_empty() {
         return;
     }
 
-    let fetches = missing.iter().map(|symbol| provider.quote(symbol));
+    let fetches = wanted.iter().map(|symbol| provider.quote(symbol));
     let results = futures_util::future::join_all(fetches).await;
 
     let mut prices = state.live.prices.write().await;
     let mut seeded = false;
-    for (symbol, result) in missing.iter().zip(results) {
+    for (symbol, result) in wanted.iter().zip(results) {
         match result {
             Ok(quote) => {
                 prices.insert(
@@ -268,20 +321,52 @@ pub async fn refresh_symbols(state: &AppState) -> anyhow::Result<()> {
 /// Full dashboard payload: portfolio view + market status + tx revision +
 /// trading state (mode, open orders, pause flag).
 pub async fn portfolio_snapshot(state: &AppState) -> anyhow::Result<serde_json::Value> {
-    // The headline portfolio is REAL holdings only; paper activity lives in
-    // the trading block (PLAN.md §7 segregation).
-    let txs = repo::fetch_mode_txs(&state.db, "live").await?;
     let prices = state.live.price_views().await;
     let now = Utc::now();
     let tx_revision = state.live.tx_revision.load(Ordering::Relaxed);
     let trading = crate::trading::snapshot_block(state).await;
-    let payload = match compute_basis(&txs) {
+    // stream = ticks push in live; poll = REST refresh every minute;
+    // none = whatever was seeded (honesty for the UI badge).
+    let quotes = if state.finnhub_token.is_some() {
+        "stream"
+    } else if state.market.is_some() {
+        "poll"
+    } else {
+        "none"
+    };
+
+    // The headline portfolio is REAL holdings only; paper activity lives in
+    // the trading block (PLAN.md §7 segregation). The replayed basis only
+    // changes when tx_revision moves — don't re-query the log per price tick.
+    let cached = {
+        let cache = state.live.basis_cache.read().await;
+        match &*cache {
+            Some((rev, basis)) if *rev == tx_revision => Some(Ok(basis.clone())),
+            _ => None,
+        }
+    };
+    let basis_result = match cached {
+        Some(hit) => hit,
+        None => {
+            let txs = repo::fetch_mode_txs(&state.db, "live").await?;
+            match compute_basis(&txs) {
+                Ok(basis) => {
+                    let basis = Arc::new(basis);
+                    *state.live.basis_cache.write().await = Some((tx_revision, basis.clone()));
+                    Ok(basis)
+                }
+                Err(e) => Err(e),
+            }
+        }
+    };
+
+    let payload = match basis_result {
         Ok(basis) => {
             let view = value(&basis, &prices);
             let open_symbols: Vec<String> =
                 view.positions.iter().map(|p| p.symbol.clone()).collect();
             let signals = position_signals(state, &open_symbols).await;
-            let mut view_value = serde_json::to_value(&view).unwrap_or_default();
+            let mut view_value = serde_json::to_value(&view).context("serialize portfolio view")?;
             if let Some(positions) = view_value
                 .get_mut("positions")
                 .and_then(|p| p.as_array_mut())
@@ -299,6 +384,7 @@ pub async fn portfolio_snapshot(state: &AppState) -> anyhow::Result<serde_json::
                 "ts": now,
                 "market": us_market_status(now),
                 "live_feed": state.finnhub_token.is_some(),
+                "quotes": quotes,
                 "tx_revision": tx_revision,
                 "trading": trading,
                 "portfolio": view_value,

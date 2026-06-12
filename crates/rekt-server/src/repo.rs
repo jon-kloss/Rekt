@@ -264,7 +264,9 @@ pub async fn closes_map(pool: &SqlitePool, symbols: &[String]) -> Result<HashMap
     Ok(map)
 }
 
-/// Most recent `limit` closes for one symbol, oldest first (signals input).
+/// Most recent `limit` closes for one symbol, oldest first (signals input —
+/// see `live::SIGNAL_WINDOW_BARS`; indicators like drawdown are computed
+/// over exactly this window, so labels must say so).
 pub async fn recent_closes(pool: &SqlitePool, symbol: &str, limit: i64) -> Result<Vec<Decimal>> {
     let rows = sqlx::query(
         r#"SELECT c.close FROM candles c
@@ -281,6 +283,46 @@ pub async fn recent_closes(pool: &SqlitePool, symbol: &str, limit: i64) -> Resul
         .collect::<Result<_>>()?;
     closes.reverse();
     Ok(closes)
+}
+
+/// True if an EOD snapshot exists for the given date+mode.
+pub async fn has_snapshot(pool: &SqlitePool, date: NaiveDate, mode: &str) -> Result<bool> {
+    let row = sqlx::query("SELECT 1 FROM snapshots WHERE date = ? AND mode = ?")
+        .bind(date.to_string())
+        .bind(mode)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some())
+}
+
+/// One stored EOD snapshot (equity curve fallback when candles are absent).
+pub struct SnapshotRow {
+    pub date: NaiveDate,
+    pub total_value: Decimal,
+    pub cash: Decimal,
+    pub invested: Decimal,
+}
+
+/// All EOD snapshots for a mode, oldest first.
+pub async fn fetch_snapshots(pool: &SqlitePool, mode: &str) -> Result<Vec<SnapshotRow>> {
+    let rows = sqlx::query(
+        r#"SELECT date, total_value, cash, invested FROM snapshots
+           WHERE mode = ? ORDER BY date"#,
+    )
+    .bind(mode)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let date: String = row.get("date");
+            Ok(SnapshotRow {
+                date: date.parse().context("corrupt snapshot date")?,
+                total_value: parse_dec(&row.get::<String, _>("total_value"), "total_value")?,
+                cash: parse_dec(&row.get::<String, _>("cash"), "cash")?,
+                invested: parse_dec(&row.get::<String, _>("invested"), "invested")?,
+            })
+        })
+        .collect()
 }
 
 /// Write (or overwrite) the EOD snapshot row for a date+mode.

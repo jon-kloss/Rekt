@@ -94,7 +94,9 @@ impl AlpacaBar {
             high: self.h,
             low: self.l,
             close: self.c,
-            volume: self.v as i64,
+            // Round (saturating) rather than truncate: fractional volumes
+            // appear in adjusted bars.
+            volume: self.v.round() as i64,
         }
     }
 }
