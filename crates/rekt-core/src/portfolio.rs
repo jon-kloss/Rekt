@@ -108,33 +108,15 @@ impl PortfolioError {
     }
 }
 
-/// An open FIFO tax lot.
+/// An open FIFO lot. (The TAX ledger keeps its own lots in
+/// [`crate::taxes`] — tax basis diverges from book basis once wash-sale
+/// carry-forwards apply.)
 #[derive(Debug, Clone, PartialEq)]
 pub struct Lot {
     pub qty: Decimal,
     /// Per-share cost including capitalized fees/taxes.
     pub unit_cost: Decimal,
     pub acquired: DateTime<Utc>,
-}
-
-/// One closed tax-lot chunk: a sell consuming (part of) one open lot.
-///
-/// Net sale proceeds (qty × price − fees − taxes) are allocated across the
-/// sell's chunks pro rata by shares, with the final chunk taking the exact
-/// remainder — so a sell's chunk proceeds always sum to its net proceeds.
-/// This is the raw material for Form 8949 (see [`crate::taxes`]).
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Disposal {
-    pub symbol: String,
-    pub qty: Decimal,
-    /// When the consumed lot was bought (splits preserve this, so the
-    /// holding period survives them).
-    pub acquired: DateTime<Utc>,
-    pub sold: DateTime<Utc>,
-    /// This chunk's share of the sell's net proceeds.
-    pub proceeds: Decimal,
-    /// Cost basis of the consumed shares (fees/taxes were capitalized in).
-    pub basis: Decimal,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -166,9 +148,6 @@ pub struct PortfolioBasis {
     /// circuit breaker.
     #[serde(skip)]
     pub realized_events: Vec<(DateTime<Utc>, Decimal)>,
-    /// Closed tax-lot chunks in replay order — feeds the tax report.
-    #[serde(skip)]
-    pub disposals: Vec<Disposal>,
 }
 
 impl PortfolioBasis {
@@ -246,38 +225,20 @@ pub fn apply_tx(book: &mut PortfolioBasis, tx: &Tx) -> Result<(), PortfolioError
                     want: tx.qty,
                 });
             }
-            // Consume lots FIFO, recording one disposal per consumed chunk.
-            let proceeds = tx.qty * tx.price - tx.fees - tx.taxes;
+            // Consume lots FIFO.
             let mut remaining = tx.qty;
             let mut basis_sold = Decimal::ZERO;
-            let mut allocated = Decimal::ZERO;
             while remaining > Decimal::ZERO {
                 let lot = position.lots.first_mut().expect("qty checked above");
                 let take = remaining.min(lot.qty);
-                let chunk_basis = take * lot.unit_cost;
-                basis_sold += chunk_basis;
-                // Pro-rata proceeds; the last chunk takes the exact
-                // remainder so the chunks always sum to `proceeds`.
-                let chunk_proceeds = if take == remaining {
-                    proceeds - allocated
-                } else {
-                    (proceeds * take / tx.qty).round_dp(6)
-                };
-                allocated += chunk_proceeds;
-                book.disposals.push(Disposal {
-                    symbol: symbol.clone(),
-                    qty: take,
-                    acquired: lot.acquired,
-                    sold: tx.ts,
-                    proceeds: chunk_proceeds,
-                    basis: chunk_basis,
-                });
+                basis_sold += take * lot.unit_cost;
                 lot.qty -= take;
                 remaining -= take;
                 if lot.qty == Decimal::ZERO {
                     position.lots.remove(0);
                 }
             }
+            let proceeds = tx.qty * tx.price - tx.fees - tx.taxes;
             book.cash += proceeds;
             position.qty -= tx.qty;
             position.cost_basis -= basis_sold;
@@ -467,38 +428,6 @@ mod tests {
         assert_eq!(aapl.cost_basis, dec("1000")); // 5 left @ 200
                                                   // Cash: 10000 - 1000 - 2000 + 4500 = 11500.
         assert_eq!(book.cash, dec("11500"));
-    }
-
-    #[test]
-    fn disposals_record_per_chunk_with_exact_proceeds_split() {
-        let txs = vec![
-            Tx {
-                ts: ts("2025-03-10T15:00:00Z"),
-                ..tx(1, TxKind::Buy, Some("AAPL"), "3", "100")
-            },
-            Tx {
-                ts: ts("2025-09-01T15:00:00Z"),
-                ..tx(2, TxKind::Buy, Some("AAPL"), "10", "200")
-            },
-            Tx {
-                fees: dec("1"),
-                ..tx(3, TxKind::Sell, Some("AAPL"), "7", "250")
-            },
-        ];
-        let book = compute_basis(&txs).unwrap();
-        let d = &book.disposals;
-        assert_eq!(d.len(), 2);
-        // Net proceeds: 7×250 − 1 = 1749, split 3:4 across the two chunks.
-        assert_eq!(d[0].qty, dec("3"));
-        assert_eq!(d[0].basis, dec("300"));
-        assert_eq!(d[0].proceeds, dec("749.571429")); // 1749×3/7 rounded
-        assert_eq!(d[0].acquired, ts("2025-03-10T15:00:00Z"));
-        assert_eq!(d[1].qty, dec("4"));
-        assert_eq!(d[1].basis, dec("800"));
-        assert_eq!(d[1].acquired, ts("2025-09-01T15:00:00Z"));
-        // Last chunk takes the remainder: the split sums exactly.
-        assert_eq!(d[0].proceeds + d[1].proceeds, dec("1749"));
-        assert_eq!(d[0].symbol, "AAPL");
     }
 
     #[test]
