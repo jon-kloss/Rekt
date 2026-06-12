@@ -116,6 +116,44 @@ pub async fn watchlist_symbols(pool: &SqlitePool) -> Result<Vec<String>> {
     Ok(rows.into_iter().map(|r| r.get("symbol")).collect())
 }
 
+/// Symbols with active alerts (their conditions need data to evaluate).
+pub async fn alert_symbols(pool: &SqlitePool) -> Result<Vec<String>> {
+    let rows = sqlx::query(
+        r#"SELECT DISTINCT i.symbol FROM alerts a
+           JOIN instruments i ON i.id = a.instrument_id
+           WHERE a.status = 'active'"#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.get("symbol")).collect())
+}
+
+/// Add a symbol to the watchlist. Returns false if it was already there.
+pub async fn watchlist_add(pool: &SqlitePool, symbol: &str) -> Result<bool> {
+    let mut dbtx = pool.begin().await?;
+    let instrument_id = ensure_instrument(&mut dbtx, symbol).await?;
+    let result =
+        sqlx::query("INSERT OR IGNORE INTO watchlist (instrument_id, added_ts) VALUES (?, ?)")
+            .bind(instrument_id)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut *dbtx)
+            .await?;
+    dbtx.commit().await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Remove a symbol from the watchlist. Returns false if it wasn't there.
+pub async fn watchlist_remove(pool: &SqlitePool, symbol: &str) -> Result<bool> {
+    let result = sqlx::query(
+        r#"DELETE FROM watchlist WHERE instrument_id IN
+           (SELECT id FROM instruments WHERE symbol = ?)"#,
+    )
+    .bind(symbol.to_uppercase())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Find-or-create an instrument row for a symbol; returns its id.
 pub async fn ensure_instrument(conn: &mut SqliteConnection, symbol: &str) -> Result<i64> {
     let symbol = symbol.to_uppercase();
@@ -348,6 +386,141 @@ pub async fn upsert_snapshot(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// One alert row, joined with its symbol, ready for the API/evaluator.
+#[derive(Debug, serde::Serialize)]
+pub struct AlertRecord {
+    pub id: i64,
+    pub symbol: String,
+    pub condition: String,
+    pub threshold: Decimal,
+    /// The pre-staged order ticket, if any (alerts-to-action).
+    pub draft_order: Option<serde_json::Value>,
+    pub status: String,
+    pub created_ts: String,
+    pub triggered_ts: Option<String>,
+    pub triggered_value: Option<Decimal>,
+    pub note: String,
+}
+
+fn alert_from_row(row: sqlx::sqlite::SqliteRow) -> Result<AlertRecord> {
+    let draft: Option<String> = row.get("draft_order_json");
+    let triggered_value: Option<String> = row.get("triggered_value");
+    Ok(AlertRecord {
+        id: row.get("id"),
+        symbol: row.get("symbol"),
+        condition: row.get("condition"),
+        threshold: parse_dec(&row.get::<String, _>("threshold"), "alerts.threshold")?,
+        draft_order: draft
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .context("corrupt draft_order_json")?,
+        status: row.get("status"),
+        created_ts: row.get("created_ts"),
+        triggered_ts: row.get("triggered_ts"),
+        triggered_value: triggered_value
+            .as_deref()
+            .map(|v| parse_dec(v, "alerts.triggered_value"))
+            .transpose()?,
+        note: row.get("note"),
+    })
+}
+
+const ALERT_SELECT: &str = r#"SELECT a.id, i.symbol, a.condition, a.threshold,
+       a.draft_order_json, a.status, a.created_ts, a.triggered_ts,
+       a.triggered_value, a.note
+       FROM alerts a JOIN instruments i ON i.id = a.instrument_id"#;
+
+/// All alerts, triggered first, then newest.
+pub async fn list_alerts(pool: &SqlitePool) -> Result<Vec<AlertRecord>> {
+    let rows = sqlx::query(&format!(
+        "{ALERT_SELECT} ORDER BY (a.status = 'triggered') DESC, a.id DESC"
+    ))
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(alert_from_row).collect()
+}
+
+/// Active alerts only (the evaluator's working set).
+pub async fn active_alerts(pool: &SqlitePool) -> Result<Vec<AlertRecord>> {
+    let rows = sqlx::query(&format!("{ALERT_SELECT} WHERE a.status = 'active'"))
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter().map(alert_from_row).collect()
+}
+
+pub async fn insert_alert(
+    pool: &SqlitePool,
+    symbol: &str,
+    condition: &str,
+    threshold: Decimal,
+    draft_order_json: Option<&str>,
+    note: &str,
+) -> Result<i64> {
+    let mut dbtx = pool.begin().await?;
+    let instrument_id = ensure_instrument(&mut dbtx, symbol).await?;
+    let result = sqlx::query(
+        r#"INSERT INTO alerts (instrument_id, condition, threshold, draft_order_json, created_ts, note)
+           VALUES (?, ?, ?, ?, ?, ?)"#,
+    )
+    .bind(instrument_id)
+    .bind(condition)
+    .bind(threshold.to_string())
+    .bind(draft_order_json)
+    .bind(Utc::now().to_rfc3339())
+    .bind(note)
+    .execute(&mut *dbtx)
+    .await?;
+    dbtx.commit().await?;
+    Ok(result.last_insert_rowid())
+}
+
+/// Returns true if a row was deleted.
+pub async fn delete_alert(pool: &SqlitePool, id: i64) -> Result<bool> {
+    let result = sqlx::query("DELETE FROM alerts WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// active → triggered, recording when and at what value. The status guard
+/// makes concurrent evaluator passes idempotent (first one wins).
+pub async fn trigger_alert(pool: &SqlitePool, id: i64, observed: Decimal) -> Result<bool> {
+    let result = sqlx::query(
+        r#"UPDATE alerts SET status = 'triggered', triggered_ts = ?, triggered_value = ?
+           WHERE id = ? AND status = 'active'"#,
+    )
+    .bind(Utc::now().to_rfc3339())
+    .bind(observed.to_string())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// triggered → dismissed. Returns false if the alert wasn't triggered.
+pub async fn dismiss_alert(pool: &SqlitePool, id: i64) -> Result<bool> {
+    let result =
+        sqlx::query("UPDATE alerts SET status = 'dismissed' WHERE id = ? AND status = 'triggered'")
+            .bind(id)
+            .execute(pool)
+            .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Any status → active again, clearing the trigger record.
+pub async fn rearm_alert(pool: &SqlitePool, id: i64) -> Result<bool> {
+    let result = sqlx::query(
+        r#"UPDATE alerts SET status = 'active', triggered_ts = NULL, triggered_value = NULL
+           WHERE id = ?"#,
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Durable key/value settings (e.g. the trading pause switch).

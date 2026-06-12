@@ -6,7 +6,7 @@
 //! snapshot and write a combination the engine would reject (TOCTOU).
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
 };
@@ -15,7 +15,7 @@ use rekt_core::portfolio::{compute_basis, TxKind};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
-use crate::{live, repo, AppState};
+use crate::{import, live, repo, AppState};
 
 pub type ApiError = (StatusCode, Json<serde_json::Value>);
 
@@ -174,36 +174,66 @@ pub async fn delete_tx(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Generic CSV import. Header: `kind,symbol,qty,price,fees,taxes,ts,note`
-/// (qty/price/fees/taxes/symbol optional per kind; ts RFC 3339, defaults to
-/// now). All-or-nothing: validation rejects the whole file on one bad row,
-/// and the inserts run in a single SQL transaction so a database failure
-/// can't leave a partial import either.
+#[derive(Debug, Deserialize)]
+pub struct ImportQuery {
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+/// CSV import. `?format=generic` (default) takes the native header
+/// `kind,symbol,qty,price,fees,taxes,ts,note`; `?format=fidelity|schwab`
+/// translates those brokers' activity exports (non-transaction rows like
+/// interest and journal entries are skipped and reported back).
+///
+/// All-or-nothing for the mapped rows: validation rejects the whole file
+/// on one bad row, and the inserts run in a single SQL transaction so a
+/// database failure can't leave a partial import either.
 pub async fn import_csv(
     State(state): State<AppState>,
+    Query(query): Query<ImportQuery>,
     body: String,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let mut reader = csv::ReaderBuilder::new()
-        .trim(csv::Trim::All)
-        .from_reader(body.as_bytes());
+    let format = query.format.as_deref().unwrap_or("generic");
+    let (inputs, skipped) = if format == "generic" {
+        let mut reader = csv::ReaderBuilder::new()
+            .trim(csv::Trim::All)
+            .from_reader(body.as_bytes());
+        let mut inputs = Vec::new();
+        for (line, row) in reader.deserialize::<TxInput>().enumerate() {
+            let input = row.map_err(|e| {
+                err(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("row {}: {e}", line + 2),
+                )
+            })?;
+            inputs.push(input);
+        }
+        (inputs, Vec::new())
+    } else {
+        let parse = import::parse_preset(format, &body)
+            .map_err(|m| err(StatusCode::UNPROCESSABLE_ENTITY, m))?;
+        (parse.rows, parse.skipped)
+    };
+
     let mut new_txs = Vec::new();
-    for (line, row) in reader.deserialize::<TxInput>().enumerate() {
-        let input = row.map_err(|e| {
-            err(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!("row {}: {e}", line + 2),
-            )
-        })?;
+    for (i, input) in inputs.into_iter().enumerate() {
         let tx = input.into_new_tx(repo::TxSource::Csv).map_err(|m| {
             err(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                format!("row {}: {m}", line + 2),
+                format!("row {}: {m}", i + 1),
             )
         })?;
         new_txs.push(tx);
     }
     if new_txs.is_empty() {
-        return Err(err(StatusCode::UNPROCESSABLE_ENTITY, "no rows in CSV"));
+        return Err(err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            if skipped.is_empty() {
+                "no rows in CSV".to_string()
+            } else {
+                format!("no importable rows — all {} skipped", skipped.len())
+            },
+        ));
     }
 
     let _guard = state.mutations.lock().await;
@@ -213,7 +243,78 @@ pub async fn import_csv(
         .map_err(internal)?;
     state.live.bump_tx_revision();
     live::refresh_symbols(&state).await.map_err(internal)?;
-    Ok(Json(serde_json::json!({ "imported": new_txs.len() })))
+    Ok(Json(
+        serde_json::json!({ "imported": new_txs.len(), "skipped": skipped }),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WatchlistInput {
+    pub symbol: String,
+}
+
+/// POST /api/watchlist — track a symbol without holding it.
+pub async fn watchlist_add(
+    State(state): State<AppState>,
+    Json(input): Json<WatchlistInput>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let symbol = input.symbol.trim().to_uppercase();
+    if symbol.is_empty()
+        || !symbol
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.')
+    {
+        return Err(err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "symbol must be alphanumeric",
+        ));
+    }
+    let added = repo::watchlist_add(&state.db, &symbol)
+        .await
+        .map_err(internal)?;
+    state.live.bump_watchlist_revision();
+    live::refresh_symbols(&state).await.map_err(internal)?;
+    // Pull candles for the new symbol soon (signals); idempotent + resumable.
+    let bg = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::history::backfill_candles(&bg).await {
+            tracing::warn!(error = %e, "watchlist candle backfill failed");
+        }
+    });
+    Ok((
+        if added {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(serde_json::json!({ "symbol": symbol })),
+    ))
+}
+
+/// DELETE /api/watchlist/{symbol}
+pub async fn watchlist_remove(
+    State(state): State<AppState>,
+    Path(symbol): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let removed = repo::watchlist_remove(&state.db, &symbol)
+        .await
+        .map_err(internal)?;
+    if !removed {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            format!("{} is not on the watchlist", symbol.to_uppercase()),
+        ));
+    }
+    state.live.bump_watchlist_revision();
+    live::refresh_symbols(&state).await.map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET /api/watchlist — symbols only; live rows come via the ws snapshot.
+pub async fn watchlist_list(State(state): State<AppState>) -> Result<Json<Vec<String>>, ApiError> {
+    Ok(Json(
+        repo::watchlist_symbols(&state.db).await.map_err(internal)?,
+    ))
 }
 
 /// One-shot portfolio snapshot (same payload as the websocket pushes).
