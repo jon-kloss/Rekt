@@ -496,14 +496,11 @@ async function loadTxs() {
 
 // ---- taxes (Form 8949 / Schedule D) ----
 let taxYear = null; // null → server picks the current NY year
+let taxReq = 0;     // newest request wins; stale responses are dropped
 async function loadTaxes() {
-  let data;
-  try {
-    const res = await fetch(taxYear ? `/api/taxes?year=${taxYear}` : "/api/taxes");
-    data = await res.json();
-    if (!res.ok) { $("taxmsg").textContent = data.error ?? `request failed (${res.status})`; return; }
-  } catch { $("taxmsg").textContent = "request failed — is the server up?"; return; }
-  $("taxmsg").textContent = "";
+  const req = ++taxReq;
+  const data = await apiFetch(taxYear ? `/api/taxes?year=${taxYear}` : "/api/taxes", undefined, $("taxmsg"));
+  if (!data || req !== taxReq) return; // failed, or a newer request owns the section
   taxYear = data.year;
   $("taxyear").innerHTML = data.years.map((y) =>
     `<option value="${esc(y)}"${y === data.year ? " selected" : ""}>${esc(y)}</option>`).join("");
@@ -520,7 +517,10 @@ async function loadTaxes() {
     return;
   }
   tbody.innerHTML = data.rows.map((r) => {
-    const g = signed(r.gain);
+    // Form 8949 column (h): gain AFTER the wash adjustment — matches the
+    // CSV and what actually lands on the form, so hand-copying a row is
+    // safe (a fully washed loss reads 0 next to its W flag).
+    const g = signed(Number(r.gain) + Number(r.disallowed));
     return `<tr>
       <td>${esc(r.qty)} sh ${esc(r.symbol)}</td>
       <td>${esc(r.acquired)}</td><td>${esc(r.sold)}</td>

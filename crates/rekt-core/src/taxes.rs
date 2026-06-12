@@ -12,6 +12,11 @@
 //! - "Substantially identical" matching is exact-symbol only.
 //! - Wash matching assumes no stock split lands inside a ±30-day window
 //!   (share counts on either side of a split don't compare).
+//! - Partially selling a recent purchase at a loss IS flagged as a wash:
+//!   the still-held remainder of that purchase counts as replacement
+//!   shares (mechanical §1091, matching broker 1099-B practice). Selling
+//!   the entire purchase is not a wash (Rev. Rul. 56-602), and lots
+//!   consumed by the same sell never replace each other.
 //! - This is bookkeeping, not tax advice.
 
 use chrono::{DateTime, Datelike, Days, Months, NaiveDate, Utc};
@@ -69,7 +74,7 @@ impl TermTotals {
         self.basis += row.basis;
         self.gain += row.gain;
         self.disallowed += row.disallowed;
-        self.reportable = self.gain + self.disallowed;
+        self.reportable += row.gain + row.disallowed;
     }
 }
 
@@ -132,9 +137,11 @@ pub fn tax_report(txs: &[Tx], year: i32) -> Result<TaxReport, PortfolioError> {
 /// be in replay/sale order, as [`compute_basis`] produces them).
 ///
 /// Model: every bought share carries one unit of "replacement capacity".
-/// Walking sales chronologically, a disposal first burns capacity on its
-/// own source shares (the shares you sold cannot replace themselves), then
-/// a losing disposal consumes capacity from buys dated within ±30 NY days
+/// Walking sales chronologically, each sell first burns capacity on ALL of
+/// its source shares — the shares you sold cannot replace themselves, and
+/// lots consumed by the same sell can never be each other's replacement
+/// (a full exit across several FIFO lots is not a wash). Then each losing
+/// chunk of the sell consumes capacity from buys dated within ±30 NY days
 /// of the sale. Each replaced share disallows its fraction of the loss; a
 /// share can replace at most one sold share across the whole log.
 fn wash_disallowed(disposals: &[Disposal], txs: &[Tx]) -> Vec<Decimal> {
@@ -161,46 +168,63 @@ fn wash_disallowed(disposals: &[Disposal], txs: &[Tx]) -> Vec<Decimal> {
         .collect();
 
     let mut out = vec![Decimal::ZERO; disposals.len()];
-    for (i, d) in disposals.iter().enumerate() {
-        // Sold shares can't be their own replacement: burn the source
-        // buy's capacity (matched by symbol + acquisition instant).
-        let mut burn = d.qty;
-        for b in buys
-            .iter_mut()
-            .filter(|b| b.symbol == d.symbol && b.ts == d.acquired)
+    let mut start = 0;
+    while start < disposals.len() {
+        // One sell transaction = one contiguous run of chunks sharing the
+        // sale instant and symbol.
+        let mut end = start + 1;
+        while end < disposals.len()
+            && disposals[end].sold == disposals[start].sold
+            && disposals[end].symbol == disposals[start].symbol
         {
-            let take = burn.min(b.cap);
-            b.cap -= take;
-            burn -= take;
-            if burn == Decimal::ZERO {
-                break;
+            end += 1;
+        }
+
+        // Burn the whole sell's source shares BEFORE any matching: sold
+        // shares can't be their own replacement, and sibling chunks of the
+        // same sell can't replace each other.
+        for d in &disposals[start..end] {
+            let mut burn = d.qty;
+            for b in buys
+                .iter_mut()
+                .filter(|b| b.symbol == d.symbol && b.ts == d.acquired)
+            {
+                let take = burn.min(b.cap);
+                b.cap -= take;
+                burn -= take;
+                if burn == Decimal::ZERO {
+                    break;
+                }
             }
         }
 
-        let loss = d.basis - d.proceeds;
-        if loss <= Decimal::ZERO {
-            continue;
-        }
-        let sold = ny_date(d.sold);
-        let lo = sold - Days::new(30);
-        let hi = sold + Days::new(30);
-        let mut replaced = Decimal::ZERO;
-        for b in buys
-            .iter_mut()
-            .filter(|b| b.symbol == d.symbol && b.date >= lo && b.date <= hi)
-        {
-            if replaced >= d.qty {
-                break;
+        for (i, d) in disposals.iter().enumerate().take(end).skip(start) {
+            let loss = d.basis - d.proceeds;
+            if loss <= Decimal::ZERO {
+                continue;
             }
-            let take = (d.qty - replaced).min(b.cap);
-            b.cap -= take;
-            replaced += take;
+            let sold = ny_date(d.sold);
+            let lo = sold - Days::new(30);
+            let hi = sold + Days::new(30);
+            let mut replaced = Decimal::ZERO;
+            for b in buys
+                .iter_mut()
+                .filter(|b| b.symbol == d.symbol && b.date >= lo && b.date <= hi)
+            {
+                if replaced >= d.qty {
+                    break;
+                }
+                let take = (d.qty - replaced).min(b.cap);
+                b.cap -= take;
+                replaced += take;
+            }
+            if replaced >= d.qty {
+                out[i] = loss;
+            } else if replaced > Decimal::ZERO {
+                out[i] = (loss * replaced / d.qty).round_dp(6);
+            }
         }
-        if replaced >= d.qty {
-            out[i] = loss;
-        } else if replaced > Decimal::ZERO {
-            out[i] = (loss * replaced / d.qty).round_dp(6);
-        }
+        start = end;
     }
     out
 }
@@ -339,6 +363,62 @@ mod tests {
         assert_eq!(report.rows[1].disallowed, Decimal::ZERO);
         assert_eq!(report.short.gain, dec("-100"));
         assert_eq!(report.short.reportable, dec("-50"));
+    }
+
+    #[test]
+    fn full_exit_across_two_lots_in_one_sell_is_not_a_wash() {
+        // Two FIFO lots liquidated by a single sell with no rebuy: the
+        // sibling lot's buy is inside the ±30-day window but its shares
+        // were sold in the same transaction — they are not replacements.
+        let txs = vec![
+            tx(1, TxKind::Buy, "TSLA", "50", "200", "2026-01-02T15:00:00Z"),
+            tx(2, TxKind::Buy, "TSLA", "50", "190", "2026-01-06T15:00:00Z"),
+            tx(
+                3,
+                TxKind::Sell,
+                "TSLA",
+                "100",
+                "150",
+                "2026-01-15T15:00:00Z",
+            ),
+        ];
+        let report = tax_report(&txs, 2026).unwrap();
+        assert_eq!(report.rows.len(), 2);
+        assert_eq!(report.rows[0].disallowed, Decimal::ZERO);
+        assert_eq!(report.rows[1].disallowed, Decimal::ZERO);
+        // Both losses recognized in full: −2500 (lot 1) − 2000 (lot 2).
+        assert_eq!(report.short.reportable, dec("-4500"));
+    }
+
+    #[test]
+    fn partially_selling_a_recent_buy_washes_against_the_remainder() {
+        // Buy 20, sell 10 at a loss nine days later: the 10 still-held
+        // shares of the same purchase are replacement shares (mechanical
+        // §1091 — broker 1099-B practice). Documented in the module docs.
+        let txs = vec![
+            tx(1, TxKind::Buy, "VOO", "20", "500", "2026-04-01T15:00:00Z"),
+            tx(2, TxKind::Sell, "VOO", "10", "450", "2026-04-10T15:00:00Z"),
+        ];
+        let report = tax_report(&txs, 2026).unwrap();
+        assert_eq!(report.rows[0].gain, dec("-500"));
+        assert_eq!(report.rows[0].disallowed, dec("500"));
+        assert_eq!(report.rows[0].code, "W");
+        assert_eq!(report.short.reportable, dec("0"));
+    }
+
+    #[test]
+    fn leap_day_acquisition_clamps_to_feb_28_anniversary() {
+        // chrono clamps 2024-02-29 + 12 months to 2025-02-28: a sale that
+        // day is still short-term, the next day is long-term — and nothing
+        // panics on the nonexistent 2025-02-29.
+        let txs = vec![
+            tx(1, TxKind::Buy, "SPY", "2", "500", "2024-02-29T15:00:00Z"),
+            tx(2, TxKind::Sell, "SPY", "1", "520", "2025-02-28T15:00:00Z"),
+            tx(3, TxKind::Sell, "SPY", "1", "520", "2025-03-03T15:00:00Z"),
+        ];
+        let report = tax_report(&txs, 2025).unwrap();
+        assert!(!report.rows[0].long_term);
+        assert!(report.rows[1].long_term);
     }
 
     #[test]
