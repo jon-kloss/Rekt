@@ -28,7 +28,7 @@ pub async fn backfill_candles(state: &AppState) -> anyhow::Result<()> {
     };
     let first = repo::first_tx_date(&state.db).await?;
     // NY calendar date: plain UTC is a day ahead between 8pm and midnight ET.
-    let today = Utc::now().with_timezone(&New_York).date_naive();
+    let today = rekt_core::taxes::ny_date(Utc::now());
     // Signals (SMA200, drawdown, drawdown alerts) want ~250 trading bars
     // even for symbols never transacted (watchlist/alert-only), so the
     // default window reaches back at least that far.
@@ -184,7 +184,7 @@ pub async fn history_payload(state: &AppState, range: &str) -> Result<serde_json
 
     // NY calendar date: plain UTC would chart a phantom "tomorrow" between
     // 8pm and midnight ET.
-    let today = Utc::now().with_timezone(&New_York).date_naive();
+    let today = rekt_core::taxes::ny_date(Utc::now());
     let (tx_rev, candles_rev) = state.live.revisions();
     let key = (tx_rev, candles_rev, today);
 

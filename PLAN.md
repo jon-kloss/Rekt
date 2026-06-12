@@ -408,9 +408,20 @@ watchlist     (instrument_id, added_ts)
 - Recommendations → pre-staged tickets through the alerts-to-action pipeline.
 - On-demand portfolio/position analysis + grounded chat panel.
 
+### Phase 6 — Taxes: wash sales + Form 8949 / Schedule D
+- Per-lot disposal records from the FIFO engine (proceeds allocated pro
+  rata across consumed lots, exact-sum remainder correction).
+- `rekt-core::taxes`: Form 8949 rows (NY trade dates, short/long split at
+  strictly-more-than-one-year, split-preserving holding period) and
+  wash-sale detection (±30-day window across year boundaries, sold shares
+  excluded as their own replacement, per-share replacement capacity).
+- `/api/taxes` + `/api/taxes/csv` (8949-shaped export); dashboard section
+  with year picker and honest limitation notes. Disallowed losses are
+  reported but basis carry-forward into replacement lots is NOT propagated.
+
 ### Backlog (post-v1, demand-validated by research)
-- Wash-sale detection + Schedule D export (US tax lots are the #3 community
-  want; a paid SaaS exists just to sell this on top of Alpaca).
+- Wash-sale basis carry-forward into replacement lots (today: reported,
+  flagged W, but not propagated into future-year basis).
 - Options tracking; full net-worth aggregation (other accounts, cash, real
   estate); recommendation outcome tracking fed back into future analyses.
 - Additional cost-basis strategies (average, specific-lot, ACB) and broker
