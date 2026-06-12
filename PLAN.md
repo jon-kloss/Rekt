@@ -41,6 +41,12 @@ Non-goals (deliberately out of scope):
 | Broker | **Alpaca** | API-first, commission-free, free paper-trading sandbox, websocket order updates; doubles as fallback market data |
 | Trading mode | **Manual + alerts-to-action** | Order tickets in the UI, plus one-click execution from triggered price alerts. Paper first, live behind an explicit switch |
 | Analysis | **Quant signals (local) + Claude API analyst** | Deterministic indicators computed in Rust for free; Claude for news synthesis, portfolio review, and recommendations with reasoning |
+| License | **AGPL-3.0** | The norm in this niche (Ghostfolio, Wealthfolio, OpenBB); blocks hosted-clone freeriding, guarantees fork-survival; dual-license path stays open. See docs/RESEARCH.md §7 |
+
+> **Competitive positioning** (research: `docs/RESEARCH.md`): no open-source
+> self-hosted tool both tracks *and* trades — the top-2 community wants. AI
+> portfolio analysis is requested and implemented by zero incumbents. REKT's
+> tracker+trader+analyst in a single binary sits exactly in that gap.
 
 ## 3. Market data strategy
 
@@ -88,12 +94,35 @@ first implementation.** Alpaca gives us:
    UI permanently shows which mode you're in (paper = obvious banner).
 2. **Confirm-before-send.** Every order shows a ticket summary (est. cost,
    buying power after) and requires confirmation. No double-click surprises.
-3. **Idempotency.** Every order carries a locally-generated
-   `client_order_id`; retries after a network blip can never double-submit.
+3. **Idempotency.** Every order carries a **deterministic** locally-generated
+   `client_order_id` (derived from intent + sequence, persisted *before*
+   submission — never a random UUID at retry time; see NautilusTrader bug
+   #3176 in docs/RESEARCH.md). Venue↔client ID mapping stored bidirectionally.
 4. **Guardrails in config.** Max order notional, max position % of portfolio,
-   daily order count cap. Exceeding one blocks the order with an explanation.
+   daily order count cap, **loss-streak / drawdown circuit breaker**
+   (Freqtrade's `StoplossGuard` pattern). Guardrails are a standalone module
+   with a global `trading_paused` flag checked unconditionally on the
+   submission path — never strategy-adjacent code.
 5. **Kill switch.** One button: cancel all open orders.
 6. **Long-only enforcement** in v1: sells are capped at held quantity.
+7. **Reconciliation gates trading.** On startup and after any websocket gap:
+   load cached state → fetch broker mass status (orders/positions/fills) →
+   diff, materialize externally-placed orders (client IDs derived from venue
+   IDs), flag drift. **No order submission until `reconciled == true`.**
+   Never trust local state across a disconnect.
+
+### Order lifecycle
+
+Orders move through an explicit state machine (a Rust enum, exhaustively
+matched): `Draft → Submitted → Accepted → PartiallyFilled → Filled /
+Canceled / Rejected / Expired`, **plus in-flight mutation states
+`PendingCancel` and `PendingReplace`** — the states that prevent races when
+a fill arrives while a cancel is in flight (NautilusTrader models 14 states
+for this reason). Alpaca's `trade_updates` events (`new`, `fill`,
+`partial_fill`, `pending_cancel`, `replaced`, `order_cancel_rejected`, …)
+map onto these transitions. Fills are deduplicated by Alpaca's unique
+execution ID — duplicate events are guaranteed on stream reconnect, and the
+consumer owns idempotency.
 
 ### Order → portfolio flow
 
@@ -284,13 +313,20 @@ imports/fill-ingestion are idempotent.
 
 ```sql
 instruments   (id, symbol, name, exchange, currency, type)        -- stock|etf
-transactions  (id, instrument_id, kind, qty, price, fees, ts, source, broker_fill_id, note)
+transactions  (id, instrument_id, kind, qty, price, fees, taxes, ts, source, fill_id, note)
               -- kind: buy | sell | dividend | split | deposit | withdrawal
-              -- source: manual | csv | broker_fill   (broker_fill_id ⇒ idempotent ingest)
+              -- source: manual | csv | broker_fill
+              -- fees and taxes are SEPARATE columns (Ghostfolio conflates
+              --   them and can't do clean tax reporting — issue #3900)
 orders        (id, client_order_id, broker_order_id, instrument_id, side,
                order_type, qty, limit_price, stop_price, tif, status,
                filled_qty, avg_fill_price, mode, submitted_ts, updated_ts)
               -- mode: paper | live  — paper history survives mode switches
+              -- status: full state machine incl. pending_cancel/pending_replace
+fills         (id, execution_id UNIQUE, order_id, qty, price, ts)
+              -- raw broker executions; UNIQUE execution_id makes ingestion
+              --   idempotent across stream reconnects; fills roll up into
+              --   transactions
 alerts        (id, instrument_id, condition, threshold, draft_order_json,
                status, triggered_ts)
 analyses      (id, kind, model, started_ts, prompt_tokens, output_tokens,
@@ -309,6 +345,10 @@ watchlist     (instrument_id, added_ts)
 
 - `deposit`/`withdrawal` track cash, so REKT knows **capital** (money in) vs
   **equity** (market value) — that distinction is the name of the app.
+- **Cost basis is a strategy trait**, not a hardcoded rule: FIFO ships in
+  v1; average cost, specific-lot, and Canadian ACB are additional impls
+  later. (FIFO-only is the single biggest complaint against Wealthfolio —
+  it's legally wrong in several jurisdictions.)
 - Paper and live activity are segregated by `mode` so paper experiments never
   pollute the real equity curve.
 - `analyses.tool_log_json` records every tool call Claude made — full audit
@@ -340,6 +380,11 @@ watchlist     (instrument_id, added_ts)
 - Daily snapshot job + candle backfill → **equity curve chart** (1M/1Y/All).
 - Per-position detail page: price chart with buy/sell markers overlaid.
 - Allocation donut; realized vs unrealized P&L; dividends received.
+- **Proper performance metrics**: time-weighted return (TWR) *and*
+  money-weighted return (IRR), with realized / unrealized / dividend / fee
+  components separated — the thing power users love Portfolio Performance
+  for and every other tracker fumbles.
+- Data-freshness indicators on prices (stale-quote honesty).
 - **Quant signal engine**: SMA/RSI/drawdown/concentration badges per position.
 - Benchmark overlay: "would I be less rekt if I'd just bought SPY?"
   (cash-flow-matched SPY comparison — a signature REKT feature).
@@ -361,6 +406,14 @@ watchlist     (instrument_id, added_ts)
   recommendation cards with citations and expandable reasoning.
 - Recommendations → pre-staged tickets through the alerts-to-action pipeline.
 - On-demand portfolio/position analysis + grounded chat panel.
+
+### Backlog (post-v1, demand-validated by research)
+- Wash-sale detection + Schedule D export (US tax lots are the #3 community
+  want; a paid SaaS exists just to sell this on top of Alpaca).
+- Options tracking; full net-worth aggregation (other accounts, cash, real
+  estate); recommendation outcome tracking fed back into future analyses.
+- Additional cost-basis strategies (average, specific-lot, ACB) and broker
+  CSV preset plugins.
 
 ## 9. Risks & open questions
 
