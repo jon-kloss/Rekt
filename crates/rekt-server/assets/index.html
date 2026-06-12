@@ -50,6 +50,14 @@
   #msg { min-height: 1.2rem; font-size: 0.8rem; color: #d29922; }
   .csv { display: flex; gap: 0.75rem; align-items: center; font-size: 0.8rem; color: #8b949e; flex-wrap: wrap; }
   .warn { color: #d29922; font-size: 0.8rem; }
+  #modebar {
+    display: none; text-align: center; padding: 0.4rem; font-size: 0.8rem;
+    letter-spacing: 0.2em; text-transform: uppercase;
+    background: #3a2d00; color: #d29922; border-bottom: 1px solid #d2992255;
+  }
+  #modebar.paused { background: #3d0c0e; color: #f85149; border-color: #f8514955; }
+  .controls { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; margin-top: 0.75rem; }
+  button.kill { background: #3d0c0e; border-color: #f8514955; color: #f85149; }
 </style>
 </head>
 <body>
@@ -62,8 +70,38 @@
   <span class="badge" id="market">…</span>
   <span class="badge" id="feed">…</span>
 </header>
+<div id="modebar"></div>
 <main>
   <div id="warn" class="warn"></div>
+
+  <section id="trading-section" style="display:none">
+    <h2>Trade <span id="trade-state" class="muted"></span></h2>
+    <form class="tx" id="orderform">
+      <label>Symbol<input name="symbol" placeholder="AAPL" style="text-transform:uppercase" required></label>
+      <label>Side
+        <select name="side"><option value="buy">buy</option><option value="sell">sell</option></select>
+      </label>
+      <label>Type
+        <select name="order_type" id="otype"><option value="market">market</option><option value="limit">limit</option></select>
+      </label>
+      <label>Qty<input name="qty" inputmode="decimal" required></label>
+      <label>Limit<input name="limit_price" inputmode="decimal" disabled></label>
+      <label>TIF
+        <select name="tif"><option value="day">day</option><option value="gtc">gtc</option></select>
+      </label>
+      <button class="primary">place order</button>
+    </form>
+    <div id="omsg" class="warn"></div>
+    <div class="controls">
+      <button id="pausebtn"></button>
+      <button id="killbtn" class="kill" title="cancel every open order at the broker">⛔ cancel all open orders</button>
+    </div>
+    <table style="margin-top:1rem">
+      <thead><tr><th>When</th><th>Symbol</th><th>Side</th><th>Type</th><th>Qty</th><th>Limit</th>
+        <th>Status</th><th>Filled</th><th>Avg px</th><th></th></tr></thead>
+      <tbody id="orders"><tr><td colspan="10" class="empty">no orders yet</td></tr></tbody>
+    </table>
+  </section>
 
   <section>
     <h2>Positions</h2>
@@ -136,8 +174,39 @@ function trackRevision(payload) {
   }
 }
 
+const TERMINAL = new Set(["filled", "canceled", "rejected", "expired", "replaced", "failed"]);
+function renderTrading(t) {
+  const bar = $("modebar"), section = $("trading-section");
+  if (!t || !t.enabled) { bar.style.display = "none"; section.style.display = "none"; return; }
+  section.style.display = "";
+  bar.style.display = "block";
+  bar.className = t.paused ? "paused" : "";
+  bar.textContent = t.paused
+    ? `⏸ trading paused — ${t.mode} mode`
+    : `${t.mode} trading${t.ready ? "" : " — reconciling with broker…"}`;
+  $("trade-state").textContent = t.ready ? "" : "(locked until reconciled)";
+  $("pausebtn").textContent = t.paused ? "▶ resume trading" : "⏸ pause trading";
+  $("pausebtn").dataset.paused = t.paused;
+
+  const tbody = $("orders");
+  if (!t.orders.length) {
+    tbody.innerHTML = `<tr><td colspan="10" class="empty">no orders yet</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = t.orders.map((o) => `<tr>
+    <td>${esc(o.submitted_ts.slice(0, 16).replace("T", " "))}</td>
+    <td>${esc(o.symbol)}</td><td>${esc(o.side)}</td><td>${esc(o.order_type)}</td>
+    <td>${esc(o.qty)}</td><td>${o.limit_price ? fmt(o.limit_price) : "—"}</td>
+    <td>${esc(o.status)}</td><td>${esc(o.filled_qty)}</td>
+    <td>${o.avg_fill_price ? fmt(o.avg_fill_price) : "—"}</td>
+    <td>${TERMINAL.has(o.status) ? "" :
+      `<button class="danger" data-cancel="${esc(o.id)}" title="cancel order">✕</button>`}</td>
+  </tr>`).join("");
+}
+
 function renderPortfolio(payload) {
   trackRevision(payload);
+  renderTrading(payload.trading);
   if (payload.type === "error") { $("warn").textContent = payload.error; return; }
   $("warn").textContent = payload.portfolio.unpriced_symbols.length
     ? `no price data for: ${payload.portfolio.unpriced_symbols.join(", ")} (equity excludes them)` : "";
@@ -219,6 +288,78 @@ $("txform").addEventListener("submit", async (e) => {
   } catch {
     $("msg").textContent = "request failed — is the server up? Transaction may not be saved.";
   }
+});
+
+// ---- trading ----
+$("otype").addEventListener("change", () => {
+  const isLimit = $("otype").value === "limit";
+  const limit = document.querySelector('#orderform [name="limit_price"]');
+  limit.disabled = !isLimit;
+  if (!isLimit) limit.value = "";
+});
+
+$("orderform").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  const body = {
+    symbol: f.get("symbol").toString().trim().toUpperCase(),
+    side: f.get("side"),
+    order_type: f.get("order_type"),
+    qty: f.get("qty").toString().trim(),
+    tif: f.get("tif"),
+  };
+  const limit = (f.get("limit_price") || "").toString().trim();
+  if (body.order_type === "limit") {
+    if (!limit) { $("omsg").textContent = "limit orders need a limit price"; return; }
+    body.limit_price = limit;
+  }
+  // Confirm-before-send: no double-click surprises (PLAN.md §4).
+  const est = body.limit_price ? ` ≈ $${fmt(Number(body.qty) * Number(body.limit_price))}` : " at market price";
+  if (!confirm(`Place ${body.side.toUpperCase()} ${body.qty} ${body.symbol} (${body.order_type}${body.limit_price ? " @ " + body.limit_price : ""}, ${body.tif})${est}?`)) return;
+  try {
+    const res = await fetch("/api/orders", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+    });
+    const json = await res.json();
+    if (!res.ok) { $("omsg").textContent = json.error; return; }
+    $("omsg").textContent = `order ${json.client_order_id}: ${json.status}`;
+    e.target.reset();
+    $("otype").dispatchEvent(new Event("change"));
+    refresh();
+  } catch {
+    $("omsg").textContent = "request failed — is the server up? Order state unknown, check Orders.";
+  }
+});
+
+$("orders").addEventListener("click", async (e) => {
+  const id = e.target.dataset?.cancel;
+  if (!id || !confirm("Cancel this order?")) return;
+  try {
+    const res = await fetch(`/api/orders/${id}`, { method: "DELETE" });
+    if (!res.ok) { $("omsg").textContent = (await res.json()).error; return; }
+    $("omsg").textContent = "cancel requested";
+    refresh();
+  } catch { $("omsg").textContent = "cancel failed — is the server up?"; }
+});
+
+$("killbtn").addEventListener("click", async () => {
+  if (!confirm("KILL SWITCH: cancel ALL open orders at the broker?")) return;
+  try {
+    const res = await fetch("/api/orders/cancel_all", { method: "POST" });
+    $("omsg").textContent = res.ok ? "all open orders canceled" : (await res.json()).error;
+    refresh();
+  } catch { $("omsg").textContent = "kill switch failed — is the server up?"; }
+});
+
+$("pausebtn").addEventListener("click", async () => {
+  const paused = $("pausebtn").dataset.paused !== "true";
+  try {
+    await fetch("/api/trading/pause", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ paused }),
+    });
+    refresh();
+  } catch { $("omsg").textContent = "request failed"; }
 });
 
 // Delete buttons are created per-row; delegate one listener on the table.

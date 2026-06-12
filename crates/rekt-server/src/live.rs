@@ -230,12 +230,14 @@ pub async fn refresh_symbols(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Full dashboard payload: portfolio view + market status + tx revision.
+/// Full dashboard payload: portfolio view + market status + tx revision +
+/// trading state (mode, open orders, pause flag).
 pub async fn portfolio_snapshot(state: &AppState) -> anyhow::Result<serde_json::Value> {
     let txs = repo::fetch_all_txs(&state.db).await?;
     let prices = state.live.price_views().await;
     let now = Utc::now();
     let tx_revision = state.live.tx_revision.load(Ordering::Relaxed);
+    let trading = crate::trading::snapshot_block(state).await;
     let payload = match compute_basis(&txs) {
         Ok(basis) => {
             let view = value(&basis, &prices);
@@ -245,6 +247,7 @@ pub async fn portfolio_snapshot(state: &AppState) -> anyhow::Result<serde_json::
                 "market": us_market_status(now),
                 "live_feed": state.finnhub_token.is_some(),
                 "tx_revision": tx_revision,
+                "trading": trading,
                 "portfolio": view,
             })
         }
@@ -254,6 +257,7 @@ pub async fn portfolio_snapshot(state: &AppState) -> anyhow::Result<serde_json::
             "type": "error",
             "ts": now,
             "tx_revision": tx_revision,
+            "trading": trading,
             "error": format!("transaction log is inconsistent: {e}"),
         }),
     };

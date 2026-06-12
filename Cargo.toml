@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/rekt-core", "crates/rekt-data", "crates/rekt-server"]
+members = ["crates/rekt-core", "crates/rekt-data", "crates/rekt-broker", "crates/rekt-server"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,6 +9,7 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/jon-kloss/Rekt"
 
 [workspace.dependencies]
+rekt-broker = { path = "crates/rekt-broker" }
 rekt-core = { path = "crates/rekt-core" }
 rekt-data = { path = "crates/rekt-data" }
 
