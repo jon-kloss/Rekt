@@ -416,12 +416,22 @@ watchlist     (instrument_id, added_ts)
   wash-sale detection (±30-day window across year boundaries, sold shares
   excluded as their own replacement, per-share replacement capacity).
 - `/api/taxes` + `/api/taxes/csv` (8949-shaped export); dashboard section
-  with year picker and honest limitation notes. Disallowed losses are
-  reported but basis carry-forward into replacement lots is NOT propagated.
+  with year picker and honest limitation notes.
+
+### Phase 7 — Wash-sale basis carry-forward + holding-period tacking
+- The tax ledger became its own chronological replay (`rekt-core::taxes`):
+  TAX basis diverges from book basis once adjustments apply, so the
+  portfolio engine stays purely economic.
+- Disallowed losses are added to the replacement shares' basis (split into
+  adjusted sub-lots when only part of a buy is the replacement; pending
+  adjustments applied when a post-sale replacement buy is replayed) and
+  the surrendered holding period tacks onto the replacement — deferred,
+  not erased, matching broker 1099-B treatment. Conservation tests prove
+  the deferred loss re-emerges on the replacement lot's sale.
+- Replacement capacities are split-adjusted (pre-split buys scale with
+  the ratio), closing the earlier split-scale caveat.
 
 ### Backlog (post-v1, demand-validated by research)
-- Wash-sale basis carry-forward into replacement lots (today: reported,
-  flagged W, but not propagated into future-year basis).
 - Options tracking; full net-worth aggregation (other accounts, cash, real
   estate); recommendation outcome tracking fed back into future analyses.
 - Additional cost-basis strategies (average, specific-lot, ACB) and broker

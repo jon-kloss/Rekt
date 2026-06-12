@@ -6,16 +6,17 @@ A self-hosted, single-user web dashboard for **tracking and trading** a US
 stocks & ETFs portfolio in real time, with an AI analyst watching over your
 shoulder. One Rust binary, one SQLite file, your keys never leave your box.
 
-**Status: Phase 6** — tracking, paper trading, history & insight,
+**Status: Phase 7** — tracking, paper trading, history & insight,
 alerts-to-action, the **AI analyst** (morning briefings, weekly deep
 reviews with web search, on-demand analysis over the Claude API — all
 **advisory only**: no dependency path to the broker, read-only tools,
 recommendations only prefill the guarded order ticket, every run
-cost-metered against a daily budget), and now **taxes**: per-lot Form 8949
-rows with wash-sale detection (IRC §1091, code W), Schedule D totals, and
-CSV export. Wash detection reports disallowed losses but does not
-carry basis forward into replacement lots — reconcile with your broker's
-1099-B; not tax advice. See
+cost-metered against a daily budget), and **taxes**: per-lot Form 8949
+rows with full wash-sale treatment (IRC §1091, code W) — disallowed
+losses **carry forward into the replacement lot's basis** with the
+holding period tacked on, matching broker 1099-B practice — plus
+Schedule D totals and CSV export. Same-symbol matching only; reconcile
+with your broker's 1099-B; not tax advice. See
 [PLAN.md](PLAN.md) for the full design and roadmap, and
 [docs/RESEARCH.md](docs/RESEARCH.md) for the research behind it.
 

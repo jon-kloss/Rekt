@@ -1,30 +1,35 @@
 //! US capital-gains reporting: Form 8949 rows + Schedule D totals, with
-//! wash-sale detection (IRC §1091).
+//! wash-sale detection AND basis carry-forward (IRC §1091).
 //!
-//! Everything is derived from the transaction log via [`compute_basis`]'s
-//! disposal records, over the FULL log — wash-sale windows cross year
-//! boundaries, so a December loss can be washed by a January rebuy.
+//! The tax ledger is its own chronological replay of the FULL transaction
+//! log — wash-sale windows cross year boundaries, and TAX basis diverges
+//! from book basis once adjustments apply: a disallowed loss is added to
+//! the replacement shares' basis and the surrendered shares' holding
+//! period is tacked on, so the loss is deferred (re-emerging when the
+//! replacement lot is sold), not erased. This matches broker 1099-B
+//! treatment.
 //!
 //! Honest limitations (stated in the UI too):
-//! - A disallowed wash loss is REPORTED (column g, code W) but the basis
-//!   carry-forward into the replacement lot is NOT propagated into future
-//!   basis math — verify against your broker's 1099-B before filing.
 //! - "Substantially identical" matching is exact-symbol only.
-//! - Wash matching assumes no stock split lands inside a ±30-day window
-//!   (share counts on either side of a split don't compare).
 //! - Partially selling a recent purchase at a loss IS flagged as a wash:
 //!   the still-held remainder of that purchase counts as replacement
 //!   shares (mechanical §1091, matching broker 1099-B practice). Selling
 //!   the entire purchase is not a wash (Rev. Rul. 56-602), and lots
 //!   consumed by the same sell never replace each other.
+//! - Replacement-share capacities are split-adjusted, but a wash whose
+//!   ±30-day window straddles a split still compares share counts
+//!   mechanically (10 pre-split shares don't match 40 post-split ones).
+//!   Reconcile with your 1099-B.
 //! - This is bookkeeping, not tax advice.
+
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Datelike, Days, Months, NaiveDate, Utc};
 use chrono_tz::America::New_York;
 use rust_decimal::Decimal;
 use serde::Serialize;
 
-use crate::portfolio::{compute_basis, Disposal, PortfolioError, Tx, TxKind};
+use crate::portfolio::{PortfolioError, Tx, TxKind};
 
 /// The America/New_York calendar date of an instant — tax forms care about
 /// the US trade date, and a 1 AM UTC fill is still yesterday in New York.
@@ -37,13 +42,16 @@ pub fn ny_date(ts: DateTime<Utc>) -> NaiveDate {
 pub struct Form8949Row {
     pub symbol: String,
     pub qty: Decimal,
-    /// Column (b), NY trade date.
+    /// Column (b), NY trade date — for replacement lots this is the
+    /// TACKED date (shifted back by the surrendered shares' holding
+    /// period), the date the holding-period clock effectively started.
     pub acquired: NaiveDate,
     /// Column (c), NY trade date.
     pub sold: NaiveDate,
     /// Column (d), net of fees.
     pub proceeds: Decimal,
-    /// Column (e), fees capitalized in.
+    /// Column (e), fees capitalized in PLUS any wash-sale basis carried
+    /// forward from an earlier disallowed loss.
     pub basis: Decimal,
     /// proceeds − basis, before any wash adjustment.
     pub gain: Decimal,
@@ -90,11 +98,10 @@ pub struct TaxReport {
 /// Build the Form 8949 / Schedule D report for one calendar year.
 ///
 /// `txs` must be the FULL chronologically ordered log (not pre-filtered to
-/// the year): cost basis depends on every prior transaction and wash-sale
-/// windows reach ±30 days across year boundaries.
+/// the year): tax basis depends on every prior transaction, and wash-sale
+/// windows and basis carry-forwards reach across year boundaries.
 pub fn tax_report(txs: &[Tx], year: i32) -> Result<TaxReport, PortfolioError> {
-    let book = compute_basis(txs)?;
-    let disallowed = wash_disallowed(&book.disposals, txs);
+    let disposals = tax_disposals(txs)?;
 
     let mut report = TaxReport {
         year,
@@ -102,25 +109,29 @@ pub fn tax_report(txs: &[Tx], year: i32) -> Result<TaxReport, PortfolioError> {
         long: TermTotals::default(),
         rows: Vec::new(),
     };
-    for (d, dis) in book.disposals.iter().zip(&disallowed) {
-        let sold = ny_date(d.sold);
-        if sold.year() != year {
+    for d in disposals {
+        if d.sold.year() != year {
             continue;
         }
-        let acquired = ny_date(d.acquired);
         // Long-term means held MORE than one year: sold strictly after the
-        // first anniversary of the (split-preserving) acquisition date.
-        let long_term = sold > acquired + Months::new(12);
+        // first anniversary of the (tacked, split-preserving) acquisition
+        // date — matches IRS Pub 550's example (bought Feb 5, sold the
+        // following Feb 6 → long-term).
+        let long_term = d.sold > d.holding_from + Months::new(12);
         let row = Form8949Row {
-            symbol: d.symbol.clone(),
+            symbol: d.symbol,
             qty: d.qty,
-            acquired,
-            sold,
+            acquired: d.holding_from,
+            sold: d.sold,
             proceeds: d.proceeds,
             basis: d.basis,
             gain: d.proceeds - d.basis,
-            disallowed: *dis,
-            code: if *dis > Decimal::ZERO { "W" } else { "" },
+            disallowed: d.disallowed,
+            code: if d.disallowed > Decimal::ZERO {
+                "W"
+            } else {
+                ""
+            },
             long_term,
         };
         if long_term {
@@ -133,28 +144,61 @@ pub fn tax_report(txs: &[Tx], year: i32) -> Result<TaxReport, PortfolioError> {
     Ok(report)
 }
 
-/// Per-disposal disallowed wash loss (aligned with `disposals`, which must
-/// be in replay/sale order, as [`compute_basis`] produces them).
-///
-/// Model: every bought share carries one unit of "replacement capacity".
-/// Walking sales chronologically, each sell first burns capacity on ALL of
-/// its source shares — the shares you sold cannot replace themselves, and
-/// lots consumed by the same sell can never be each other's replacement
-/// (a full exit across several FIFO lots is not a wash). Then each losing
-/// chunk of the sell consumes capacity from buys dated within ±30 NY days
-/// of the sale. Each replaced share disallows its fraction of the loss; a
-/// share can replace at most one sold share across the whole log.
-fn wash_disallowed(disposals: &[Disposal], txs: &[Tx]) -> Vec<Decimal> {
-    struct BuyCap {
-        symbol: String,
-        ts: DateTime<Utc>,
-        date: NaiveDate,
-        cap: Decimal,
-    }
-    let mut buys: Vec<BuyCap> = txs
+/// An open TAX lot: like the portfolio engine's FIFO lot, but its basis
+/// carries wash-sale adjustments and its holding anchor carries tacking.
+#[derive(Debug, Clone)]
+struct TaxLot {
+    /// Originating buy transaction — links the lot to its replacement
+    /// capacity entry.
+    buy_id: i64,
+    qty: Decimal,
+    /// Per-share TAX basis (capitalized fees + carried-forward wash loss).
+    unit_basis: Decimal,
+    /// NY date the holding-period clock started (tacked for replacements).
+    holding_from: NaiveDate,
+}
+
+/// Per-buy replacement capacity: each purchased share can replace at most
+/// one wash-sold share across the whole log, and burns when sold itself.
+struct BuyCap {
+    id: i64,
+    symbol: String,
+    ts: DateTime<Utc>,
+    date: NaiveDate,
+    cap: Decimal,
+}
+
+/// A wash adjustment owed to a buy that hasn't been replayed yet (the
+/// replacement was purchased within 30 days AFTER the loss sale).
+struct PendingAdj {
+    qty: Decimal,
+    per_share_add: Decimal,
+    holding_from: NaiveDate,
+}
+
+/// One closed tax-lot chunk, wash-adjusted.
+#[derive(Debug)]
+struct TaxDisposal {
+    symbol: String,
+    qty: Decimal,
+    holding_from: NaiveDate,
+    sold: NaiveDate,
+    proceeds: Decimal,
+    basis: Decimal,
+    disallowed: Decimal,
+}
+
+/// Replay the log into wash-adjusted disposals (the validation mirrors
+/// [`crate::portfolio::compute_basis`], so an inconsistent log fails the
+/// same way here as everywhere else).
+fn tax_disposals(txs: &[Tx]) -> Result<Vec<TaxDisposal>, PortfolioError> {
+    // Replacement capacity is precollected over ALL buys: a loss can be
+    // washed by a purchase up to 30 days in the future.
+    let mut caps: Vec<BuyCap> = txs
         .iter()
         .filter(|t| t.kind == TxKind::Buy)
         .map(|t| BuyCap {
+            id: t.id,
             symbol: t
                 .symbol
                 .as_deref()
@@ -167,66 +211,284 @@ fn wash_disallowed(disposals: &[Disposal], txs: &[Tx]) -> Vec<Decimal> {
         })
         .collect();
 
-    let mut out = vec![Decimal::ZERO; disposals.len()];
-    let mut start = 0;
-    while start < disposals.len() {
-        // One sell transaction = one contiguous run of chunks sharing the
-        // sale instant and symbol.
-        let mut end = start + 1;
-        while end < disposals.len()
-            && disposals[end].sold == disposals[start].sold
-            && disposals[end].symbol == disposals[start].symbol
-        {
-            end += 1;
-        }
+    let mut positions: BTreeMap<String, Vec<TaxLot>> = BTreeMap::new();
+    let mut pending: HashMap<i64, Vec<PendingAdj>> = HashMap::new();
+    let mut out: Vec<TaxDisposal> = Vec::new();
 
-        // Burn the whole sell's source shares BEFORE any matching: sold
-        // shares can't be their own replacement, and sibling chunks of the
-        // same sell can't replace each other.
-        for d in &disposals[start..end] {
-            let mut burn = d.qty;
-            for b in buys
-                .iter_mut()
-                .filter(|b| b.symbol == d.symbol && b.ts == d.acquired)
-            {
-                let take = burn.min(b.cap);
-                b.cap -= take;
-                burn -= take;
-                if burn == Decimal::ZERO {
-                    break;
+    for tx in txs {
+        let symbol = || -> Result<String, PortfolioError> {
+            tx.symbol
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_uppercase)
+                .ok_or(PortfolioError::MissingSymbol {
+                    id: tx.id,
+                    kind: tx.kind.as_str(),
+                })
+        };
+
+        match tx.kind {
+            TxKind::Buy => {
+                let symbol = symbol()?;
+                if tx.qty <= Decimal::ZERO {
+                    return Err(PortfolioError::NonPositive {
+                        id: tx.id,
+                        field: "qty",
+                    });
+                }
+                let unit = (tx.qty * tx.price + tx.fees + tx.taxes) / tx.qty;
+                let lots = positions.entry(symbol).or_default();
+                // A buy that was matched as a FUTURE replacement enters the
+                // book pre-adjusted: basis bumped, holding period tacked.
+                let mut remaining = tx.qty;
+                for adj in pending.remove(&tx.id).unwrap_or_default() {
+                    let take = remaining.min(adj.qty);
+                    if take > Decimal::ZERO {
+                        lots.push(TaxLot {
+                            buy_id: tx.id,
+                            qty: take,
+                            unit_basis: unit + adj.per_share_add,
+                            holding_from: adj.holding_from,
+                        });
+                        remaining -= take;
+                    }
+                }
+                if remaining > Decimal::ZERO {
+                    lots.push(TaxLot {
+                        buy_id: tx.id,
+                        qty: remaining,
+                        unit_basis: unit,
+                        holding_from: ny_date(tx.ts),
+                    });
                 }
             }
-        }
-
-        for (i, d) in disposals.iter().enumerate().take(end).skip(start) {
-            let loss = d.basis - d.proceeds;
-            if loss <= Decimal::ZERO {
-                continue;
-            }
-            let sold = ny_date(d.sold);
-            let lo = sold - Days::new(30);
-            let hi = sold + Days::new(30);
-            let mut replaced = Decimal::ZERO;
-            for b in buys
-                .iter_mut()
-                .filter(|b| b.symbol == d.symbol && b.date >= lo && b.date <= hi)
-            {
-                if replaced >= d.qty {
-                    break;
+            TxKind::Sell => {
+                let symbol = symbol()?;
+                if tx.qty <= Decimal::ZERO {
+                    return Err(PortfolioError::NonPositive {
+                        id: tx.id,
+                        field: "qty",
+                    });
                 }
-                let take = (d.qty - replaced).min(b.cap);
-                b.cap -= take;
-                replaced += take;
+                let lots = positions.entry(symbol.clone()).or_default();
+                let have: Decimal = lots.iter().map(|l| l.qty).sum();
+                if tx.qty > have {
+                    return Err(PortfolioError::Oversell {
+                        id: tx.id,
+                        symbol,
+                        have,
+                        want: tx.qty,
+                    });
+                }
+                sell(tx, symbol, lots, &mut caps, &mut pending, &mut out);
             }
-            if replaced >= d.qty {
-                out[i] = loss;
-            } else if replaced > Decimal::ZERO {
-                out[i] = (loss * replaced / d.qty).round_dp(6);
+            TxKind::Split => {
+                let symbol = symbol()?;
+                if tx.qty <= Decimal::ZERO {
+                    return Err(PortfolioError::BadSplitRatio {
+                        id: tx.id,
+                        ratio: tx.qty,
+                    });
+                }
+                for lot in positions.entry(symbol.clone()).or_default() {
+                    lot.qty *= tx.qty;
+                    lot.unit_basis /= tx.qty;
+                }
+                // Capacities of shares bought BEFORE the split scale with
+                // them; later buys are already in post-split units. Replay
+                // order is (ts, id) — the id tie-break keeps a same-instant
+                // post-split buy from gaining phantom capacity.
+                for cap in caps
+                    .iter_mut()
+                    .filter(|c| c.symbol == symbol && (c.ts, c.id) < (tx.ts, tx.id))
+                {
+                    cap.cap *= tx.qty;
+                }
             }
+            TxKind::Dividend => {
+                symbol()?; // same validation as the portfolio engine
+            }
+            TxKind::Deposit | TxKind::Withdrawal => {}
         }
-        start = end;
     }
-    out
+    Ok(out)
+}
+
+/// Process one sell: consume FIFO tax lots, allocate net proceeds pro rata
+/// (last chunk takes the exact remainder), burn the WHOLE sell's source
+/// capacity before any matching, then wash-match each losing chunk and
+/// carry the disallowed amount into its replacement shares.
+fn sell(
+    tx: &Tx,
+    symbol: String,
+    lots: &mut Vec<TaxLot>,
+    caps: &mut [BuyCap],
+    pending: &mut HashMap<i64, Vec<PendingAdj>>,
+    out: &mut Vec<TaxDisposal>,
+) {
+    let proceeds = tx.qty * tx.price - tx.fees - tx.taxes;
+    let sold_date = ny_date(tx.ts);
+
+    struct Chunk {
+        buy_id: i64,
+        qty: Decimal,
+        basis: Decimal,
+        holding_from: NaiveDate,
+    }
+    let mut chunks = Vec::new();
+    let mut remaining = tx.qty;
+    while remaining > Decimal::ZERO {
+        let lot = lots.first_mut().expect("oversell checked by caller");
+        let take = remaining.min(lot.qty);
+        chunks.push(Chunk {
+            buy_id: lot.buy_id,
+            qty: take,
+            basis: take * lot.unit_basis,
+            holding_from: lot.holding_from,
+        });
+        lot.qty -= take;
+        remaining -= take;
+        if lot.qty == Decimal::ZERO {
+            lots.remove(0);
+        }
+    }
+
+    // Burn source capacity for the whole sell first: sold shares can't be
+    // their own replacement, and sibling chunks can't replace each other.
+    for c in &chunks {
+        if let Some(cap) = caps.iter_mut().find(|b| b.id == c.buy_id) {
+            cap.cap -= c.qty.min(cap.cap);
+        }
+    }
+
+    let mut allocated = Decimal::ZERO;
+    let last = chunks.len() - 1;
+    for (k, c) in chunks.iter().enumerate() {
+        let chunk_proceeds = if k == last {
+            proceeds - allocated
+        } else {
+            (proceeds * c.qty / tx.qty).round_dp(6)
+        };
+        allocated += chunk_proceeds;
+
+        let mut disallowed = Decimal::ZERO;
+        let loss = c.basis - chunk_proceeds;
+        if loss > Decimal::ZERO {
+            // Replacement shares: buys within ±30 NY days with capacity,
+            // chronological (caps are in tx order).
+            let lo = sold_date - Days::new(30);
+            let hi = sold_date + Days::new(30);
+            let mut matches: Vec<(i64, DateTime<Utc>, NaiveDate, Decimal)> = Vec::new();
+            let mut replaced = Decimal::ZERO;
+            for b in caps
+                .iter_mut()
+                .filter(|b| b.symbol == symbol && b.date >= lo && b.date <= hi)
+            {
+                if replaced >= c.qty {
+                    break;
+                }
+                let take = (c.qty - replaced).min(b.cap);
+                if take > Decimal::ZERO {
+                    b.cap -= take;
+                    replaced += take;
+                    matches.push((b.id, b.ts, b.date, take));
+                }
+            }
+            if replaced > Decimal::ZERO {
+                disallowed = if replaced >= c.qty {
+                    loss
+                } else {
+                    (loss * replaced / c.qty).round_dp(6)
+                };
+                // Carry the disallowed loss into the replacement shares,
+                // allocated per matched buy with a remainder correction so
+                // the carried basis sums exactly to the reported column g.
+                // Holding-period tack: the replacement clock starts the
+                // surrendered shares' holding period earlier.
+                let held = sold_date.signed_duration_since(c.holding_from);
+                let mut adj_alloc = Decimal::ZERO;
+                let last_match = matches.len() - 1;
+                for (j, (buy_id, buy_ts, buy_date, r)) in matches.iter().enumerate() {
+                    let amount = if j == last_match {
+                        disallowed - adj_alloc
+                    } else {
+                        (disallowed * r / replaced).round_dp(6)
+                    };
+                    adj_alloc += amount;
+                    let per_share_add = amount / r;
+                    // Saturate rather than panic: cascading tacks on
+                    // crafted ancient dates could otherwise underflow
+                    // chrono's range. A floor anchor stays long-term.
+                    let anchor = buy_date.checked_sub_signed(held).unwrap_or(NaiveDate::MIN);
+                    // Replay order is (ts, id): only a buy replayed BEFORE
+                    // this sell has a lot to adjust in place — a same-
+                    // instant later-id buy must go through the pending map
+                    // or the carried basis would silently vanish.
+                    if (*buy_ts, *buy_id) < (tx.ts, tx.id) {
+                        adjust_held_lots(lots, *buy_id, *r, per_share_add, anchor);
+                    } else {
+                        pending.entry(*buy_id).or_default().push(PendingAdj {
+                            qty: *r,
+                            per_share_add,
+                            holding_from: anchor,
+                        });
+                    }
+                }
+            }
+        }
+
+        out.push(TaxDisposal {
+            symbol: symbol.clone(),
+            qty: c.qty,
+            holding_from: c.holding_from,
+            sold: sold_date,
+            proceeds: chunk_proceeds,
+            basis: c.basis,
+            disallowed,
+        });
+    }
+}
+
+/// Designate `qty` still-held shares of `buy_id` as replacement shares:
+/// bump their per-share basis and tack the holding anchor, splitting a lot
+/// when only part of it is designated.
+///
+/// The adjusted sub-lot is inserted BEFORE the unadjusted remainder: its
+/// tacked anchor makes it the older holding, so FIFO must consume it
+/// first — otherwise the deferred loss would sit in the book longer than
+/// strict first-in-first-out reporting allows.
+fn adjust_held_lots(
+    lots: &mut Vec<TaxLot>,
+    buy_id: i64,
+    mut qty: Decimal,
+    per_share_add: Decimal,
+    anchor: NaiveDate,
+) {
+    let mut i = 0;
+    while i < lots.len() && qty > Decimal::ZERO {
+        if lots[i].buy_id != buy_id {
+            i += 1;
+            continue;
+        }
+        let take = qty.min(lots[i].qty);
+        if take == lots[i].qty {
+            lots[i].unit_basis += per_share_add;
+            lots[i].holding_from = anchor;
+            i += 1;
+        } else {
+            lots[i].qty -= take;
+            let adjusted = TaxLot {
+                buy_id,
+                qty: take,
+                unit_basis: lots[i].unit_basis + per_share_add,
+                holding_from: anchor,
+            };
+            lots.insert(i, adjusted);
+            i += 2; // past the inserted sub-lot and the remainder
+        }
+        qty -= take;
+    }
 }
 
 #[cfg(test)]
@@ -287,6 +549,20 @@ mod tests {
     }
 
     #[test]
+    fn split_scales_replacement_capacity_too() {
+        // Buy 10, 4:1 split, dump all 40 at a loss with no rebuy: the burn
+        // must cancel the full post-split capacity — no phantom wash.
+        let txs = vec![
+            tx(1, TxKind::Buy, "NVDA", "10", "400", "2026-01-05T15:00:00Z"),
+            tx(2, TxKind::Split, "NVDA", "4", "0", "2026-01-10T15:00:00Z"),
+            tx(3, TxKind::Sell, "NVDA", "40", "80", "2026-01-20T15:00:00Z"),
+        ];
+        let report = tax_report(&txs, 2026).unwrap();
+        assert_eq!(report.rows[0].disallowed, Decimal::ZERO);
+        assert_eq!(report.short.reportable, dec("-800"));
+    }
+
+    #[test]
     fn rebuy_within_thirty_days_disallows_the_loss() {
         let txs = vec![
             tx(1, TxKind::Buy, "TSLA", "10", "300", "2026-01-05T15:00:00Z"),
@@ -298,7 +574,70 @@ mod tests {
         assert_eq!(row.gain, dec("-500"));
         assert_eq!(row.disallowed, dec("500"));
         assert_eq!(row.code, "W");
-        // Schedule D: the loss is fully disallowed.
+        // Schedule D: the loss is fully disallowed (deferred, not gone).
+        assert_eq!(report.short.reportable, dec("0"));
+    }
+
+    #[test]
+    fn deferred_loss_reemerges_when_the_replacement_lot_is_sold() {
+        let txs = vec![
+            tx(1, TxKind::Buy, "TSLA", "10", "100", "2026-01-05T15:00:00Z"),
+            tx(2, TxKind::Sell, "TSLA", "10", "90", "2026-02-02T15:00:00Z"),
+            tx(3, TxKind::Buy, "TSLA", "10", "95", "2026-02-10T15:00:00Z"),
+            // Final exit, far outside any window, at the rebuy price.
+            tx(4, TxKind::Sell, "TSLA", "10", "95", "2026-12-01T15:00:00Z"),
+        ];
+        let report = tax_report(&txs, 2026).unwrap();
+        // Row 1: $100 loss, fully washed.
+        assert_eq!(report.rows[0].disallowed, dec("100"));
+        // Row 2: sold at the rebuy price, yet the carried basis (950 + 100
+        // = 1050) surfaces the deferred $100 loss.
+        assert_eq!(report.rows[1].basis, dec("1050"));
+        assert_eq!(report.rows[1].gain, dec("-100"));
+        assert_eq!(report.rows[1].disallowed, Decimal::ZERO);
+        // Year total equals the economic truth: bought 1950, sold 1850.
+        assert_eq!(
+            report.short.reportable + report.long.reportable,
+            dec("-100")
+        );
+    }
+
+    #[test]
+    fn holding_period_tacks_onto_replacement_shares() {
+        // Held ~11 months before the wash sale; the replacement is held
+        // only 6 weeks but the tacked clock makes its sale long-term.
+        let txs = vec![
+            tx(1, TxKind::Buy, "MSFT", "5", "400", "2024-01-10T15:00:00Z"),
+            tx(2, TxKind::Sell, "MSFT", "5", "350", "2024-12-20T15:00:00Z"),
+            tx(3, TxKind::Buy, "MSFT", "5", "340", "2024-12-30T15:00:00Z"),
+            tx(4, TxKind::Sell, "MSFT", "5", "500", "2025-02-10T15:00:00Z"),
+        ];
+        let report = tax_report(&txs, 2025).unwrap();
+        let row = &report.rows[0];
+        // Tacked anchor: Dec 30 minus the 345 days held = Jan 20 2024.
+        assert_eq!(row.acquired, NaiveDate::from_ymd_opt(2024, 1, 20).unwrap());
+        assert!(row.long_term, "tacked holding period crosses one year");
+        // Basis carries the $250 disallowed loss: 1700 + 250 = 1950.
+        assert_eq!(row.basis, dec("1950"));
+        assert_eq!(row.gain, dec("550"));
+    }
+
+    #[test]
+    fn replacement_bought_before_the_sale_is_adjusted_in_place() {
+        let txs = vec![
+            tx(1, TxKind::Buy, "AMD", "10", "100", "2026-01-05T15:00:00Z"),
+            tx(2, TxKind::Buy, "AMD", "10", "95", "2026-03-02T15:00:00Z"),
+            // FIFO sells lot 1 at a loss; lot 2 (bought 8 days earlier) is
+            // the replacement and absorbs the disallowed $100.
+            tx(3, TxKind::Sell, "AMD", "10", "90", "2026-03-10T15:00:00Z"),
+            tx(4, TxKind::Sell, "AMD", "10", "105", "2026-06-01T15:00:00Z"),
+        ];
+        let report = tax_report(&txs, 2026).unwrap();
+        assert_eq!(report.rows[0].disallowed, dec("100"));
+        // Lot 2's basis: 950 + 100 carried = 1050; sold for 1050 → flat.
+        assert_eq!(report.rows[1].basis, dec("1050"));
+        assert_eq!(report.rows[1].gain, dec("0"));
+        // Economic truth across the year: bought 1950, sold 1950.
         assert_eq!(report.short.reportable, dec("0"));
     }
 
@@ -334,18 +673,24 @@ mod tests {
     #[test]
     fn wash_window_crosses_the_year_boundary() {
         // December loss washed by a January rebuy: the disallowance lands
-        // in the December tax year, which is why the report needs the full
-        // log rather than a year slice.
+        // in the December tax year, and the carried basis surfaces it in
+        // the January lot's eventual sale.
         let txs = vec![
             tx(1, TxKind::Buy, "MSFT", "5", "400", "2025-06-02T15:00:00Z"),
             tx(2, TxKind::Sell, "MSFT", "5", "350", "2025-12-20T15:00:00Z"),
             tx(3, TxKind::Buy, "MSFT", "5", "340", "2026-01-10T15:00:00Z"),
+            tx(4, TxKind::Sell, "MSFT", "5", "340", "2026-06-01T15:00:00Z"),
         ];
-        let report = tax_report(&txs, 2025).unwrap();
-        assert_eq!(report.rows[0].disallowed, dec("250"));
-        assert_eq!(report.short.reportable, dec("0"));
-        // And 2026 has no rows at all (nothing sold).
-        assert!(tax_report(&txs, 2026).unwrap().rows.is_empty());
+        let report_2025 = tax_report(&txs, 2025).unwrap();
+        assert_eq!(report_2025.rows[0].disallowed, dec("250"));
+        assert_eq!(report_2025.short.reportable, dec("0"));
+        // 2026: the deferred $250 re-emerges through the carried basis.
+        let report_2026 = tax_report(&txs, 2026).unwrap();
+        assert_eq!(report_2026.rows[0].basis, dec("1950")); // 1700 + 250
+        assert_eq!(
+            report_2026.short.reportable + report_2026.long.reportable,
+            dec("-250")
+        );
     }
 
     #[test]
@@ -394,16 +739,43 @@ mod tests {
     fn partially_selling_a_recent_buy_washes_against_the_remainder() {
         // Buy 20, sell 10 at a loss nine days later: the 10 still-held
         // shares of the same purchase are replacement shares (mechanical
-        // §1091 — broker 1099-B practice). Documented in the module docs.
+        // §1091 — broker 1099-B practice), and they absorb the basis.
         let txs = vec![
             tx(1, TxKind::Buy, "VOO", "20", "500", "2026-04-01T15:00:00Z"),
             tx(2, TxKind::Sell, "VOO", "10", "450", "2026-04-10T15:00:00Z"),
+            tx(3, TxKind::Sell, "VOO", "10", "450", "2026-08-03T15:00:00Z"),
         ];
         let report = tax_report(&txs, 2026).unwrap();
         assert_eq!(report.rows[0].gain, dec("-500"));
         assert_eq!(report.rows[0].disallowed, dec("500"));
         assert_eq!(report.rows[0].code, "W");
-        assert_eq!(report.short.reportable, dec("0"));
+        // The remainder carries the deferred loss: basis 5000 + 500.
+        assert_eq!(report.rows[1].basis, dec("5500"));
+        assert_eq!(report.rows[1].gain, dec("-1000"));
+        // Economic truth: bought 10000, sold 9000 → −1000 reportable.
+        assert_eq!(report.short.reportable, dec("-1000"));
+    }
+
+    #[test]
+    fn chunk_proceeds_sum_exactly_across_lots() {
+        // 3:4 split of net proceeds (7×250 − 1 fee) cannot drop a cent.
+        let txs = vec![
+            tx(1, TxKind::Buy, "AAPL", "3", "100", "2025-03-10T15:00:00Z"),
+            tx(2, TxKind::Buy, "AAPL", "10", "200", "2025-09-01T15:00:00Z"),
+            Tx {
+                fees: dec("1"),
+                ..tx(3, TxKind::Sell, "AAPL", "7", "250", "2026-02-02T15:00:00Z")
+            },
+        ];
+        let report = tax_report(&txs, 2026).unwrap();
+        assert_eq!(report.rows.len(), 2);
+        assert_eq!(report.rows[0].proceeds, dec("749.571429"));
+        assert_eq!(
+            report.rows[0].proceeds + report.rows[1].proceeds,
+            dec("1749")
+        );
+        assert_eq!(report.rows[0].basis, dec("300"));
+        assert_eq!(report.rows[1].basis, dec("800"));
     }
 
     #[test]
@@ -448,5 +820,91 @@ mod tests {
         ];
         assert_eq!(tax_report(&txs, 2025).unwrap().rows.len(), 1);
         assert!(tax_report(&txs, 2026).unwrap().rows.is_empty());
+    }
+
+    #[test]
+    fn same_instant_split_then_buy_gains_no_phantom_capacity() {
+        // A split and a buy at the SAME timestamp, split first by id: the
+        // buy is post-split and its capacity must not be scaled — selling
+        // everything at a loss with no rebuy is not a wash.
+        let txs = vec![
+            tx(1, TxKind::Buy, "NVDA", "10", "400", "2026-01-02T15:00:00Z"),
+            tx(2, TxKind::Split, "NVDA", "4", "0", "2026-01-10T15:00:00Z"),
+            tx(3, TxKind::Buy, "NVDA", "10", "100", "2026-01-10T15:00:00Z"),
+            tx(4, TxKind::Sell, "NVDA", "50", "80", "2026-01-20T15:00:00Z"),
+        ];
+        let report = tax_report(&txs, 2026).unwrap();
+        assert_eq!(report.rows.len(), 2);
+        assert_eq!(report.rows[0].disallowed, Decimal::ZERO);
+        assert_eq!(report.rows[1].disallowed, Decimal::ZERO);
+        // Full exit: 4000 + 1000 paid, 4000 received.
+        assert_eq!(report.short.reportable, dec("-1000"));
+    }
+
+    #[test]
+    fn same_instant_rebuy_after_the_sell_still_carries_basis() {
+        // Sell and rebuy share a timestamp, sell first by id: the
+        // adjustment must route through the pending map (the rebuy lot
+        // doesn't exist yet) and land when the buy is replayed.
+        let txs = vec![
+            tx(1, TxKind::Buy, "TSLA", "10", "100", "2026-01-05T15:00:00Z"),
+            tx(2, TxKind::Sell, "TSLA", "10", "90", "2026-02-02T15:00:00Z"),
+            tx(3, TxKind::Buy, "TSLA", "10", "90", "2026-02-02T15:00:00Z"),
+            tx(4, TxKind::Sell, "TSLA", "10", "90", "2026-12-01T15:00:00Z"),
+        ];
+        let report = tax_report(&txs, 2026).unwrap();
+        assert_eq!(report.rows[0].disallowed, dec("100"));
+        // The carried basis lands: 900 + 100 deferred.
+        assert_eq!(report.rows[1].basis, dec("1000"));
+        // Conservation: bought 1900, sold 1800.
+        assert_eq!(report.short.reportable, dec("-100"));
+    }
+
+    #[test]
+    fn adjusted_sub_lot_sells_before_the_unadjusted_remainder() {
+        // Partial wash inside one purchase: the 4 adjusted shares carry a
+        // tacked (older) anchor, so FIFO must surface their deferred loss
+        // on the NEXT sale, not leave it parked behind the remainder.
+        let txs = vec![
+            tx(1, TxKind::Buy, "VOO", "10", "100", "2026-04-01T15:00:00Z"),
+            tx(2, TxKind::Sell, "VOO", "4", "90", "2026-04-10T15:00:00Z"),
+            tx(3, TxKind::Sell, "VOO", "4", "100", "2026-08-03T15:00:00Z"),
+        ];
+        let report = tax_report(&txs, 2026).unwrap();
+        // Loss 40, fully washed against the still-held remainder.
+        assert_eq!(report.rows[0].disallowed, dec("40"));
+        // The August sale consumes the ADJUSTED sub-lot first: basis
+        // 4×100 + 40 carried = 440, anchor tacked to Mar 23.
+        assert_eq!(report.rows[1].basis, dec("440"));
+        assert_eq!(report.rows[1].gain, dec("-40"));
+        assert_eq!(
+            report.rows[1].acquired,
+            NaiveDate::from_ymd_opt(2026, 3, 23).unwrap()
+        );
+    }
+
+    #[test]
+    fn oversell_and_missing_symbol_fail_like_the_portfolio_engine() {
+        let txs = vec![
+            tx(1, TxKind::Buy, "AAPL", "5", "100", "2026-01-05T15:00:00Z"),
+            tx(2, TxKind::Sell, "AAPL", "6", "100", "2026-02-02T15:00:00Z"),
+        ];
+        assert_eq!(
+            tax_report(&txs, 2026).unwrap_err(),
+            PortfolioError::Oversell {
+                id: 2,
+                symbol: "AAPL".into(),
+                have: dec("5"),
+                want: dec("6"),
+            }
+        );
+        let txs = vec![Tx {
+            symbol: None,
+            ..tx(1, TxKind::Buy, "X", "5", "100", "2026-01-05T15:00:00Z")
+        }];
+        assert!(matches!(
+            tax_report(&txs, 2026).unwrap_err(),
+            PortfolioError::MissingSymbol { id: 1, .. }
+        ));
     }
 }
