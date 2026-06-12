@@ -229,6 +229,26 @@ pub struct TicketContext<'a> {
     pub trading_paused: bool,
 }
 
+/// The order-SHAPE rules, shared by real tickets ([`check_ticket`]) and
+/// alert draft orders: one rule set so the two paths can never drift —
+/// a draft that passes creation must not fail shape checks at confirm time.
+pub fn check_shape(
+    order_type: OrderType,
+    qty: Decimal,
+    limit_price: Option<Decimal>,
+) -> Result<(), GuardrailViolation> {
+    if qty <= Decimal::ZERO {
+        return Err(GuardrailViolation::NonPositiveQty);
+    }
+    match order_type {
+        OrderType::Limit if limit_price.unwrap_or_default() <= Decimal::ZERO => {
+            Err(GuardrailViolation::MissingLimitPrice)
+        }
+        OrderType::Market if limit_price.is_some() => Err(GuardrailViolation::UnexpectedLimitPrice),
+        _ => Ok(()),
+    }
+}
+
 /// Check a ticket against every rail. Returns the estimated notional on
 /// success so the UI confirm dialog can show it.
 pub fn check_ticket(
@@ -259,18 +279,7 @@ pub fn check_ticket(
             }
         }
     }
-    if ticket.qty <= Decimal::ZERO {
-        return Err(GuardrailViolation::NonPositiveQty);
-    }
-    match ticket.order_type {
-        OrderType::Limit if ticket.limit_price.unwrap_or_default() <= Decimal::ZERO => {
-            return Err(GuardrailViolation::MissingLimitPrice);
-        }
-        OrderType::Market if ticket.limit_price.is_some() => {
-            return Err(GuardrailViolation::UnexpectedLimitPrice);
-        }
-        _ => {}
-    }
+    check_shape(ticket.order_type, ticket.qty, ticket.limit_price)?;
     if orders_today >= rails.max_orders_per_day {
         return Err(GuardrailViolation::DailyCap {
             max: rails.max_orders_per_day,

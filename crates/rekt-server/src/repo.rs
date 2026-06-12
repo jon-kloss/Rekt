@@ -443,6 +443,15 @@ pub async fn list_alerts(pool: &SqlitePool) -> Result<Vec<AlertRecord>> {
     rows.into_iter().map(alert_from_row).collect()
 }
 
+/// One alert by id.
+pub async fn get_alert(pool: &SqlitePool, id: i64) -> Result<Option<AlertRecord>> {
+    let row = sqlx::query(&format!("{ALERT_SELECT} WHERE a.id = ?"))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    row.map(alert_from_row).transpose()
+}
+
 /// Active alerts only (the evaluator's working set).
 pub async fn active_alerts(pool: &SqlitePool) -> Result<Vec<AlertRecord>> {
     let rows = sqlx::query(&format!("{ALERT_SELECT} WHERE a.status = 'active'"))

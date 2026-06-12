@@ -36,12 +36,15 @@ impl AlertCondition {
         )
     }
 
-    /// Human description for notifications: "AAPL ≤ $170".
+    /// Human description for notifications and logs: "AAPL <= $170".
+    /// Deliberately ASCII: this string travels in an HTTP header (ntfy
+    /// Title), and `HeaderValue` rejects non-ASCII — `≤` would make every
+    /// push fail. The UI renders its own pretty labels.
     pub fn describe(&self, symbol: &str, threshold: Decimal) -> String {
         match self {
-            AlertCondition::PriceBelow => format!("{symbol} ≤ ${threshold}"),
-            AlertCondition::PriceAbove => format!("{symbol} ≥ ${threshold}"),
-            AlertCondition::DrawdownAbove => format!("{symbol} drawdown ≥ {threshold}%"),
+            AlertCondition::PriceBelow => format!("{symbol} <= ${threshold}"),
+            AlertCondition::PriceAbove => format!("{symbol} >= ${threshold}"),
+            AlertCondition::DrawdownAbove => format!("{symbol} drawdown >= {threshold}%"),
         }
     }
 }
@@ -117,13 +120,27 @@ mod tests {
         assert!("price_at".parse::<AlertCondition>().is_err());
         assert_eq!(
             AlertCondition::PriceBelow.describe("AAPL", dec("170")),
-            "AAPL ≤ $170"
+            "AAPL <= $170"
         );
         assert_eq!(
             AlertCondition::DrawdownAbove.describe("TSLA", dec("20")),
-            "TSLA drawdown ≥ 20%"
+            "TSLA drawdown >= 20%"
         );
         assert!(AlertCondition::PriceBelow.needs_price());
         assert!(!AlertCondition::DrawdownAbove.needs_price());
+    }
+
+    #[test]
+    fn descriptions_are_header_safe_ascii() {
+        // The description is used as an HTTP header value (ntfy Title);
+        // any non-ASCII byte would make every push notification fail.
+        for condition in [
+            AlertCondition::PriceBelow,
+            AlertCondition::PriceAbove,
+            AlertCondition::DrawdownAbove,
+        ] {
+            let desc = condition.describe("BRK.B", dec("123.45"));
+            assert!(desc.is_ascii(), "non-ASCII in {desc:?}");
+        }
     }
 }

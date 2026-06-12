@@ -209,6 +209,9 @@
       <label>Qty<input name="draft_qty" inputmode="decimal" disabled></label>
       <label>Limit<input name="draft_limit" inputmode="decimal" disabled></label>
       <label>Note<input name="note"></label>
+      <label title="arm even if the condition is already true (it will fire on the next check)">
+        Fire now OK<input type="checkbox" name="allow_immediate" style="height:1.2rem">
+      </label>
       <button class="primary">arm alert</button>
     </form>
     <div id="amsg" class="warn"></div>
@@ -270,14 +273,16 @@ const signed = (s) => {
   return { text: (n > 0 ? "+" : "") + fmt(s), cls: n > 0 ? "up" : "down" };
 };
 
-// Reload the transaction table only when the server says the log changed.
-let txRevision = null;
+// Reload server-derived views only when the relevant revision moves:
+// transactions on tx_revision; history/meter on EITHER revision (candle
+// backfill changes the curve without any transaction mutation).
+let txRevision = null, candlesRevision = null;
 function trackRevision(payload) {
-  if (payload.tx_revision !== undefined && payload.tx_revision !== txRevision) {
-    txRevision = payload.tx_revision;
-    loadTxs();
-    loadHistory();
-  }
+  const txChanged = payload.tx_revision !== undefined && payload.tx_revision !== txRevision;
+  const candlesChanged = payload.candles_revision !== undefined && payload.candles_revision !== candlesRevision;
+  if (txChanged) { txRevision = payload.tx_revision; loadTxs(); }
+  if (candlesChanged) candlesRevision = payload.candles_revision;
+  if (txChanged || candlesChanged) loadHistory();
 }
 
 // No cancel button for terminal orders OR pending_submit (no broker id
@@ -331,7 +336,7 @@ function renderTrading(t) {
 const CONDITION_LABEL = { price_below: "≤ $", price_above: "≥ $", drawdown_above: "drawdown ≥ " };
 function describeAlert(a) {
   const t = esc(a.threshold) + (a.condition === "drawdown_above" ? "%" : "");
-  return `${esc(a.symbol)} ${CONDITION_LABEL[a.condition] ?? a.condition} ${t}`;
+  return `${esc(a.symbol)} ${CONDITION_LABEL[a.condition] ?? esc(a.condition)} ${t}`;
 }
 
 let tradingEnabled = false;
@@ -507,14 +512,26 @@ async function loadHistory() {
           ? "charting nightly snapshots — configure Alpaca keys for full daily history"
           : "no candle data yet — configure Alpaca keys for historical bars"));
     drawChart(points);
-    // The meter always reads the full series (server-cached, so this extra
-    // fetch is free) — switching to 1M after a crash shouldn't read "zen".
-    const allPoints = currentRange === "all"
-      ? points
-      : ((await (await fetch("/api/history?range=all")).json()).points ?? []);
-    updateRektMeter(allPoints);
+    // The meter always reads the full series — switching to 1M after a
+    // crash shouldn't read "zen". Cached per tx revision; a meter-only
+    // fetch failure must not clobber the healthy chart's status note.
+    try {
+      const rev = `${txRevision}:${candlesRevision}`;
+      let allPoints;
+      if (currentRange === "all") {
+        allPoints = points;
+        allPointsCache = { rev, points };
+      } else if (allPointsCache.points && allPointsCache.rev === rev) {
+        allPoints = allPointsCache.points;
+      } else {
+        allPoints = (await (await fetch("/api/history?range=all")).json()).points ?? [];
+        allPointsCache = { rev, points: allPoints };
+      }
+      updateRektMeter(allPoints);
+    } catch { $("rektmeter").style.display = "none"; }
   } catch { $("histnote").textContent = "history unavailable — is the server up?"; }
 }
+let allPointsCache = { rev: null, points: null };
 
 // The REKT meter: how far off peak equity are we, really? (Phase 4 easter
 // egg — drawdown from all-time peak, faces calibrated to pain.)
@@ -743,6 +760,7 @@ $("alertform").addEventListener("submit", async (e) => {
   };
   const note = (f.get("note") || "").toString().trim();
   if (note) body.note = note;
+  if (f.get("allow_immediate")) body.allow_immediate = true;
   if (f.get("draft_side")) {
     body.draft_order = {
       side: f.get("draft_side"),
@@ -755,9 +773,12 @@ $("alertform").addEventListener("submit", async (e) => {
       body.draft_order.limit_price = limit;
     }
   }
-  if (await apiFetch("/api/alerts", {
+  const json = await apiFetch("/api/alerts", {
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
-  }, $("amsg"))) {
+  }, $("amsg"));
+  if (json) {
+    // e.g. "no market data yet — fires when data arrives if already true".
+    if (json.note) $("amsg").textContent = json.note;
     e.target.reset();
     $("draftside").dispatchEvent(new Event("change"));
     refresh();

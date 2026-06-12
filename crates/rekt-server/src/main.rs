@@ -45,6 +45,10 @@ pub struct AppState {
     pub mutations: Arc<Mutex<()>>,
     /// ntfy push endpoint for triggered alerts (REKT_NTFY_URL / _TOPIC).
     pub notify_url: Option<String>,
+    /// Serializes candle backfill runs: the scheduler and on-demand spawns
+    /// (watchlist add) must not fetch the same symbol's history twice or
+    /// contend for SQLite's single writer.
+    pub backfill_lock: Arc<Mutex<()>>,
 }
 
 fn app(state: AppState) -> Router {
@@ -234,18 +238,26 @@ async fn main() -> anyhow::Result<()> {
     let guardrails = Arc::new(guardrails_from_env());
 
     // Alert push: full URL wins, else a topic on the public ntfy.sh.
-    let notify_url = std::env::var("REKT_NTFY_URL")
+    let notify_url = match std::env::var("REKT_NTFY_URL")
         .ok()
         .filter(|u| !u.is_empty())
-        .or_else(|| {
-            std::env::var("REKT_NTFY_TOPIC")
-                .ok()
-                .filter(|t| !t.is_empty())
-                .map(|t| format!("https://ntfy.sh/{t}"))
-        });
-    if notify_url.is_some() {
-        tracing::info!("alert push notifications enabled (ntfy)");
-    }
+    {
+        Some(url) => {
+            tracing::info!("alert push notifications enabled (ntfy)");
+            Some(url)
+        }
+        None => std::env::var("REKT_NTFY_TOPIC")
+            .ok()
+            .filter(|t| !t.is_empty())
+            .map(|t| {
+                tracing::warn!(
+                    "REKT_NTFY_TOPIC publishes to the PUBLIC ntfy.sh server — anyone who \
+                     guesses the topic name can read your trade alerts. Use a long random \
+                     topic, or self-host ntfy and set REKT_NTFY_URL"
+                );
+                format!("https://ntfy.sh/{t}")
+            }),
+    };
 
     let state = live::start(move |handles| AppState {
         db,
@@ -260,6 +272,7 @@ async fn main() -> anyhow::Result<()> {
         symbols: Arc::new(handles.symbols),
         mutations: Arc::new(Mutex::new(())),
         notify_url,
+        backfill_lock: Arc::new(Mutex::new(())),
     });
 
     // Subscribe the stream to currently held symbols from the start.
@@ -326,9 +339,10 @@ async fn main() -> anyhow::Result<()> {
         let alert_state = state.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+            let mut drawdowns = alerts::DrawdownCache::default();
             loop {
                 tick.tick().await;
-                if let Err(e) = alerts::evaluate_alerts(&alert_state).await {
+                if let Err(e) = alerts::evaluate_alerts(&alert_state, &mut drawdowns).await {
                     tracing::error!(error = %e, "alert evaluation failed");
                 }
             }
@@ -372,6 +386,7 @@ mod tests {
             symbols: Arc::new(symbols),
             mutations: Arc::new(Mutex::new(())),
             notify_url: None,
+            backfill_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -520,7 +535,16 @@ mod tests {
             .body(axum::body::Body::from(bad_csv))
             .unwrap();
         let response = app(state.clone()).oneshot(request_body).await.unwrap();
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        // Replay errors name the line in the ORIGINAL file (header = line 1;
+        // the oversell is data row 2 = file line 3), like every other path.
+        assert!(
+            body["error"].as_str().unwrap().starts_with("line 3:"),
+            "{body}"
+        );
 
         let (_, txs) = request(state.clone(), "GET", "/api/transactions", None).await;
         assert_eq!(txs.as_array().unwrap().len(), 0);
@@ -689,6 +713,19 @@ mod tests {
     #[tokio::test]
     async fn submit_persists_deterministic_client_id_then_accepts() {
         let state = trading_state().await;
+        // Tickets obey the same symbol rule as watchlist/alerts — a
+        // malformed symbol fails locally, not as a broker rejection.
+        let (status, _) = request(
+            state.clone(),
+            "POST",
+            "/api/orders",
+            Some(serde_json::json!({
+                "symbol": "not a symbol!", "side": "buy", "order_type": "market", "qty": "1"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
         let (status, json) = request(
             state.clone(),
             "POST",
@@ -1000,9 +1037,27 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CREATED, "{created}");
         let id = created["id"].as_i64().unwrap();
+        // No price data yet → the arm-time check couldn't run; the response
+        // says so instead of implying it passed.
+        assert!(created["note"].as_str().unwrap().contains("no market data"));
+
+        // Bad symbols are rejected like the watchlist path.
+        let (status, _) = request(
+            state.clone(),
+            "POST",
+            "/api/alerts",
+            Some(serde_json::json!({
+                "symbol": "not a symbol!", "condition": "price_below", "threshold": "170"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
         // No price data yet → evaluation leaves it armed.
-        alerts::evaluate_alerts(&state).await.unwrap();
+        let mut drawdowns = alerts::DrawdownCache::default();
+        alerts::evaluate_alerts(&state, &mut drawdowns)
+            .await
+            .unwrap();
         let (_, list) = request(state.clone(), "GET", "/api/alerts", None).await;
         assert_eq!(list[0]["status"], "active");
         assert_eq!(list[0]["symbol"], "AAPL");
@@ -1012,13 +1067,19 @@ mod tests {
             .live
             .set_price("AAPL", rust_decimal::Decimal::from(171))
             .await;
-        alerts::evaluate_alerts(&state).await.unwrap();
+        alerts::evaluate_alerts(&state, &mut drawdowns)
+            .await
+            .unwrap();
         let (_, list) = request(state.clone(), "GET", "/api/alerts", None).await;
         assert_eq!(list[0]["status"], "active");
 
         state.live.set_price("AAPL", "169.5".parse().unwrap()).await;
-        alerts::evaluate_alerts(&state).await.unwrap();
-        alerts::evaluate_alerts(&state).await.unwrap(); // idempotent
+        alerts::evaluate_alerts(&state, &mut drawdowns)
+            .await
+            .unwrap();
+        alerts::evaluate_alerts(&state, &mut drawdowns)
+            .await
+            .unwrap(); // idempotent
         let (_, list) = request(state.clone(), "GET", "/api/alerts", None).await;
         assert_eq!(list.as_array().unwrap().len(), 1);
         assert_eq!(list[0]["status"], "triggered");
@@ -1048,7 +1109,23 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
 
-        // rearm clears the trigger record.
+        // rearm while the condition is STILL true (price 169.5 ≤ 170) is
+        // refused — it would just re-fire on the next tick.
+        let (status, body) = request(
+            state.clone(),
+            "POST",
+            &format!("/api/alerts/{id}/rearm"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("still true"));
+
+        // Once the condition resets, rearm clears the trigger record.
+        state
+            .live
+            .set_price("AAPL", rust_decimal::Decimal::from(175))
+            .await;
         let (status, _) = request(
             state.clone(),
             "POST",
@@ -1092,7 +1169,9 @@ mod tests {
         .await
         .unwrap();
 
-        let (status, _) = request(
+        // The condition is ALREADY true (25% ≥ 20%) → arming would fire
+        // instantly, so creation is rejected with an explanation…
+        let (status, body) = request(
             state.clone(),
             "POST",
             "/api/alerts",
@@ -1101,9 +1180,26 @@ mod tests {
             })),
         )
         .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("already true"));
+
+        // …unless the user explicitly opts into an immediate fire.
+        let (status, _) = request(
+            state.clone(),
+            "POST",
+            "/api/alerts",
+            Some(serde_json::json!({
+                "symbol": "TSLA", "condition": "drawdown_above", "threshold": "20",
+                "allow_immediate": true
+            })),
+        )
+        .await;
         assert_eq!(status, StatusCode::CREATED);
 
-        alerts::evaluate_alerts(&state).await.unwrap();
+        let mut drawdowns = alerts::DrawdownCache::default();
+        alerts::evaluate_alerts(&state, &mut drawdowns)
+            .await
+            .unwrap();
         let (_, list) = request(state, "GET", "/api/alerts", None).await;
         assert_eq!(list[0]["status"], "triggered");
         assert_eq!(list[0]["triggered_value"], "25.00");
