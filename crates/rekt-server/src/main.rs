@@ -13,6 +13,7 @@ mod history;
 mod import;
 mod live;
 mod repo;
+mod taxes;
 mod trading;
 
 use std::sync::atomic::AtomicBool;
@@ -70,6 +71,8 @@ fn app(state: AppState) -> Router {
         .route("/api/transactions/{id}", delete(api::delete_tx))
         .route("/api/import/csv", post(api::import_csv))
         .route("/api/history", get(history::history))
+        .route("/api/taxes", get(taxes::taxes))
+        .route("/api/taxes/csv", get(taxes::taxes_csv))
         .route(
             "/api/watchlist",
             get(api::watchlist_list).post(api::watchlist_add),
@@ -1547,5 +1550,77 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn tax_report_flags_wash_sales_and_exports_csv() {
+        let state = test_state().await;
+        for body in [
+            serde_json::json!({"kind": "buy", "symbol": "TSLA", "qty": "10", "price": "300",
+                "ts": "2026-01-05T15:00:00Z"}),
+            serde_json::json!({"kind": "sell", "symbol": "TSLA", "qty": "10", "price": "250",
+                "ts": "2026-03-02T15:00:00Z"}),
+            serde_json::json!({"kind": "buy", "symbol": "TSLA", "qty": "10", "price": "240",
+                "ts": "2026-03-20T15:00:00Z"}),
+        ] {
+            let (status, _) = request(state.clone(), "POST", "/api/transactions", Some(body)).await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+
+        let (status, json) = request(state.clone(), "GET", "/api/taxes?year=2026", None).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["year"], 2026);
+        assert_eq!(json["years"][0], 2026);
+        let row = &json["rows"][0];
+        assert_eq!(row["code"], "W");
+        assert_eq!(row["disallowed"], "500");
+        assert_eq!(row["gain"], "-500");
+        assert_eq!(row["long_term"], false);
+        // Schedule D: the washed loss nets to zero reportable.
+        assert_eq!(json["short"]["reportable"], "0");
+
+        // The CSV export carries the same row, Form 8949-shaped.
+        let response = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/taxes/csv?year=2026")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/csv"));
+        assert!(response
+            .headers()
+            .get("content-disposition")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("rekt-form8949-2026.csv"));
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let csv = std::str::from_utf8(&body).unwrap();
+        assert!(csv.starts_with("Description,Date Acquired,Date Sold,"));
+        assert!(
+            csv.contains("10 sh TSLA,01/05/2026,03/02/2026,2500,3000,W,500,0,short"),
+            "{csv}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_tax_year_reports_honestly() {
+        let (status, json) = request(test_state().await, "GET", "/api/taxes", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["rows"].as_array().unwrap().is_empty());
+        assert_eq!(json["short"]["reportable"], "0");
+        // With no transactions, the only offered year is the current one.
+        assert_eq!(json["years"].as_array().unwrap().len(), 1);
     }
 }

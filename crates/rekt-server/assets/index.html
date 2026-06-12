@@ -281,6 +281,29 @@
       <tbody id="txs"><tr><td colspan="8" class="empty">nothing yet</td></tr></tbody>
     </table>
   </section>
+
+  <section>
+    <h2>Taxes <span class="muted" style="text-transform:none;letter-spacing:0">— Form 8949 / Schedule D</span></h2>
+    <div class="controls" style="margin-bottom:0.75rem">
+      <label>Tax year <select id="taxyear"></select></label>
+      <a id="taxcsv" href="/api/taxes/csv"><button>⬇ Form 8949 CSV</button></a>
+    </div>
+    <div class="metrics">
+      <div class="stat"><span class="label">Short-term</span><span class="val" id="tax-st">—</span></div>
+      <div class="stat"><span class="label">Long-term</span><span class="val" id="tax-lt">—</span></div>
+      <div class="stat"><span class="label">Proceeds</span><span class="val" id="tax-proceeds">—</span></div>
+      <div class="stat"><span class="label">Wash disallowed</span><span class="val" id="tax-wash">—</span></div>
+    </div>
+    <table>
+      <thead><tr><th>Description</th><th>Acquired</th><th>Sold</th><th>Proceeds</th><th>Basis</th>
+        <th>Gain/Loss</th><th>Wash adj.</th><th>Term</th></tr></thead>
+      <tbody id="taxrows"><tr><td colspan="8" class="empty">no closed lots this year</td></tr></tbody>
+    </table>
+    <div id="taxmsg" class="warn"></div>
+    <p class="muted" style="font-size:0.85rem">Live-mode lots only (paper trades are not taxable). Wash-sale
+    losses are flagged and disallowed (code W) but the basis carry-forward into the replacement lot is
+    <strong>not</strong> applied to future years — reconcile with your broker's 1099-B. Not tax advice.</p>
+  </section>
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -307,7 +330,7 @@ let txRevision = null, candlesRevision = null;
 function trackRevision(payload) {
   const txChanged = payload.tx_revision !== undefined && payload.tx_revision !== txRevision;
   const candlesChanged = payload.candles_revision !== undefined && payload.candles_revision !== candlesRevision;
-  if (txChanged) { txRevision = payload.tx_revision; loadTxs(); }
+  if (txChanged) { txRevision = payload.tx_revision; loadTxs(); loadTaxes(); }
   if (candlesChanged) candlesRevision = payload.candles_revision;
   if (txChanged || candlesChanged) loadHistory();
 }
@@ -470,6 +493,46 @@ async function loadTxs() {
     <td><button class="danger" data-id="${esc(t.id)}" title="delete">✕</button></td>
   </tr>`).join("");
 }
+
+// ---- taxes (Form 8949 / Schedule D) ----
+let taxYear = null; // null → server picks the current NY year
+async function loadTaxes() {
+  let data;
+  try {
+    const res = await fetch(taxYear ? `/api/taxes?year=${taxYear}` : "/api/taxes");
+    data = await res.json();
+    if (!res.ok) { $("taxmsg").textContent = data.error ?? `request failed (${res.status})`; return; }
+  } catch { $("taxmsg").textContent = "request failed — is the server up?"; return; }
+  $("taxmsg").textContent = "";
+  taxYear = data.year;
+  $("taxyear").innerHTML = data.years.map((y) =>
+    `<option value="${esc(y)}"${y === data.year ? " selected" : ""}>${esc(y)}</option>`).join("");
+  $("taxcsv").href = `/api/taxes/csv?year=${data.year}`;
+  const st = signed(data.short.reportable), lt = signed(data.long.reportable);
+  $("tax-st").textContent = st.text; $("tax-st").className = "val " + st.cls;
+  $("tax-lt").textContent = lt.text; $("tax-lt").className = "val " + lt.cls;
+  $("tax-proceeds").textContent = "$" + fmt(Number(data.short.proceeds) + Number(data.long.proceeds));
+  const wash = Number(data.short.disallowed) + Number(data.long.disallowed);
+  $("tax-wash").textContent = wash ? "$" + fmt(wash) : "—";
+  const tbody = $("taxrows");
+  if (!data.rows.length) {
+    tbody.innerHTML = `<tr><td colspan="8" class="empty">no closed lots this year</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = data.rows.map((r) => {
+    const g = signed(r.gain);
+    return `<tr>
+      <td>${esc(r.qty)} sh ${esc(r.symbol)}</td>
+      <td>${esc(r.acquired)}</td><td>${esc(r.sold)}</td>
+      <td>${fmt(r.proceeds)}</td><td>${fmt(r.basis)}</td>
+      <td class="${g.cls}">${g.text}</td>
+      <td>${r.code === "W"
+        ? `<span class="down" title="wash sale — loss disallowed">W +${fmt(r.disallowed)}</span>` : "—"}</td>
+      <td>${r.long_term ? "long" : "short"}</td>
+    </tr>`;
+  }).join("");
+}
+$("taxyear").addEventListener("change", () => { taxYear = Number($("taxyear").value); loadTaxes(); });
 
 function sigBadges(sig) {
   if (!sig) return `<span class="muted">—</span>`;

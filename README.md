@@ -6,13 +6,16 @@ A self-hosted, single-user web dashboard for **tracking and trading** a US
 stocks & ETFs portfolio in real time, with an AI analyst watching over your
 shoulder. One Rust binary, one SQLite file, your keys never leave your box.
 
-**Status: Phase 5** — tracking, paper trading, history & insight,
-alerts-to-action, and now the **AI analyst**: morning briefings (Haiku),
-weekly deep reviews with web search (Opus 4.8), and on-demand portfolio
-analysis over the Claude API. The analyst is **advisory only** — its crate
-has no dependency path to the broker, its tools are read-only, and a
-recommendation can only prefill the normal guarded order ticket that a
-human confirms. Every run is cost-metered against a daily budget. See
+**Status: Phase 6** — tracking, paper trading, history & insight,
+alerts-to-action, the **AI analyst** (morning briefings, weekly deep
+reviews with web search, on-demand analysis over the Claude API — all
+**advisory only**: no dependency path to the broker, read-only tools,
+recommendations only prefill the guarded order ticket, every run
+cost-metered against a daily budget), and now **taxes**: per-lot Form 8949
+rows with wash-sale detection (IRC §1091, code W), Schedule D totals, and
+CSV export. Wash detection reports disallowed losses but does not
+carry basis forward into replacement lots — reconcile with your broker's
+1099-B; not tax advice. See
 [PLAN.md](PLAN.md) for the full design and roadmap, and
 [docs/RESEARCH.md](docs/RESEARCH.md) for the research behind it.
 

@@ -10,6 +10,7 @@ pub mod market;
 pub mod orders;
 pub mod portfolio;
 pub mod signals;
+pub mod taxes;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
