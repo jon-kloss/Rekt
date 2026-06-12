@@ -26,6 +26,7 @@ pub struct RunConfig<'a> {
 }
 
 /// The result of a completed loop.
+#[derive(Debug)]
 pub struct RunOutcome {
     /// Final response text (or the raw JSON when `output_schema` was set).
     pub text: String,
@@ -34,11 +35,20 @@ pub struct RunOutcome {
     pub tool_log: Vec<Value>,
 }
 
+/// A failed loop STILL carries the usage that was billed before it failed —
+/// dropping it would make failed runs invisible to budget accounting.
+#[derive(Debug)]
+pub struct RunFailure {
+    pub error: AnalystError,
+    pub usage: UsageTotals,
+    pub tool_log: Vec<Value>,
+}
+
 pub async fn run(
     transport: &dyn Transport,
     tools: Option<&dyn ToolExecutor>,
     config: RunConfig<'_>,
-) -> Result<RunOutcome, AnalystError> {
+) -> Result<RunOutcome, RunFailure> {
     let mut tool_definitions: Vec<Value> = tools.map(|t| t.definitions()).unwrap_or_default();
     tool_definitions.extend(config.server_tools.iter().cloned());
 
@@ -48,13 +58,24 @@ pub async fn run(
     })];
     let mut usage = UsageTotals::default();
     let mut tool_log: Vec<Value> = Vec::new();
+    // Any early exit must carry the usage accumulated so far.
+    macro_rules! fail {
+        ($error:expr) => {
+            return Err(RunFailure {
+                error: $error,
+                usage,
+                tool_log,
+            })
+        };
+    }
 
     for _ in 0..config.max_iterations {
         let mut request = json!({
             "model": config.model,
             "max_tokens": config.max_tokens,
-            // Stable prefix first, cache breakpoint on the system block:
-            // tools render before system, so this caches both together.
+            // Stable prefix first, cache breakpoint on the system block
+            // (which also covers the tools rendered before it — for runs
+            // that share the same tool set; tool sets differ per kind).
             "system": [{
                 "type": "text",
                 "text": config.system,
@@ -72,24 +93,35 @@ pub async fn run(
             request["output_config"] = json!({"format": schema});
         }
 
-        let response = transport.send(&request).await?;
+        let response = match transport.send(&request).await {
+            Ok(response) => response,
+            Err(error) => fail!(error),
+        };
         usage.add(&response.usage);
 
         match response.stop_reason.as_deref() {
             Some("end_turn") | Some("stop_sequence") => {
+                // Structured outputs guarantee the FIRST text block is the
+                // schema-valid JSON — trailing commentary blocks must not
+                // be concatenated into it.
+                let text = if config.output_schema.is_some() {
+                    response.structured_text()
+                } else {
+                    response.text()
+                };
                 return Ok(RunOutcome {
-                    text: response.text(),
+                    text,
                     usage,
                     tool_log,
                 });
             }
             Some("max_tokens") => {
                 // Truncated output is dishonest output — fail loudly.
-                return Err(AnalystError::BadResponse(
+                fail!(AnalystError::BadResponse(
                     "response hit max_tokens before finishing".into(),
                 ));
             }
-            Some("refusal") => return Err(AnalystError::Refused),
+            Some("refusal") => fail!(AnalystError::Refused),
             // Server-side tool (web search) paused its loop: echo the
             // assistant turn back verbatim and the API resumes on its own.
             Some("pause_turn") => {
@@ -99,7 +131,7 @@ pub async fn run(
                 let calls = response.tool_uses();
                 messages.push(json!({"role": "assistant", "content": response.content}));
                 let Some(executor) = tools else {
-                    return Err(AnalystError::BadResponse(
+                    fail!(AnalystError::BadResponse(
                         "model called a tool but no executor is configured".into(),
                     ));
                 };
@@ -120,13 +152,17 @@ pub async fn run(
                 messages.push(json!({"role": "user", "content": results}));
             }
             other => {
-                return Err(AnalystError::BadResponse(format!(
+                fail!(AnalystError::BadResponse(format!(
                     "unexpected stop_reason {other:?}"
                 )));
             }
         }
     }
-    Err(AnalystError::LoopLimit(config.max_iterations))
+    Err(RunFailure {
+        error: AnalystError::LoopLimit(config.max_iterations),
+        usage,
+        tool_log,
+    })
 }
 
 #[cfg(test)]
@@ -270,10 +306,12 @@ mod tests {
             "stop_reason": "refusal",
             "usage": {"input_tokens": 1, "output_tokens": 0}
         })]);
-        assert!(matches!(
-            run(&refusing, Some(&FakeTools), config()).await,
-            Err(AnalystError::Refused)
-        ));
+        let failure = run(&refusing, Some(&FakeTools), config())
+            .await
+            .unwrap_err();
+        assert!(matches!(failure.error, AnalystError::Refused));
+        // The tokens the refused call billed survive the failure.
+        assert_eq!(failure.usage.input_tokens, 1);
     }
 
     #[tokio::test]
@@ -291,8 +329,11 @@ mod tests {
             })
             .collect();
         let script = Script::new(endless);
-        let result = run(&script, Some(&FakeTools), config()).await;
-        assert!(matches!(result, Err(AnalystError::LoopLimit(5))));
+        let failure = run(&script, Some(&FakeTools), config()).await.unwrap_err();
+        assert!(matches!(failure.error, AnalystError::LoopLimit(5)));
+        // Five paid calls are still accounted on the failure path.
+        assert_eq!(failure.usage.requests, 5);
+        assert_eq!(failure.usage.input_tokens, 5);
         // Unknown tool became an is_error result, not a crash.
         let requests = script.requests.lock().unwrap();
         assert_eq!(requests[1]["messages"][2]["content"][0]["is_error"], true);

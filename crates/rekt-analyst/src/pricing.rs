@@ -20,6 +20,15 @@ fn rates(model: &str) -> (Decimal, Decimal) {
     }
 }
 
+/// Worst-case OUTPUT cost of one response (`max_tokens` × output rate) —
+/// budget gates use it as headroom so an in-flight run can't sail
+/// arbitrarily far past the ceiling. (Input cost is unbounded by nature —
+/// web search results — and stays post-hoc.)
+pub fn max_output_cost(model: &str, max_tokens: u32) -> Decimal {
+    let (_, output_rate) = rates(model);
+    (Decimal::from(max_tokens) * output_rate / Decimal::from(1_000_000u64)).round_dp(6)
+}
+
 pub fn cost_usd(model: &str, totals: &UsageTotals) -> Decimal {
     let (input_rate, output_rate) = rates(model);
     let million = Decimal::from(1_000_000u64);

@@ -7,7 +7,8 @@
 //! ticket the human confirms through /api/orders with every guardrail.
 //! Every run is cost-metered and a daily budget gates new runs.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::{
@@ -15,10 +16,10 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use chrono::{Duration, Utc};
-use rekt_analyst::runner::{run, RunConfig};
-use rekt_analyst::{pricing, ToolExecutor, ANALYST_MODEL, BRIEFING_MODEL};
-use rust_decimal::Decimal;
+use chrono::{DateTime, Duration, Utc};
+use chrono_tz::America::New_York;
+use rekt_analyst::runner::{run, RunConfig, RunOutcome};
+use rekt_analyst::{pricing, ToolExecutor, UsageTotals, ANALYST_MODEL, BRIEFING_MODEL};
 use serde_json::{json, Value};
 
 use crate::api::{err, internal, validate_symbol, ApiError};
@@ -29,6 +30,32 @@ use crate::{repo, AppState};
 const RECOMMENDATION_TTL_DAYS: i64 = 7;
 /// Generous cap on loop iterations (each is one API call).
 const MAX_ITERATIONS: usize = 12;
+
+/// Midnight of the CURRENT New York calendar day, as UTC. Both the budget
+/// day and the scheduler's once-per-day guards use this — mixing UTC days
+/// with NY fire conditions would re-open the window every evening.
+fn ny_day_start() -> DateTime<Utc> {
+    Utc::now()
+        .with_timezone(&New_York)
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is a valid time")
+        .and_local_timezone(New_York)
+        .single()
+        .expect("NY midnight is never ambiguous (US DST shifts at 2am)")
+        .to_utc()
+}
+
+/// Releases the single-flight latch on success, error, AND panic — a
+/// detached task's panic is swallowed by tokio, so only a destructor can
+/// guarantee the analyst doesn't wedge until restart.
+struct RunningGuard(Arc<AtomicBool>);
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
 
 /// Frozen system prompt — byte-identical across runs so the prompt cache
 /// holds (volatile data travels in the user turn, never here).
@@ -107,6 +134,17 @@ impl ToolExecutor for ServerTools {
                 let snapshot = crate::live::portfolio_snapshot(&self.state)
                     .await
                     .map_err(|e| format!("portfolio unavailable: {e}"))?;
+                // The inconsistent-log payload is Ok(type:"error") — passing
+                // its missing keys through as nulls would hand the model a
+                // phantom empty portfolio. Fail the tool call honestly.
+                if snapshot["type"] == "error" {
+                    return Err(format!(
+                        "portfolio unavailable: {}",
+                        snapshot["error"]
+                            .as_str()
+                            .unwrap_or("inconsistent transaction log")
+                    ));
+                }
                 // The model gets portfolio + watchlist, not trading internals.
                 Ok(json!({
                     "portfolio": snapshot["portfolio"],
@@ -181,23 +219,44 @@ fn review_schema() -> Value {
     })
 }
 
-/// Compact context block injected into the user turn (volatile data lives
-/// here, after the cached prefix).
-async fn context_block(state: &AppState) -> String {
-    let snapshot = crate::live::portfolio_snapshot(state).await.ok();
-    let portfolio = snapshot
-        .as_ref()
-        .map(|s| json!({"portfolio": s["portfolio"], "watchlist": s["watchlist"]}).to_string())
-        .unwrap_or_else(|| "portfolio unavailable".into());
+/// "Today is …" line for every user turn (volatile data lives after the
+/// cached prefix, never in the system prompt).
+fn date_line() -> String {
     format!(
-        "Today is {}.\n\nCurrent state:\n{portfolio}",
-        Utc::now().format("%Y-%m-%d")
+        "Today is {}.",
+        Utc::now().with_timezone(&New_York).format("%Y-%m-%d")
     )
+}
+
+/// Full portfolio context injected into the BRIEFING user turn (the
+/// briefing is the tool-less, single-call kind — review/ask fetch fresh
+/// data through get_portfolio instead of carrying a pre-baked copy).
+async fn portfolio_context(state: &AppState) -> String {
+    match crate::live::portfolio_snapshot(state).await {
+        // Honesty over nulls: the inconsistent-log payload must read as an
+        // error, not as an empty portfolio.
+        Ok(snapshot) if snapshot["type"] == "error" => format!(
+            "Portfolio unavailable: {}",
+            snapshot["error"]
+                .as_str()
+                .unwrap_or("inconsistent transaction log")
+        ),
+        Ok(snapshot) => json!({
+            "portfolio": snapshot["portfolio"],
+            "watchlist": snapshot["watchlist"],
+        })
+        .to_string(),
+        Err(e) => format!("Portfolio unavailable: {e}"),
+    }
 }
 
 /// Run one analysis end to end and persist the outcome. Spawned in the
 /// background; all failures land in the analyses row, never silently.
 pub async fn run_analysis(state: AppState, id: i64, kind: String, question: Option<String>) {
+    // Drop guard, not a trailing store: tokio swallows panics in detached
+    // tasks, and a wedged latch would 409 every future run until restart.
+    let _running = RunningGuard(state.analyst_running.clone());
+
     match run_analysis_inner(&state, &kind, question.as_deref()).await {
         Ok((outcome, model)) => {
             let tool_log = serde_json::to_string(&outcome.tool_log).ok();
@@ -244,78 +303,96 @@ pub async fn run_analysis(state: AppState, id: i64, kind: String, question: Opti
                 None => tracing::info!(analysis = id, kind, "analysis complete"),
             }
         }
-        Err(message) => {
-            tracing::error!(analysis = id, kind, %message, "analysis failed");
+        Err(failure) => {
+            tracing::error!(analysis = id, kind, message = %failure.message, "analysis failed");
+            // The tokens a FAILED run billed must still count against the
+            // budget — zeros here would let failures spend invisibly.
+            let tool_log = serde_json::to_string(&failure.tool_log).ok();
             let row = repo::AnalysisOutcome {
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-                cost_usd: Decimal::ZERO,
+                input_tokens: failure.usage.input_tokens as i64,
+                output_tokens: failure.usage.output_tokens as i64,
+                cache_read_tokens: failure.usage.cache_read_tokens as i64,
+                cache_write_tokens: failure.usage.cache_write_tokens as i64,
+                cost_usd: pricing::cost_usd(failure.model, &failure.usage),
                 report_md: None,
-                tool_log_json: None,
-                error: Some(&message),
+                tool_log_json: tool_log.as_deref(),
+                error: Some(&failure.message),
             };
             if let Err(e) = repo::finish_analysis(&state.db, id, row).await {
                 tracing::error!(analysis = id, error = %e, "failed to persist analysis error");
             }
         }
     }
-    state.analyst_running.store(false, Ordering::Relaxed);
+}
+
+/// Everything a failed run still owes the books.
+struct RunFailureDetails {
+    message: String,
+    usage: UsageTotals,
+    tool_log: Vec<Value>,
+    model: &'static str,
 }
 
 async fn run_analysis_inner(
     state: &AppState,
     kind: &str,
     question: Option<&str>,
-) -> Result<(rekt_analyst::runner::RunOutcome, &'static str), String> {
+) -> Result<(RunOutcome, &'static str), RunFailureDetails> {
+    // Kind split: the BRIEFING is the inject-and-answer kind — portfolio
+    // context in the user turn, NO tools, one cheap Haiku call. Review/ask
+    // get the tool surface instead and fetch fresh data exactly once.
+    let (model, max_tokens) = kind_params(kind);
+    let fail = |message: String| RunFailureDetails {
+        message,
+        usage: UsageTotals::default(),
+        tool_log: Vec::new(),
+        model,
+    };
     let Some(transport) = &state.analyst else {
-        return Err("no ANTHROPIC_API_KEY configured".into());
+        return Err(fail("no ANTHROPIC_API_KEY configured".into()));
     };
-    let tools = ServerTools {
-        state: state.clone(),
-    };
-    let context = context_block(state).await;
+    let date = date_line();
 
-    let (model, user_content, server_tools, output_schema, max_tokens) = match kind {
+    let (user_content, use_tools, server_tools, output_schema) = match kind {
         "briefing" => (
-            BRIEFING_MODEL,
             format!(
-                "{context}\n\nWrite this morning's briefing: 1) portfolio state in two sentences, \
-                 2) the signals that deserve attention today, 3) anything to watch. \
-                 Under 250 words."
+                "{date}\n\nCurrent state:\n{}\n\nWrite this morning's briefing: 1) portfolio \
+                 state in two sentences, 2) the signals that deserve attention today, \
+                 3) anything to watch. Under 250 words.",
+                portfolio_context(state).await
             ),
+            false,
             vec![],
             None,
-            2048u32,
         ),
         "weekly_review" => (
-            ANALYST_MODEL,
             format!(
-                "{context}\n\nDo the weekly deep review: performance vs the SPY benchmark, \
+                "{date}\n\nDo the weekly deep review: performance vs the SPY benchmark, \
                  position-by-position assessment using signals and recent price action, \
                  concentration and cash posture, and what changed this week in the market that \
                  affects these holdings (use web_search). End with concrete recommendations."
             ),
+            true,
             vec![json!({"type": "web_search_20260209", "name": "web_search", "max_uses": 6})],
             Some(review_schema()),
-            16000,
         ),
         _ => (
-            ANALYST_MODEL,
             format!(
-                "{context}\n\nQuestion from the user:\n{}",
+                "{date}\n\nQuestion from the user:\n{}",
                 question.unwrap_or("Analyze my portfolio.")
             ),
+            true,
             vec![json!({"type": "web_search_20260209", "name": "web_search", "max_uses": 4})],
             None,
-            8000,
         ),
     };
 
+    let tools = ServerTools {
+        state: state.clone(),
+    };
     let outcome = run(
         transport.as_ref(),
-        Some(&tools),
+        use_tools.then_some(&tools as &dyn ToolExecutor),
         RunConfig {
             model,
             max_tokens,
@@ -328,8 +405,23 @@ async fn run_analysis_inner(
         },
     )
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|failure| RunFailureDetails {
+        message: failure.error.to_string(),
+        usage: failure.usage,
+        tool_log: failure.tool_log,
+        model,
+    })?;
     Ok((outcome, model))
+}
+
+/// Model + max_tokens per kind — shared by the run path and the budget
+/// gate's worst-case estimate.
+fn kind_params(kind: &str) -> (&'static str, u32) {
+    match kind {
+        "briefing" => (BRIEFING_MODEL, 2048),
+        "weekly_review" => (ANALYST_MODEL, 16000),
+        _ => (ANALYST_MODEL, 8000),
+    }
 }
 
 /// Persist parsed recommendations; invalid symbols are skipped loudly.
@@ -380,19 +472,22 @@ async fn start_run(
             "AI analyst disabled — set ANTHROPIC_API_KEY",
         ));
     }
-    let today = Utc::now()
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight")
-        .and_utc();
-    let spent = repo::analyses_cost_since(&state.db, today)
+    // Budget gate (NY day, like the scheduler): the gate requires headroom
+    // for this run's WORST-CASE output cost, so a run can't sail
+    // arbitrarily far past the ceiling. Input cost (web search results) is
+    // unbounded by nature and stays post-hoc — a run in flight may finish
+    // somewhat past the budget; the next run is then blocked.
+    let spent = repo::analyses_cost_since(&state.db, ny_day_start())
         .await
         .map_err(internal)?;
-    if spent >= state.ai_budget {
+    let (model, max_tokens) = kind_params(kind);
+    let headroom = pricing::max_output_cost(model, max_tokens);
+    if spent + headroom > state.ai_budget {
         return Err(err(
             StatusCode::TOO_MANY_REQUESTS,
             format!(
-                "daily AI budget reached (${spent} of ${} — raise REKT_AI_DAILY_BUDGET)",
+                "daily AI budget would be exceeded (${spent} spent of ${}, this run reserves \
+                 ${headroom} — raise REKT_AI_DAILY_BUDGET)",
                 state.ai_budget
             ),
         ));
@@ -409,11 +504,6 @@ async fn start_run(
         ));
     }
 
-    let model = if kind == "briefing" {
-        BRIEFING_MODEL
-    } else {
-        ANALYST_MODEL
-    };
     let id = match repo::insert_analysis(&state.db, kind, model, question.as_deref()).await {
         Ok(id) => id,
         Err(e) => {
@@ -464,19 +554,21 @@ pub async fn ask(
 }
 
 /// GET /api/analyst — one payload for the dashboard section: enablement,
-/// budget state, recent analyses and recommendations.
+/// budget state, recent analyses (LIGHT — no report bodies; this endpoint
+/// is polled every 3s during a run) plus the latest analysis in full.
 pub async fn summary(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let today = Utc::now()
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight")
-        .and_utc();
-    let spent = repo::analyses_cost_since(&state.db, today)
+    let spent = repo::analyses_cost_since(&state.db, ny_day_start())
         .await
         .map_err(internal)?;
-    let analyses = repo::recent_analyses(&state.db, 8)
+    let analyses = repo::recent_analyses_light(&state.db, 8)
         .await
         .map_err(internal)?;
+    let latest = match analyses.first() {
+        Some(first) => repo::get_analysis(&state.db, first.id)
+            .await
+            .map_err(internal)?,
+        None => None,
+    };
     let recommendations = repo::list_recommendations(&state.db, 20)
         .await
         .map_err(internal)?;
@@ -485,6 +577,7 @@ pub async fn summary(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
         "running": state.analyst_running.load(Ordering::Relaxed),
         "today_cost_usd": spent,
         "budget_usd": state.ai_budget,
+        "latest": latest,
         "analyses": analyses,
         "recommendations": recommendations,
     })))
@@ -539,17 +632,15 @@ pub async fn dismiss_recommendation(
 /// and single-flight rules identical to manual runs.
 pub async fn maybe_scheduled_runs(state: &AppState) -> anyhow::Result<()> {
     use chrono::{Datelike, Timelike, Weekday};
-    use chrono_tz::America::New_York;
 
     if state.analyst.is_none() {
         return Ok(());
     }
     let now_ny = Utc::now().with_timezone(&New_York);
-    let today_start = Utc::now()
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight")
-        .and_utc();
+    // NY midnight, NOT UTC midnight: the fire condition below is NY time,
+    // so a UTC day boundary (~8pm ET) would re-open the once-per-day guard
+    // every evening and fire duplicate paid briefings.
+    let today_start = ny_day_start();
 
     let is_weekday = !matches!(now_ny.weekday(), Weekday::Sat | Weekday::Sun);
     if is_weekday

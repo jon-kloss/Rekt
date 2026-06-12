@@ -43,7 +43,9 @@ alert push: `REKT_NTFY_TOPIC` (topic on the public ntfy.sh — **the topic
 name is the only secret**: anyone who guesses it can read your trade
 alerts, so use a long random string, or better, self-host ntfy and set
 `REKT_NTFY_URL`), AI analyst: `ANTHROPIC_API_KEY`, `REKT_AI_DAILY_BUDGET`
-(USD spend ceiling, default 2.50), `REKT_AI_AUTO` (set 0 to disable the
+(USD/day, default 2.50 — gates new runs, reserving each run's worst-case
+output cost; a run already in flight may finish somewhat past the ceiling
+and the next run is then blocked), `REKT_AI_AUTO` (set 0 to disable the
 scheduled briefing/review), and guardrails:
 `REKT_MAX_ORDER_NOTIONAL` (default 10000), `REKT_MAX_POSITION_PCT`
 (default 25), `REKT_MAX_ORDERS_PER_DAY` (default 20),

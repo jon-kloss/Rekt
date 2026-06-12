@@ -227,10 +227,10 @@
   <section>
     <h2>AI Analyst <span id="ai-meta" class="muted" style="text-transform:none;letter-spacing:0"></span></h2>
     <div class="controls" style="margin-top:0">
-      <button id="ai-briefing">☀ morning briefing</button>
-      <button id="ai-review">🔍 weekly deep review</button>
+      <button id="ai-briefing" disabled>☀ morning briefing</button>
+      <button id="ai-review" disabled>🔍 weekly deep review</button>
       <input id="ai-question" placeholder="ask the analyst…" style="flex:1;min-width:220px">
-      <button id="ai-ask" class="primary">ask</button>
+      <button id="ai-ask" class="primary" disabled>ask</button>
     </div>
     <div id="ai-msg" class="warn"></div>
     <div id="ai-report" class="aireport muted">no analyses yet</div>
@@ -864,7 +864,7 @@ async function loadAnalyst() {
     meta.textContent = `— $${fmt(data.today_cost_usd)} of $${fmt(data.budget_usd)} today` +
       (data.running ? " · analyzing…" : "");
 
-    const latest = (data.analyses ?? [])[0];
+    const latest = data.latest;
     const report = $("ai-report");
     if (latest) {
       const when = latest.started_ts.slice(0, 16).replace("T", " ");
@@ -901,7 +901,11 @@ async function loadAnalyst() {
     // Poll while a run is in flight so the report appears when it lands.
     if (data.running && !aiPollTimer) aiPollTimer = setInterval(loadAnalyst, 3000);
     if (!data.running && aiPollTimer) { clearInterval(aiPollTimer); aiPollTimer = null; }
-  } catch { $("ai-msg").textContent = "analyst status unavailable"; }
+  } catch {
+    $("ai-msg").textContent = "analyst status unavailable";
+    // Stop polling into an outage; the next user action restarts it.
+    if (aiPollTimer) { clearInterval(aiPollTimer); aiPollTimer = null; }
+  }
 }
 
 async function aiTrigger(url, body) {

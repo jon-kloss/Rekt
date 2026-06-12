@@ -103,6 +103,18 @@ impl MessageResponse {
             .join("\n")
     }
 
+    /// The FIRST text block only — structured outputs guarantee the first
+    /// text block carries the schema-valid JSON; any later text block is
+    /// commentary that would corrupt a concatenated parse.
+    pub fn structured_text(&self) -> String {
+        self.content
+            .iter()
+            .find(|block| block["type"] == "text")
+            .and_then(|block| block["text"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
     /// Client-tool calls awaiting execution: (id, name, input).
     /// `server_tool_use` blocks are excluded — Anthropic runs those.
     pub fn tool_uses(&self) -> Vec<(String, String, serde_json::Value)> {
@@ -241,6 +253,8 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(response.text(), "Hello\nworld");
+        // Structured parses must never see trailing commentary blocks.
+        assert_eq!(response.structured_text(), "Hello");
         let tools = response.tool_uses();
         assert_eq!(tools.len(), 1, "server_tool_use must not be executed by us");
         assert_eq!(tools[0].1, "get_portfolio");

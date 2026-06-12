@@ -644,11 +644,16 @@ pub async fn get_analysis(pool: &SqlitePool, id: i64) -> Result<Option<AnalysisR
     row.map(analysis_from_row).transpose()
 }
 
-/// Recent analyses, newest first.
-pub async fn recent_analyses(pool: &SqlitePool, limit: i64) -> Result<Vec<AnalysisRecord>> {
-    let rows = sqlx::query(&format!(
-        "SELECT {ANALYSIS_COLUMNS} FROM analyses ORDER BY id DESC LIMIT ?"
-    ))
+/// Recent analyses WITHOUT report bodies — the polled summary endpoint
+/// must not ship kilobytes of markdown the client discards. Fetch the full
+/// record by id when the body is needed.
+pub async fn recent_analyses_light(pool: &SqlitePool, limit: i64) -> Result<Vec<AnalysisRecord>> {
+    let rows = sqlx::query(
+        r#"SELECT id, kind, model, status, started_ts, finished_ts,
+                  input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                  cost_usd, question, NULL AS report_md, error
+           FROM analyses ORDER BY id DESC LIMIT ?"#,
+    )
     .bind(limit)
     .fetch_all(pool)
     .await?;
@@ -730,24 +735,23 @@ pub async fn insert_recommendation(pool: &SqlitePool, rec: NewRecommendation<'_>
     Ok(result.last_insert_rowid())
 }
 
-/// Recommendations, newest first, after lapsing anything past its expiry —
-/// stale advice must never look current.
+/// Recommendations, newest first. Expiry is COMPUTED at read time (a pure
+/// SELECT — no write-per-poll, no UPDATE/SELECT race): a lapsed open row
+/// presents as 'expired', and the status-transition guard below refuses to
+/// move it, so stale advice can never look or act current.
 pub async fn list_recommendations(
     pool: &SqlitePool,
     limit: i64,
 ) -> Result<Vec<RecommendationRecord>> {
-    sqlx::query(
-        "UPDATE recommendations SET status = 'expired' WHERE status = 'open' AND expires_ts < ?",
-    )
-    .bind(Utc::now().to_rfc3339())
-    .execute(pool)
-    .await?;
     let rows = sqlx::query(
         r#"SELECT r.id, r.analysis_id, i.symbol, r.action, r.sizing, r.rationale,
-                  r.confidence, r.status, r.created_ts, r.expires_ts
+                  r.confidence, r.created_ts, r.expires_ts,
+                  CASE WHEN r.status = 'open' AND r.expires_ts IS NOT NULL AND r.expires_ts < ?1
+                       THEN 'expired' ELSE r.status END AS status
            FROM recommendations r JOIN instruments i ON i.id = r.instrument_id
-           ORDER BY (r.status = 'open') DESC, r.id DESC LIMIT ?"#,
+           ORDER BY (status = 'open') DESC, r.id DESC LIMIT ?2"#,
     )
+    .bind(Utc::now().to_rfc3339())
     .bind(limit)
     .fetch_all(pool)
     .await?;
@@ -770,12 +774,18 @@ pub async fn list_recommendations(
 
 /// open → accepted/dismissed; the status guard keeps double-clicks honest.
 pub async fn set_recommendation_status(pool: &SqlitePool, id: i64, status: &str) -> Result<bool> {
-    let result =
-        sqlx::query("UPDATE recommendations SET status = ? WHERE id = ? AND status = 'open'")
-            .bind(status)
-            .bind(id)
-            .execute(pool)
-            .await?;
+    // The expiry clause pairs with list_recommendations' computed status:
+    // a lapsed recommendation presents as 'expired' and cannot be moved.
+    let result = sqlx::query(
+        r#"UPDATE recommendations SET status = ?
+           WHERE id = ? AND status = 'open'
+             AND (expires_ts IS NULL OR expires_ts >= ?)"#,
+    )
+    .bind(status)
+    .bind(id)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
     Ok(result.rows_affected() > 0)
 }
 

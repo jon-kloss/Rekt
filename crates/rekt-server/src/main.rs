@@ -1449,6 +1449,13 @@ mod tests {
 
         // The valid recommendation persisted; the invalid symbol was skipped.
         let (_, summary) = request(state.clone(), "GET", "/api/analyst", None).await;
+        // Poll payload stays light: list rows carry no report body; the
+        // full report rides only on "latest".
+        assert!(summary["analyses"][0]["report_md"].is_null());
+        assert_eq!(
+            summary["latest"]["report_md"].as_str().unwrap(),
+            "## Review\nAll holdings fine."
+        );
         let recs = summary["recommendations"].as_array().unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0]["symbol"], "AAPL");
@@ -1496,10 +1503,49 @@ mod tests {
         let analysis = wait_for_analysis(&state, id).await;
         assert_eq!(analysis.status, "error");
         assert!(analysis.error.unwrap().contains("declined"));
+        // The tokens the refused call billed are still accounted.
+        assert_eq!(analysis.input_tokens, 1);
+        assert!(analysis.cost_usd > rust_decimal::Decimal::ZERO);
 
         // The single-flight latch released — a new run can start.
         assert!(!state
             .analyst_running
             .load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn lapsed_recommendations_present_as_expired_and_refuse_transitions() {
+        let state = test_state().await;
+        let analysis_id = repo::insert_analysis(&state.db, "weekly_review", "m", None)
+            .await
+            .unwrap();
+        let rec_id = repo::insert_recommendation(
+            &state.db,
+            repo::NewRecommendation {
+                analysis_id,
+                symbol: "AAPL",
+                action: "buy",
+                sizing: "",
+                rationale: "was timely a week ago",
+                confidence: "low",
+                expires_ts: chrono::Utc::now() - chrono::Duration::hours(1),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Read-time computed status: presents as expired without any write.
+        let recs = repo::list_recommendations(&state.db, 10).await.unwrap();
+        assert_eq!(recs[0].status, "expired");
+
+        // And the transition guard refuses to act on it.
+        let (status, _) = request(
+            state,
+            "POST",
+            &format!("/api/recommendations/{rec_id}/accept"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 }
