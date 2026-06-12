@@ -155,8 +155,9 @@ pub struct Guardrails {
     /// Maximum orders submitted per calendar day (America/New_York).
     pub max_orders_per_day: u32,
     /// Circuit breaker (Freqtrade `StoplossGuard` pattern, PLAN.md §4):
-    /// block new orders once today's realized loss exceeds this. `None`
-    /// disables.
+    /// block new BUYS once today's realized loss exceeds this — sells stay
+    /// allowed so a tripped breaker never locks you into a falling position.
+    /// `None` disables.
     pub max_daily_loss: Option<Decimal>,
 }
 
@@ -246,12 +247,16 @@ pub fn check_ticket(
     if trading_paused {
         return Err(GuardrailViolation::TradingPaused);
     }
-    if let Some(max_loss) = rails.max_daily_loss {
-        if realized_today <= -max_loss {
-            return Err(GuardrailViolation::DailyLossBreaker {
-                loss: -realized_today.round_dp(2),
-                max: max_loss,
-            });
+    // Buys only: a breaker that blocked sells would forbid REDUCING risk
+    // exactly when the user most needs to exit a falling position.
+    if matches!(ticket.side, Side::Buy) {
+        if let Some(max_loss) = rails.max_daily_loss {
+            if realized_today <= -max_loss {
+                return Err(GuardrailViolation::DailyLossBreaker {
+                    loss: -realized_today.round_dp(2),
+                    max: max_loss,
+                });
+            }
         }
     }
     if ticket.qty <= Decimal::ZERO {
@@ -495,6 +500,22 @@ mod tests {
             err,
             Err(GuardrailViolation::DailyLossBreaker { .. })
         ));
+        // Sells stay allowed — the breaker must never lock the user into a
+        // losing position.
+        let sell = ticket("AAPL", Side::Sell, "5", OrderType::Limit, Some("100"));
+        assert!(check_ticket(
+            &sell,
+            &TicketContext {
+                basis: &basis,
+                last_price: None,
+                equity: dec("100000"),
+                orders_today: 0,
+                realized_today: dec("-1500"),
+                trading_paused: false,
+            },
+            &rails,
+        )
+        .is_ok());
         // A profitable day doesn't trip it.
         assert!(check_ticket(
             &t,

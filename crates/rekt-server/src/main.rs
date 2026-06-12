@@ -7,6 +7,7 @@
 //!   the API answers 503 with an explanation instead of pretending.
 
 mod api;
+mod history;
 mod live;
 mod repo;
 mod trading;
@@ -28,6 +29,8 @@ use tokio::sync::{broadcast, watch, Mutex};
 pub struct AppState {
     pub db: SqlitePool,
     pub market: Option<Arc<dyn MarketData>>,
+    /// Daily-bars provider (Alpaca data API) for candles/backfill.
+    pub bars: Option<Arc<dyn MarketData>>,
     pub finnhub_token: Option<String>,
     pub broker: Option<Arc<dyn rekt_broker::Broker>>,
     pub trading: Arc<trading::TradingState>,
@@ -49,6 +52,7 @@ fn app(state: AppState) -> Router {
         .route("/api/transactions", get(api::list_txs).post(api::create_tx))
         .route("/api/transactions/{id}", delete(api::delete_tx))
         .route("/api/import/csv", post(api::import_csv))
+        .route("/api/history", get(history::history))
         .route(
             "/api/orders",
             get(trading::list_orders).post(trading::submit_order),
@@ -103,6 +107,10 @@ async fn quote(
         Err(DataError::RateLimited) => Err(api::err(
             StatusCode::TOO_MANY_REQUESTS,
             "provider rate limit hit, try again shortly",
+        )),
+        Err(DataError::Unsupported(what)) => Err(api::err(
+            StatusCode::NOT_IMPLEMENTED,
+            format!("provider does not support {what}"),
         )),
         Err(DataError::Upstream(msg)) => Err(api::err(StatusCode::BAD_GATEWAY, msg)),
     }
@@ -167,13 +175,6 @@ async fn main() -> anyhow::Result<()> {
     let finnhub_token = std::env::var("FINNHUB_API_KEY")
         .ok()
         .filter(|t| !t.is_empty());
-    let market: Option<Arc<dyn MarketData>> = match &finnhub_token {
-        Some(token) => Some(Arc::new(Finnhub::new(token.clone()))),
-        None => {
-            tracing::warn!("FINNHUB_API_KEY not set — quotes and live feed disabled");
-            None
-        }
-    };
 
     // Phase 2 ships PAPER ONLY (PLAN.md §4): live mode arrives behind an
     // explicit toggle after a paper soak, with separate key config.
@@ -191,6 +192,25 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+
+    // Quotes: Finnhub primary, Alpaca data API as the guaranteed fallback
+    // (PLAN.md §3 — the trading account exists anyway).
+    let alpaca_data = alpaca_keys
+        .clone()
+        .map(|(key, secret)| Arc::new(rekt_data::alpaca_data::AlpacaData::new(key, secret)));
+    let market: Option<Arc<dyn MarketData>> = match (&finnhub_token, &alpaca_data) {
+        (Some(token), _) => Some(Arc::new(Finnhub::new(token.clone()))),
+        (None, Some(alpaca)) => {
+            tracing::info!("no FINNHUB_API_KEY — using Alpaca data API for quotes");
+            Some(alpaca.clone() as Arc<dyn MarketData>)
+        }
+        (None, None) => {
+            tracing::warn!("no market data keys — quotes disabled");
+            None
+        }
+    };
+    // Daily bars are Alpaca-only (Finnhub's free tier dropped candles).
+    let bars: Option<Arc<dyn MarketData>> = alpaca_data.map(|alpaca| alpaca as Arc<dyn MarketData>);
     let broker: Option<Arc<dyn rekt_broker::Broker>> = alpaca_keys.clone().map(|(key, secret)| {
         Arc::new(rekt_broker::alpaca::Alpaca::paper(key, secret)) as Arc<dyn rekt_broker::Broker>
     });
@@ -200,6 +220,7 @@ async fn main() -> anyhow::Result<()> {
     let state = live::start(move |handles| AppState {
         db,
         market,
+        bars,
         finnhub_token,
         broker,
         trading: Arc::new(trading::TradingState::default()),
@@ -249,6 +270,24 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(mode = "paper", "broker configured — reconciling");
     }
 
+    // History pipeline: candle backfill + EOD snapshots (needs the bars
+    // provider). First tick is immediate, then every 30 minutes.
+    if state.bars.is_some() {
+        let hist_state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1800));
+            loop {
+                tick.tick().await;
+                if let Err(e) = history::backfill_candles(&hist_state).await {
+                    tracing::error!(error = %e, "candle backfill failed");
+                }
+                if let Err(e) = history::maybe_snapshot_eod(&hist_state).await {
+                    tracing::error!(error = %e, "EOD snapshot failed");
+                }
+            }
+        });
+    }
+
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     tracing::info!(addr = %listen, "REKT listening — how rekt are you today?");
     axum::serve(listener, app(state))
@@ -276,6 +315,7 @@ mod tests {
         AppState {
             db: pool,
             market: None,
+            bars: None,
             finnhub_token: None,
             broker: None,
             trading: Arc::new(trading::TradingState::default()),
@@ -794,6 +834,62 @@ mod tests {
             .unwrap()
             .get("status");
         assert_eq!(status, "filled", "terminal state must never regress");
+    }
+
+    #[tokio::test]
+    async fn history_endpoint_builds_equity_curve_with_benchmark() {
+        let state = test_state().await;
+        // Empty log → empty curve with an explanation.
+        let (status, json) = request(state.clone(), "GET", "/api/history?range=all", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["points"].as_array().unwrap().is_empty());
+
+        // Deposit + buy on day 1; candles for the symbol and SPY.
+        for body in [
+            serde_json::json!({"kind":"deposit","price":"1000","ts":"2026-06-01T15:00:00Z"}),
+            serde_json::json!({"kind":"buy","symbol":"AAPL","qty":"10","price":"100","ts":"2026-06-01T15:30:00Z"}),
+        ] {
+            let (status, _) = request(state.clone(), "POST", "/api/transactions", Some(body)).await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+        let candle = |date: &str, close: &str| rekt_core::Candle {
+            date: date.parse().unwrap(),
+            open: close.parse().unwrap(),
+            high: close.parse().unwrap(),
+            low: close.parse().unwrap(),
+            close: close.parse().unwrap(),
+            volume: 1,
+        };
+        repo::upsert_candles(
+            &state.db,
+            "AAPL",
+            &[candle("2026-06-01", "100"), candle("2026-06-02", "120")],
+        )
+        .await
+        .unwrap();
+        repo::upsert_candles(
+            &state.db,
+            "SPY",
+            &[candle("2026-06-01", "500"), candle("2026-06-02", "505")],
+        )
+        .await
+        .unwrap();
+
+        let (status, json) = request(state, "GET", "/api/history?range=all", None).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let points = json["points"].as_array().unwrap();
+        assert!(points.len() >= 2);
+        // Day 1: 10×100 = 1000 equity (cash spent); benchmark = 1000 in SPY.
+        assert_eq!(points[0]["equity"], "1000");
+        assert_eq!(points[0]["benchmark"], "1000");
+        // Latest: AAPL at 120 → equity 1200; SPY 505/500 → benchmark 1010.
+        let last = points.last().unwrap();
+        assert_eq!(last["equity"], "1200");
+        assert_eq!(last["benchmark"], "1010");
+        // Metrics: TWR 20%, benchmark 1%.
+        assert_eq!(json["metrics"]["twr_pct"], "20.00");
+        assert_eq!(json["metrics"]["benchmark_twr_pct"], "1.00");
+        assert_eq!(json["totals"]["deposited"], "1000");
     }
 
     #[tokio::test]

@@ -6,12 +6,12 @@ A self-hosted, single-user web dashboard for **tracking and trading** a US
 stocks & ETFs portfolio in real time, with an AI analyst watching over your
 shoulder. One Rust binary, one SQLite file, your keys never leave your box.
 
-**Status: Phase 2** — live-ticking portfolio tracking plus **paper trading**
-end to end: order tickets with guardrails, real-time order status via
-Alpaca's `trade_updates` stream, fills auto-ingested into the transaction
-log, startup reconciliation, kill switch. See [PLAN.md](PLAN.md) for the full
-design and roadmap, and [docs/RESEARCH.md](docs/RESEARCH.md) for the research
-behind it.
+**Status: Phase 3** — tracking, paper trading, and now **history & insight**:
+equity curve with a cash-flow-matched SPY benchmark, proper TWR + IRR,
+quant-signal badges (RSI / SMA distance / drawdown), daily candle backfill
+via Alpaca's free bars, and EOD snapshots. See [PLAN.md](PLAN.md) for the
+full design and roadmap, and [docs/RESEARCH.md](docs/RESEARCH.md) for the
+research behind it.
 
 ## Quick start
 

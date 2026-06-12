@@ -165,109 +165,116 @@ impl PortfolioBasis {
 /// layer guarantees this.
 pub fn compute_basis(txs: &[Tx]) -> Result<PortfolioBasis, PortfolioError> {
     let mut book = PortfolioBasis::default();
-
     for tx in txs {
-        let symbol = || -> Result<String, PortfolioError> {
-            tx.symbol
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map(str::to_uppercase)
-                .ok_or(PortfolioError::MissingSymbol {
-                    id: tx.id,
-                    kind: tx.kind.as_str(),
-                })
-        };
+        apply_tx(&mut book, tx)?;
+    }
+    Ok(book)
+}
 
-        match tx.kind {
-            TxKind::Buy => {
-                let symbol = symbol()?;
-                if tx.qty <= Decimal::ZERO {
-                    return Err(PortfolioError::NonPositive {
-                        id: tx.id,
-                        field: "qty",
-                    });
-                }
-                let cost = tx.qty * tx.price + tx.fees + tx.taxes;
-                book.cash -= cost;
-                let position = book.positions.entry(symbol).or_default();
-                position.qty += tx.qty;
-                position.cost_basis += cost;
-                position.lots.push(Lot {
-                    qty: tx.qty,
-                    unit_cost: cost / tx.qty,
-                    acquired: tx.ts,
+/// Apply one transaction to a running basis — the fold step behind
+/// [`compute_basis`], exposed so replays (e.g. the daily equity series) can
+/// advance incrementally instead of recomputing the whole prefix.
+pub fn apply_tx(book: &mut PortfolioBasis, tx: &Tx) -> Result<(), PortfolioError> {
+    let symbol = || -> Result<String, PortfolioError> {
+        tx.symbol
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_uppercase)
+            .ok_or(PortfolioError::MissingSymbol {
+                id: tx.id,
+                kind: tx.kind.as_str(),
+            })
+    };
+
+    match tx.kind {
+        TxKind::Buy => {
+            let symbol = symbol()?;
+            if tx.qty <= Decimal::ZERO {
+                return Err(PortfolioError::NonPositive {
+                    id: tx.id,
+                    field: "qty",
                 });
             }
-            TxKind::Sell => {
-                let symbol = symbol()?;
-                if tx.qty <= Decimal::ZERO {
-                    return Err(PortfolioError::NonPositive {
-                        id: tx.id,
-                        field: "qty",
-                    });
-                }
-                let position = book.positions.entry(symbol.clone()).or_default();
-                if tx.qty > position.qty {
-                    return Err(PortfolioError::Oversell {
-                        id: tx.id,
-                        symbol,
-                        have: position.qty,
-                        want: tx.qty,
-                    });
-                }
-                // Consume lots FIFO.
-                let mut remaining = tx.qty;
-                let mut basis_sold = Decimal::ZERO;
-                while remaining > Decimal::ZERO {
-                    let lot = position.lots.first_mut().expect("qty checked above");
-                    let take = remaining.min(lot.qty);
-                    basis_sold += take * lot.unit_cost;
-                    lot.qty -= take;
-                    remaining -= take;
-                    if lot.qty == Decimal::ZERO {
-                        position.lots.remove(0);
-                    }
-                }
-                let proceeds = tx.qty * tx.price - tx.fees - tx.taxes;
-                book.cash += proceeds;
-                position.qty -= tx.qty;
-                position.cost_basis -= basis_sold;
-                position.realized_pnl += proceeds - basis_sold;
-                book.realized_events.push((tx.ts, proceeds - basis_sold));
+            let cost = tx.qty * tx.price + tx.fees + tx.taxes;
+            book.cash -= cost;
+            let position = book.positions.entry(symbol).or_default();
+            position.qty += tx.qty;
+            position.cost_basis += cost;
+            position.lots.push(Lot {
+                qty: tx.qty,
+                unit_cost: cost / tx.qty,
+                acquired: tx.ts,
+            });
+        }
+        TxKind::Sell => {
+            let symbol = symbol()?;
+            if tx.qty <= Decimal::ZERO {
+                return Err(PortfolioError::NonPositive {
+                    id: tx.id,
+                    field: "qty",
+                });
             }
-            TxKind::Dividend => {
-                let symbol = symbol()?;
-                book.cash += tx.price;
-                let position = book.positions.entry(symbol).or_default();
-                position.dividends += tx.price;
+            let position = book.positions.entry(symbol.clone()).or_default();
+            if tx.qty > position.qty {
+                return Err(PortfolioError::Oversell {
+                    id: tx.id,
+                    symbol,
+                    have: position.qty,
+                    want: tx.qty,
+                });
             }
-            TxKind::Split => {
-                let symbol = symbol()?;
-                if tx.qty <= Decimal::ZERO {
-                    return Err(PortfolioError::BadSplitRatio {
-                        id: tx.id,
-                        ratio: tx.qty,
-                    });
-                }
-                let position = book.positions.entry(symbol).or_default();
-                position.qty *= tx.qty;
-                for lot in &mut position.lots {
-                    lot.qty *= tx.qty;
-                    lot.unit_cost /= tx.qty;
+            // Consume lots FIFO.
+            let mut remaining = tx.qty;
+            let mut basis_sold = Decimal::ZERO;
+            while remaining > Decimal::ZERO {
+                let lot = position.lots.first_mut().expect("qty checked above");
+                let take = remaining.min(lot.qty);
+                basis_sold += take * lot.unit_cost;
+                lot.qty -= take;
+                remaining -= take;
+                if lot.qty == Decimal::ZERO {
+                    position.lots.remove(0);
                 }
             }
-            TxKind::Deposit => {
-                book.cash += tx.price;
-                book.deposited += tx.price;
+            let proceeds = tx.qty * tx.price - tx.fees - tx.taxes;
+            book.cash += proceeds;
+            position.qty -= tx.qty;
+            position.cost_basis -= basis_sold;
+            position.realized_pnl += proceeds - basis_sold;
+            book.realized_events.push((tx.ts, proceeds - basis_sold));
+        }
+        TxKind::Dividend => {
+            let symbol = symbol()?;
+            book.cash += tx.price;
+            let position = book.positions.entry(symbol).or_default();
+            position.dividends += tx.price;
+        }
+        TxKind::Split => {
+            let symbol = symbol()?;
+            if tx.qty <= Decimal::ZERO {
+                return Err(PortfolioError::BadSplitRatio {
+                    id: tx.id,
+                    ratio: tx.qty,
+                });
             }
-            TxKind::Withdrawal => {
-                book.cash -= tx.price;
-                book.withdrawn += tx.price;
+            let position = book.positions.entry(symbol).or_default();
+            position.qty *= tx.qty;
+            for lot in &mut position.lots {
+                lot.qty *= tx.qty;
+                lot.unit_cost /= tx.qty;
             }
+        }
+        TxKind::Deposit => {
+            book.cash += tx.price;
+            book.deposited += tx.price;
+        }
+        TxKind::Withdrawal => {
+            book.cash -= tx.price;
+            book.withdrawn += tx.price;
         }
     }
 
-    Ok(book)
+    Ok(())
 }
 
 /// Latest known market prices, keyed by symbol.
