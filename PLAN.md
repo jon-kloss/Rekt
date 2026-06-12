@@ -313,7 +313,8 @@ imports/fill-ingestion are idempotent.
 
 ```sql
 instruments   (id, symbol, name, exchange, currency, type)        -- stock|etf
-transactions  (id, instrument_id, kind, qty, price, fees, taxes, ts, source, fill_id, note)
+transactions  (id, instrument_id, kind, qty, price, fees, taxes, ts, source, fill_id, note, mode)
+              -- mode: paper | live — paper fills NEVER pollute the live portfolio
               -- kind: buy | sell | dividend | split | deposit | withdrawal
               -- source: manual | csv | broker_fill
               -- fees and taxes are SEPARATE columns (Ghostfolio conflates

@@ -154,6 +154,10 @@ pub struct Guardrails {
     pub max_position_pct: Decimal,
     /// Maximum orders submitted per calendar day (America/New_York).
     pub max_orders_per_day: u32,
+    /// Circuit breaker (Freqtrade `StoplossGuard` pattern, PLAN.md §4):
+    /// block new orders once today's realized loss exceeds this. `None`
+    /// disables.
+    pub max_daily_loss: Option<Decimal>,
 }
 
 impl Default for Guardrails {
@@ -162,6 +166,7 @@ impl Default for Guardrails {
             max_order_notional: Decimal::from(10_000),
             max_position_pct: Decimal::from(25),
             max_orders_per_day: 20,
+            max_daily_loss: Some(Decimal::from(1_000)),
         }
     }
 }
@@ -194,6 +199,11 @@ pub enum GuardrailViolation {
     },
     #[error("daily order cap reached ({max} orders today)")]
     DailyCap { max: u32 },
+    #[error(
+        "circuit breaker: today's realized loss ${loss} exceeds the ${max} cap — \
+         trading blocked until tomorrow (or raise REKT_MAX_DAILY_LOSS)"
+    )]
+    DailyLossBreaker { loss: Decimal, max: Decimal },
 }
 
 /// Estimate the per-share price an order will execute around: the limit
@@ -205,19 +215,44 @@ pub fn reference_price(ticket: &OrderTicket, last_price: Option<Decimal>) -> Opt
     }
 }
 
+/// Everything the guardrails need to judge a ticket.
+pub struct TicketContext<'a> {
+    pub basis: &'a PortfolioBasis,
+    /// Last known price for the ticket's symbol (market-order reference).
+    pub last_price: Option<Decimal>,
+    /// Account equity (position-cap denominator).
+    pub equity: Decimal,
+    pub orders_today: u32,
+    /// Realized P&L since the start of the trading day (breaker input).
+    pub realized_today: Decimal,
+    pub trading_paused: bool,
+}
+
 /// Check a ticket against every rail. Returns the estimated notional on
 /// success so the UI confirm dialog can show it.
 pub fn check_ticket(
     ticket: &OrderTicket,
-    basis: &PortfolioBasis,
-    last_price: Option<Decimal>,
-    equity: Decimal,
+    ctx: &TicketContext,
     rails: &Guardrails,
-    orders_today: u32,
-    trading_paused: bool,
 ) -> Result<Decimal, GuardrailViolation> {
+    let TicketContext {
+        basis,
+        last_price,
+        equity,
+        orders_today,
+        realized_today,
+        trading_paused,
+    } = *ctx;
     if trading_paused {
         return Err(GuardrailViolation::TradingPaused);
+    }
+    if let Some(max_loss) = rails.max_daily_loss {
+        if realized_today <= -max_loss {
+            return Err(GuardrailViolation::DailyLossBreaker {
+                loss: -realized_today.round_dp(2),
+                max: max_loss,
+            });
+        }
     }
     if ticket.qty <= Decimal::ZERO {
         return Err(GuardrailViolation::NonPositiveQty);
@@ -341,12 +376,15 @@ mod tests {
         let t = ticket("AAPL", Side::Buy, "5", OrderType::Limit, Some("150"));
         let notional = check_ticket(
             &t,
-            &basis,
-            None,
-            dec("100000"),
+            &TicketContext {
+                basis: &basis,
+                last_price: None,
+                equity: dec("100000"),
+                orders_today: 0,
+                realized_today: Decimal::ZERO,
+                trading_paused: false,
+            },
             &Guardrails::default(),
-            0,
-            false,
         );
         assert_eq!(notional.unwrap(), dec("750.00"));
     }
@@ -358,12 +396,15 @@ mod tests {
         assert_eq!(
             check_ticket(
                 &t,
-                &basis,
-                Some(dec("100")),
-                dec("1000"),
+                &TicketContext {
+                    basis: &basis,
+                    last_price: Some(dec("100")),
+                    equity: dec("1000"),
+                    orders_today: 0,
+                    realized_today: Decimal::ZERO,
+                    trading_paused: true,
+                },
                 &Guardrails::default(),
-                0,
-                true
             ),
             Err(GuardrailViolation::TradingPaused)
         );
@@ -375,12 +416,15 @@ mod tests {
         let t = ticket("AAPL", Side::Sell, "6", OrderType::Market, None);
         let err = check_ticket(
             &t,
-            &basis,
-            Some(dec("100")),
-            dec("100000"),
+            &TicketContext {
+                basis: &basis,
+                last_price: Some(dec("100")),
+                equity: dec("100000"),
+                orders_today: 0,
+                realized_today: Decimal::ZERO,
+                trading_paused: false,
+            },
             &Guardrails::default(),
-            0,
-            false,
         );
         assert!(matches!(err, Err(GuardrailViolation::LongOnly { .. })));
     }
@@ -392,19 +436,79 @@ mod tests {
             max_order_notional: dec("1000"),
             max_position_pct: dec("25"),
             max_orders_per_day: 20,
+            max_daily_loss: None,
         };
         // Notional cap: 20 * 100 = 2000 > 1000.
         let t = ticket("AAPL", Side::Buy, "20", OrderType::Limit, Some("100"));
         assert!(matches!(
-            check_ticket(&t, &basis, None, dec("100000"), &rails, 0, false),
+            check_ticket(
+                &t,
+                &TicketContext {
+                    basis: &basis,
+                    last_price: None,
+                    equity: dec("100000"),
+                    orders_today: 0,
+                    realized_today: Decimal::ZERO,
+                    trading_paused: false,
+                },
+                &rails,
+            ),
             Err(GuardrailViolation::NotionalCap { .. })
         ));
         // Position cap: equity 2000, resulting position 5*100+held 10*100=1500 → 75%.
         let t = ticket("AAPL", Side::Buy, "5", OrderType::Limit, Some("100"));
         assert!(matches!(
-            check_ticket(&t, &basis, None, dec("2000"), &rails, 0, false),
+            check_ticket(
+                &t,
+                &TicketContext {
+                    basis: &basis,
+                    last_price: None,
+                    equity: dec("2000"),
+                    orders_today: 0,
+                    realized_today: Decimal::ZERO,
+                    trading_paused: false,
+                },
+                &rails,
+            ),
             Err(GuardrailViolation::PositionCap { .. })
         ));
+    }
+
+    #[test]
+    fn daily_loss_breaker_trips_on_realized_losses() {
+        let basis = basis_with("AAPL", "10", "100");
+        let t = ticket("AAPL", Side::Buy, "1", OrderType::Limit, Some("100"));
+        let rails = Guardrails::default(); // max_daily_loss = 1000
+        let err = check_ticket(
+            &t,
+            &TicketContext {
+                basis: &basis,
+                last_price: None,
+                equity: dec("100000"),
+                orders_today: 0,
+                realized_today: dec("-1500"),
+                trading_paused: false,
+            },
+            &rails,
+        );
+        assert!(matches!(
+            err,
+            Err(GuardrailViolation::DailyLossBreaker { .. })
+        ));
+        // A profitable day doesn't trip it.
+        assert!(check_ticket(
+            &t,
+            &TicketContext {
+                basis: &basis,
+                last_price: None,
+                equity: dec("100000"),
+                orders_today: 0,
+                realized_today: dec("500"),
+                trading_paused: false,
+            },
+            &rails,
+        )
+        .is_ok());
     }
 
     #[test]
@@ -414,12 +518,15 @@ mod tests {
         assert!(matches!(
             check_ticket(
                 &t,
-                &basis,
-                Some(dec("100")),
-                dec("100000"),
+                &TicketContext {
+                    basis: &basis,
+                    last_price: Some(dec("100")),
+                    equity: dec("100000"),
+                    orders_today: 20,
+                    realized_today: Decimal::ZERO,
+                    trading_paused: false,
+                },
                 &Guardrails::default(),
-                20,
-                false
             ),
             Err(GuardrailViolation::DailyCap { .. })
         ));
@@ -427,12 +534,15 @@ mod tests {
         assert!(matches!(
             check_ticket(
                 &t,
-                &basis,
-                None,
-                dec("100000"),
+                &TicketContext {
+                    basis: &basis,
+                    last_price: None,
+                    equity: dec("100000"),
+                    orders_today: 0,
+                    realized_today: Decimal::ZERO,
+                    trading_paused: false,
+                },
                 &Guardrails::default(),
-                0,
-                false
             ),
             Err(GuardrailViolation::NoPrice { .. })
         ));

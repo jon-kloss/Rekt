@@ -203,18 +203,11 @@ pub async fn seed_missing_quotes(state: &AppState, symbols: &[String]) {
 }
 
 /// Recompute the desired upstream subscription set after any transaction
-/// mutation: symbols with open positions + the watchlist.
+/// mutation: every symbol ever transacted (any mode — paper orders need
+/// prices too) + the watchlist. A superset of open positions is fine; a
+/// few extra subscriptions cost nothing at personal scale.
 pub async fn refresh_symbols(state: &AppState) -> anyhow::Result<()> {
-    let txs = repo::fetch_all_txs(&state.db).await?;
-    let mut symbols: Vec<String> = match compute_basis(&txs) {
-        Ok(basis) => basis
-            .positions
-            .iter()
-            .filter(|(_, p)| p.qty > Decimal::ZERO)
-            .map(|(s, _)| s.clone())
-            .collect(),
-        Err(_) => Vec::new(), // invalid log is surfaced by the API path, not here
-    };
+    let mut symbols = repo::all_symbols(&state.db).await?;
     symbols.extend(repo::watchlist_symbols(&state.db).await?);
     symbols.sort();
     symbols.dedup();
@@ -233,7 +226,9 @@ pub async fn refresh_symbols(state: &AppState) -> anyhow::Result<()> {
 /// Full dashboard payload: portfolio view + market status + tx revision +
 /// trading state (mode, open orders, pause flag).
 pub async fn portfolio_snapshot(state: &AppState) -> anyhow::Result<serde_json::Value> {
-    let txs = repo::fetch_all_txs(&state.db).await?;
+    // The headline portfolio is REAL holdings only; paper activity lives in
+    // the trading block (PLAN.md §7 segregation).
+    let txs = repo::fetch_mode_txs(&state.db, "live").await?;
     let prices = state.live.price_views().await;
     let now = Utc::now();
     let tx_revision = state.live.tx_revision.load(Ordering::Relaxed);

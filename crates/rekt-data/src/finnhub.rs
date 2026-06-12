@@ -22,7 +22,10 @@ pub struct Finnhub {
 impl Finnhub {
     pub fn new(token: String) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .expect("reqwest client"),
             token,
             base_url: BASE_URL.to_string(),
         }

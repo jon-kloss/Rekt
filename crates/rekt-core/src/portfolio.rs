@@ -142,6 +142,21 @@ pub struct PortfolioBasis {
     pub positions: BTreeMap<String, PositionBasis>,
     pub deposited: Decimal,
     pub withdrawn: Decimal,
+    /// Realized P&L per sell, in replay order — feeds the daily-loss
+    /// circuit breaker.
+    #[serde(skip)]
+    pub realized_events: Vec<(DateTime<Utc>, Decimal)>,
+}
+
+impl PortfolioBasis {
+    /// Realized P&L from sells at or after `since`.
+    pub fn realized_since(&self, since: DateTime<Utc>) -> Decimal {
+        self.realized_events
+            .iter()
+            .filter(|(ts, _)| *ts >= since)
+            .map(|(_, amount)| *amount)
+            .sum()
+    }
 }
 
 /// Replay the transaction log into cash + FIFO lots + realized P&L.
@@ -218,6 +233,7 @@ pub fn compute_basis(txs: &[Tx]) -> Result<PortfolioBasis, PortfolioError> {
                 position.qty -= tx.qty;
                 position.cost_basis -= basis_sold;
                 position.realized_pnl += proceeds - basis_sold;
+                book.realized_events.push((tx.ts, proceeds - basis_sold));
             }
             TxKind::Dividend => {
                 let symbol = symbol()?;

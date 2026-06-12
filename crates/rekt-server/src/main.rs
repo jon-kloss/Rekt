@@ -130,6 +130,13 @@ fn guardrails_from_env() -> rekt_core::orders::Guardrails {
     {
         rails.max_orders_per_day = v;
     }
+    if let Some(v) = std::env::var("REKT_MAX_DAILY_LOSS")
+        .ok()
+        .and_then(|v| v.parse::<rust_decimal::Decimal>().ok())
+    {
+        // Zero or negative disables the breaker explicitly.
+        rails.max_daily_loss = (v > rust_decimal::Decimal::ZERO).then_some(v);
+    }
     rails
 }
 
@@ -206,9 +213,13 @@ async fn main() -> anyhow::Result<()> {
     // Subscribe the stream to currently held symbols from the start.
     live::refresh_symbols(&state).await?;
 
-    // Trading pipeline: trade_updates stream → event apply (the stream's
-    // Connected event triggers the startup reconciliation that unlocks
-    // trading; without a stream we reconcile once directly).
+    // Restore persisted safety flags (pause survives restarts).
+    trading::load_persisted(&state).await?;
+
+    // Trading pipeline: trade_updates stream → event apply. Reconciliation
+    // runs (a) on every stream (re)connect, and (b) on a periodic timer
+    // whose first tick fires immediately — a permanently-blocked websocket
+    // can never lock trading out.
     if let Some((key, secret)) = alpaca_keys {
         let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(256);
         tokio::spawn(rekt_broker::stream::run_trade_updates(
@@ -225,10 +236,17 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         });
-        tracing::info!(
-            mode = "paper",
-            "broker configured — awaiting reconciliation"
-        );
+        let recon_state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+            loop {
+                tick.tick().await; // first tick is immediate
+                if let Err(e) = trading::reconcile(&recon_state).await {
+                    tracing::error!(error = %e, "periodic reconciliation failed");
+                }
+            }
+        });
+        tracing::info!(mode = "paper", "broker configured — reconciling");
     }
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
@@ -485,6 +503,12 @@ mod tests {
                 filled_qty: rust_decimal::Decimal::ZERO,
                 avg_fill_price: None,
                 updated_ts: None,
+                symbol: Some(_ticket.symbol.clone()),
+                side: Some(_ticket.side),
+                qty: Some(_ticket.qty),
+                order_type: Some(_ticket.order_type.as_str().to_string()),
+                limit_price: _ticket.limit_price,
+                tif: Some(_ticket.tif.as_str().to_string()),
             })
         }
         async fn cancel_order(&self, _id: &str) -> Result<(), rekt_broker::BrokerError> {
@@ -687,12 +711,89 @@ mod tests {
                 .get("n");
         assert_eq!(broker_txs, 1);
 
-        // And the fill landed in the portfolio: 5 AAPL @ 99.50.
+        // Mode segregation (PLAN §7): the paper fill is recorded as a
+        // paper transaction but must NOT appear in the live portfolio.
+        let modes: Vec<String> =
+            sqlx::query("SELECT mode FROM transactions WHERE source = 'broker_fill'")
+                .fetch_all(&state.db)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| r.get("mode"))
+                .collect();
+        assert_eq!(modes, vec!["paper"]);
+
         let (_, snapshot) = request(state, "GET", "/api/portfolio", None).await;
-        assert_eq!(snapshot["portfolio"]["positions"][0]["symbol"], "AAPL");
-        assert_eq!(snapshot["portfolio"]["positions"][0]["qty"], "5");
+        // Live portfolio holds only the deposit — no AAPL position.
+        assert!(snapshot["portfolio"]["positions"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert_eq!(snapshot["trading"]["mode"], "paper");
         assert_eq!(snapshot["trading"]["orders"][0]["status"], "filled");
+    }
+
+    #[tokio::test]
+    async fn stale_status_update_cannot_regress_a_filled_order() {
+        let state = trading_state().await;
+        let (_, json) = request(
+            state.clone(),
+            "POST",
+            "/api/orders",
+            Some(serde_json::json!({
+                "symbol": "AAPL", "side": "buy", "order_type": "limit",
+                "qty": "5", "limit_price": "100"
+            })),
+        )
+        .await;
+        let client_order_id = json["client_order_id"].as_str().unwrap().to_string();
+
+        let order_json = |status: &str| {
+            serde_json::json!({
+                "id": format!("mock-{client_order_id}"),
+                "client_order_id": client_order_id,
+                "status": status,
+                "filled_qty": if status == "filled" { "5" } else { "0" }
+            })
+        };
+
+        // Fast fill arrives first…
+        trading::apply_event(
+            &state,
+            rekt_broker::stream::BrokerEvent::OrderUpdate {
+                order: Box::new(serde_json::from_value(order_json("filled")).unwrap()),
+                event: "fill".into(),
+                execution: Some(rekt_broker::stream::StreamExecution {
+                    execution_id: "exec-race".into(),
+                    qty: "5".parse().unwrap(),
+                    price: "100".parse().unwrap(),
+                    ts: chrono::Utc::now(),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+        // …then the slower submit-response/duplicate event says "accepted".
+        trading::apply_event(
+            &state,
+            rekt_broker::stream::BrokerEvent::OrderUpdate {
+                order: Box::new(serde_json::from_value(order_json("accepted")).unwrap()),
+                event: "new".into(),
+                execution: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        use sqlx::Row;
+        let status: String = sqlx::query("SELECT status FROM orders WHERE client_order_id = ?")
+            .bind(&client_order_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap()
+            .get("status");
+        assert_eq!(status, "filled", "terminal state must never regress");
     }
 
     #[tokio::test]

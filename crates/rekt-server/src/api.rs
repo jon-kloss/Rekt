@@ -23,7 +23,7 @@ pub fn err(status: StatusCode, msg: impl Into<String>) -> ApiError {
     (status, Json(serde_json::json!({ "error": msg.into() })))
 }
 
-fn internal(e: impl std::fmt::Display) -> ApiError {
+pub fn internal(e: impl std::fmt::Display) -> ApiError {
     tracing::error!(error = %e, "internal error");
     err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
@@ -70,6 +70,7 @@ impl TxInput {
             note: self.note.unwrap_or_default(),
             source,
             fill_id: None,
+            mode: "live", // manual/CSV entries are real holdings
         })
     }
 }
@@ -79,10 +80,24 @@ impl TxInput {
 /// keep their input order in the replay (ties break by id).
 const CANDIDATE_ID_BASE: i64 = i64::MAX / 2;
 
-/// Validate that the log including `candidates` still replays cleanly
-/// (oversells etc.), without writing anything.
+/// Validate that the live-mode log including `candidates` still replays
+/// cleanly (oversells etc.), without writing anything.
+///
+/// Repair-friendly: if the EXISTING log is already inconsistent (e.g. a
+/// broker fill landed against deleted history), new transactions are
+/// allowed through — otherwise the user could never insert the correcting
+/// entry and the create path would be permanently bricked.
 async fn validate_with(state: &AppState, candidates: &[repo::NewTx]) -> Result<(), ApiError> {
-    let mut txs = repo::fetch_all_txs(&state.db).await.map_err(internal)?;
+    let mut txs = repo::fetch_mode_txs(&state.db, "live")
+        .await
+        .map_err(internal)?;
+    if let Err(existing_error) = compute_basis(&txs) {
+        tracing::warn!(
+            error = %existing_error,
+            "transaction log already inconsistent — allowing mutation so it can be repaired"
+        );
+        return Ok(());
+    }
     for (i, c) in candidates.iter().enumerate() {
         txs.push(rekt_core::portfolio::Tx {
             id: CANDIDATE_ID_BASE + i as i64,
@@ -139,8 +154,8 @@ pub async fn create_tx(
 
 pub async fn list_txs(
     State(state): State<AppState>,
-) -> Result<Json<Vec<rekt_core::portfolio::Tx>>, ApiError> {
-    let mut txs = repo::fetch_all_txs(&state.db).await.map_err(internal)?;
+) -> Result<Json<Vec<repo::TxRecord>>, ApiError> {
+    let mut txs = repo::fetch_txs(&state.db, None).await.map_err(internal)?;
     txs.reverse(); // newest first for display
     Ok(Json(txs))
 }

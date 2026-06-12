@@ -42,6 +42,8 @@ pub enum BrokerError {
 }
 
 /// Broker's view of an order (returned by submit and mass-status queries).
+/// The descriptive fields are `Option` because not every endpoint includes
+/// them — they're needed when materializing externally-placed orders.
 #[derive(Debug, Clone)]
 pub struct BrokerOrder {
     pub broker_order_id: String,
@@ -50,6 +52,12 @@ pub struct BrokerOrder {
     pub filled_qty: Decimal,
     pub avg_fill_price: Option<Decimal>,
     pub updated_ts: Option<DateTime<Utc>>,
+    pub symbol: Option<String>,
+    pub side: Option<rekt_core::orders::Side>,
+    pub qty: Option<Decimal>,
+    pub order_type: Option<String>,
+    pub limit_price: Option<Decimal>,
+    pub tif: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

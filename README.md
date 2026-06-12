@@ -34,7 +34,8 @@ with clear errors instead of pretending.
 Configuration (env vars): `REKT_DB` (default `rekt.db`), `REKT_LISTEN`
 (default `127.0.0.1:7777`), `FINNHUB_API_KEY`, `ALPACA_PAPER_KEY`/`_SECRET`,
 and guardrails: `REKT_MAX_ORDER_NOTIONAL` (default 10000),
-`REKT_MAX_POSITION_PCT` (default 25), `REKT_MAX_ORDERS_PER_DAY` (default 20).
+`REKT_MAX_POSITION_PCT` (default 25), `REKT_MAX_ORDERS_PER_DAY` (default 20),
+`REKT_MAX_DAILY_LOSS` (circuit breaker, default 1000; ≤0 disables).
 
 ## Development
 

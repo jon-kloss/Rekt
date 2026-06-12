@@ -68,14 +68,24 @@ pub fn parse_frame(text: &str) -> Option<BrokerEvent> {
     }
     let update: TradeUpdate = serde_json::from_value(envelope.data).ok()?;
     let execution = match update.event.as_str() {
+        // A malformed execution must degrade to `None` — never drop the
+        // whole frame, or the order-status update is lost too.
         "fill" | "partial_fill" => {
-            let execution_id = update.execution_id?;
-            Some(StreamExecution {
-                execution_id,
-                qty: update.qty.as_deref()?.parse().ok()?,
-                price: update.price.as_deref()?.parse().ok()?,
-                ts: update.timestamp.unwrap_or_else(Utc::now),
-            })
+            let parsed = (|| {
+                Some(StreamExecution {
+                    execution_id: update.execution_id.clone()?,
+                    qty: update.qty.as_deref()?.parse().ok()?,
+                    price: update.price.as_deref()?.parse().ok()?,
+                    ts: update.timestamp.unwrap_or_else(Utc::now),
+                })
+            })();
+            if parsed.is_none() {
+                tracing::warn!(
+                    event = %update.event,
+                    "fill event missing execution fields — status applied, fill left to reconciliation"
+                );
+            }
+            parsed
         }
         _ => None,
     };
@@ -130,24 +140,22 @@ pub async fn run_trade_updates(
         }
 
         while let Some(frame) = ws.next().await {
+            // Alpaca sends both text and binary frames on this stream;
+            // both carry the same JSON.
+            let text = match &frame {
+                Ok(Message::Text(text)) => Some(text.as_str()),
+                Ok(Message::Binary(bytes)) => std::str::from_utf8(bytes).ok(),
+                _ => None,
+            };
+            if let Some(text) = text {
+                if let Some(event) = parse_frame(text) {
+                    if events.send(event).await.is_err() {
+                        return;
+                    }
+                }
+                continue;
+            }
             match frame {
-                // Alpaca sends both text and binary frames on this stream.
-                Ok(Message::Text(text)) => {
-                    if let Some(event) = parse_frame(&text) {
-                        if events.send(event).await.is_err() {
-                            return;
-                        }
-                    }
-                }
-                Ok(Message::Binary(bytes)) => {
-                    if let Ok(text) = std::str::from_utf8(&bytes) {
-                        if let Some(event) = parse_frame(text) {
-                            if events.send(event).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
                 Ok(Message::Ping(payload)) => {
                     let _ = ws.send(Message::Pong(payload)).await;
                 }
@@ -198,6 +206,25 @@ mod tests {
         let execution = execution.unwrap();
         assert_eq!(execution.execution_id, "exec-123");
         assert_eq!(execution.price.to_string(), "170.05");
+        assert_eq!(order.into_broker_order().status, OrderStatus::Filled);
+    }
+
+    #[test]
+    fn fill_without_execution_id_still_delivers_status() {
+        let frame = r#"{
+            "stream": "trade_updates",
+            "data": {
+                "event": "fill",
+                "order": { "id": "b9", "client_order_id": "rekt-paper-9", "status": "filled" }
+            }
+        }"#;
+        let Some(BrokerEvent::OrderUpdate {
+            order, execution, ..
+        }) = parse_frame(frame)
+        else {
+            panic!("status update must survive a malformed execution");
+        };
+        assert!(execution.is_none());
         assert_eq!(order.into_broker_order().status, OrderStatus::Filled);
     }
 

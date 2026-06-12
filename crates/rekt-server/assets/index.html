@@ -174,7 +174,25 @@ function trackRevision(payload) {
   }
 }
 
-const TERMINAL = new Set(["filled", "canceled", "rejected", "expired", "replaced", "failed"]);
+// No cancel button for terminal orders OR pending_submit (no broker id
+// yet — reconciliation resolves those).
+const NOT_CANCELABLE = new Set(
+  ["filled", "canceled", "rejected", "expired", "replaced", "failed", "pending_submit"]);
+
+// One fetch wrapper for every mutating call: shows errors in the given
+// message element, returns the parsed body on success, null on failure.
+async function apiFetch(url, opts, msgEl) {
+  try {
+    const res = await fetch(url, opts);
+    const body = res.status === 204 ? {} : await res.json();
+    if (!res.ok) { msgEl.textContent = body.error ?? `request failed (${res.status})`; return null; }
+    msgEl.textContent = "";
+    return body;
+  } catch {
+    msgEl.textContent = "request failed — is the server up?";
+    return null;
+  }
+}
 function renderTrading(t) {
   const bar = $("modebar"), section = $("trading-section");
   if (!t || !t.enabled) { bar.style.display = "none"; section.style.display = "none"; return; }
@@ -199,7 +217,7 @@ function renderTrading(t) {
     <td>${esc(o.qty)}</td><td>${o.limit_price ? fmt(o.limit_price) : "—"}</td>
     <td>${esc(o.status)}</td><td>${esc(o.filled_qty)}</td>
     <td>${o.avg_fill_price ? fmt(o.avg_fill_price) : "—"}</td>
-    <td>${TERMINAL.has(o.status) ? "" :
+    <td>${NOT_CANCELABLE.has(o.status) ? "" :
       `<button class="danger" data-cancel="${esc(o.id)}" title="cancel order">✕</button>`}</td>
   </tr>`).join("");
 }
@@ -278,15 +296,11 @@ $("txform").addEventListener("submit", async (e) => {
     if (v) body[k] = k === "symbol" ? v.toUpperCase() : v;
   }
   if (f.get("ts")) body.ts = new Date(f.get("ts")).toISOString();
-  try {
-    const res = await fetch("/api/transactions", {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
-    });
-    if (!res.ok) { $("msg").textContent = (await res.json()).error; return; }
-    $("msg").textContent = ""; e.target.reset();
+  if (await apiFetch("/api/transactions", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  }, $("msg"))) {
+    e.target.reset();
     refresh();
-  } catch {
-    $("msg").textContent = "request failed — is the server up? Transaction may not be saved.";
   }
 });
 
@@ -316,64 +330,46 @@ $("orderform").addEventListener("submit", async (e) => {
   // Confirm-before-send: no double-click surprises (PLAN.md §4).
   const est = body.limit_price ? ` ≈ $${fmt(Number(body.qty) * Number(body.limit_price))}` : " at market price";
   if (!confirm(`Place ${body.side.toUpperCase()} ${body.qty} ${body.symbol} (${body.order_type}${body.limit_price ? " @ " + body.limit_price : ""}, ${body.tif})${est}?`)) return;
-  try {
-    const res = await fetch("/api/orders", {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
-    });
-    const json = await res.json();
-    if (!res.ok) { $("omsg").textContent = json.error; return; }
-    $("omsg").textContent = `order ${json.client_order_id}: ${json.status}`;
-    e.target.reset();
-    $("otype").dispatchEvent(new Event("change"));
-    refresh();
-  } catch {
-    $("omsg").textContent = "request failed — is the server up? Order state unknown, check Orders.";
-  }
+  const json = await apiFetch("/api/orders", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  }, $("omsg"));
+  if (!json) return;
+  $("omsg").textContent = `order ${json.client_order_id}: ${json.status}`;
+  e.target.reset();
+  $("otype").dispatchEvent(new Event("change"));
+  refresh();
 });
 
 $("orders").addEventListener("click", async (e) => {
   const id = e.target.dataset?.cancel;
   if (!id || !confirm("Cancel this order?")) return;
-  try {
-    const res = await fetch(`/api/orders/${id}`, { method: "DELETE" });
-    if (!res.ok) { $("omsg").textContent = (await res.json()).error; return; }
+  if (await apiFetch(`/api/orders/${id}`, { method: "DELETE" }, $("omsg"))) {
     $("omsg").textContent = "cancel requested";
     refresh();
-  } catch { $("omsg").textContent = "cancel failed — is the server up?"; }
+  }
 });
 
 $("killbtn").addEventListener("click", async () => {
   if (!confirm("KILL SWITCH: cancel ALL open orders at the broker?")) return;
-  try {
-    const res = await fetch("/api/orders/cancel_all", { method: "POST" });
-    $("omsg").textContent = res.ok ? "all open orders canceled" : (await res.json()).error;
+  if (await apiFetch("/api/orders/cancel_all", { method: "POST" }, $("omsg")) !== null) {
+    $("omsg").textContent = "all open orders canceled";
     refresh();
-  } catch { $("omsg").textContent = "kill switch failed — is the server up?"; }
+  }
 });
 
 $("pausebtn").addEventListener("click", async () => {
   const paused = $("pausebtn").dataset.paused !== "true";
-  try {
-    await fetch("/api/trading/pause", {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ paused }),
-    });
-    refresh();
-  } catch { $("omsg").textContent = "request failed"; }
+  if (await apiFetch("/api/trading/pause", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ paused }),
+  }, $("omsg")) !== null) refresh();
 });
 
 // Delete buttons are created per-row; delegate one listener on the table.
 $("txs").addEventListener("click", async (e) => {
   const id = e.target.dataset?.id;
   if (!id || !confirm("Delete this transaction? Derived positions will be recomputed.")) return;
-  try {
-    const res = await fetch(`/api/transactions/${id}`, { method: "DELETE" });
-    if (!res.ok) { $("msg").textContent = (await res.json()).error; return; }
-    $("msg").textContent = "";
-    refresh();
-  } catch {
-    $("msg").textContent = "delete failed — is the server up?";
-  }
+  if (await apiFetch(`/api/transactions/${id}`, { method: "DELETE" }, $("msg")) !== null) refresh();
 });
 
 $("kind").addEventListener("change", () => {
@@ -386,13 +382,8 @@ $("kind").addEventListener("change", () => {
 $("csvfile").addEventListener("change", async (e) => {
   const file = e.target.files[0];
   if (!file) return;
-  try {
-    const res = await fetch("/api/import/csv", { method: "POST", body: await file.text() });
-    const json = await res.json();
-    $("msg").textContent = res.ok ? `imported ${json.imported} transactions` : json.error;
-  } catch {
-    $("msg").textContent = "import failed — is the server up? Nothing was imported.";
-  }
+  const json = await apiFetch("/api/import/csv", { method: "POST", body: await file.text() }, $("msg"));
+  if (json) $("msg").textContent = `imported ${json.imported} transactions`;
   e.target.value = "";
   refresh();
 });

@@ -31,7 +31,12 @@ impl Alpaca {
 
     pub fn new(base_url: String, key: String, secret: String, mode: TradeMode) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            // A broker call that hangs must not hang REKT (see PR #4 review:
+            // submit paths and reconciliation depend on bounded latency).
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .expect("reqwest client"),
             base_url,
             key,
             secret,
@@ -89,6 +94,20 @@ pub struct AlpacaOrder {
     pub filled_avg_price: Option<String>,
     #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
+    // Descriptive fields — present on order objects, used to materialize
+    // externally-placed orders during reconciliation.
+    #[serde(default)]
+    pub symbol: Option<String>,
+    #[serde(default)]
+    pub side: Option<String>,
+    #[serde(default)]
+    pub qty: Option<String>,
+    #[serde(default, rename = "type")]
+    pub order_type: Option<String>,
+    #[serde(default)]
+    pub limit_price: Option<String>,
+    #[serde(default)]
+    pub time_in_force: Option<String>,
 }
 
 /// Map Alpaca's order status vocabulary onto our state machine.
@@ -130,9 +149,19 @@ impl AlpacaOrder {
             status: map_status(&self.status),
             filled_qty: parse_dec_opt(&self.filled_qty).unwrap_or_default(),
             avg_fill_price: parse_dec_opt(&self.filled_avg_price),
+            updated_ts: self.updated_at,
+            symbol: self.symbol,
+            side: match self.side.as_deref() {
+                Some("buy") => Some(Side::Buy),
+                Some("sell") | Some("sell_short") => Some(Side::Sell),
+                _ => None,
+            },
+            qty: parse_dec_opt(&self.qty),
+            order_type: self.order_type,
+            limit_price: parse_dec_opt(&self.limit_price),
+            tif: self.time_in_force,
             broker_order_id: self.id,
             client_order_id: self.client_order_id,
-            updated_ts: self.updated_at,
         }
     }
 }
@@ -284,25 +313,40 @@ impl Broker for Alpaca {
         &self,
         after: Option<DateTime<Utc>>,
     ) -> Result<Vec<Execution>, BrokerError> {
-        let mut query: Vec<(String, String)> = vec![
-            ("activity_types".into(), "FILL".into()),
-            ("page_size".into(), "100".into()),
-            ("direction".into(), "asc".into()),
-        ];
-        if let Some(after) = after {
-            query.push(("after".into(), after.to_rfc3339()));
+        const PAGE_SIZE: usize = 100;
+        let mut executions = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut query: Vec<(String, String)> = vec![
+                ("activity_types".into(), "FILL".into()),
+                ("page_size".into(), PAGE_SIZE.to_string()),
+                ("direction".into(), "asc".into()),
+            ];
+            if let Some(after) = after {
+                query.push(("after".into(), after.to_rfc3339()));
+            }
+            if let Some(token) = &page_token {
+                query.push(("page_token".into(), token.clone()));
+            }
+            let response = self
+                .request(reqwest::Method::GET, "/v2/account/activities")
+                .query(&query)
+                .send()
+                .await
+                .map_err(|e| BrokerError::Upstream(e.to_string()))?;
+            let activities: Vec<AlpacaActivity> = Self::handle(response).await?;
+            let page_len = activities.len();
+            page_token = activities.last().map(|a| a.id.clone());
+            executions.extend(
+                activities
+                    .into_iter()
+                    .filter_map(AlpacaActivity::into_execution),
+            );
+            // A short page means we've drained the range.
+            if page_len < PAGE_SIZE || page_token.is_none() {
+                return Ok(executions);
+            }
         }
-        let response = self
-            .request(reqwest::Method::GET, "/v2/account/activities")
-            .query(&query)
-            .send()
-            .await
-            .map_err(|e| BrokerError::Upstream(e.to_string()))?;
-        let activities: Vec<AlpacaActivity> = Self::handle(response).await?;
-        Ok(activities
-            .into_iter()
-            .filter_map(AlpacaActivity::into_execution)
-            .collect())
     }
 
     async fn account(&self) -> Result<AccountInfo, BrokerError> {
