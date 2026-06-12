@@ -1,28 +1,33 @@
 # REKT — Real-time Equity & Capital Tracker
 
 > A self-hosted, single-user web dashboard for tracking **and trading** a
-> stocks & ETFs portfolio in real time. Rust backend, browser frontend, runs
-> on a laptop or home server. Find out exactly how rekt you are, live — and
-> do something about it.
+> stocks & ETFs portfolio in real time, with an AI analyst watching over your
+> shoulder. Rust backend, browser frontend, runs on a laptop or home server.
+> Find out exactly how rekt you are, live — and do something about it.
 
 ## 1. Vision
 
-REKT answers three questions at a glance, with live data during market hours,
-and lets you act on the answer without leaving the dashboard:
+REKT answers four questions at a glance, with live data during market hours,
+and lets you act on the answers without leaving the dashboard:
 
 1. **What am I worth right now?** — total portfolio value, ticking in real time.
 2. **How rekt am I today?** — day P&L, unrealized/realized gains per position.
 3. **How did I get here?** — historical equity curve, cost basis, allocation.
-4. **Do something about it** — place, monitor, and cancel orders from the
-   dashboard, including one-click execution from price alerts.
+4. **What should I consider doing next?** — quant signals + an AI analyst
+   that synthesizes news, portfolio state, and market context into
+   recommendations with reasoning.
+5. **Do something about it** — place, monitor, and cancel orders from the
+   dashboard; recommendations and alerts arrive as pre-staged order tickets.
 
 Non-goals (deliberately out of scope):
 
-- No algorithmic/bot trading in v1 — humans click, REKT executes. (The
-  `Broker` trait shouldn't preclude it later.)
+- No algorithmic/bot trading, and **the AI never executes trades** — every
+  order requires a human click on a confirm button, no exceptions.
 - No multi-tenant auth, billing, or SaaS plumbing. One user, one process.
 - No options/futures/crypto in v1 (the data model shouldn't preclude them later).
 - No margin or short selling in v1 — long-only, cash account semantics.
+- No pretense of price prediction — the AI synthesizes and reasons; it does
+  not see the future, and the UI never implies otherwise.
 - No tax-form generation (we track lots well enough to add it later).
 
 ## 2. Product decisions (locked in)
@@ -35,6 +40,7 @@ Non-goals (deliberately out of scope):
 | Backend | Rust | User preference; great fit for a long-running streaming daemon |
 | Broker | **Alpaca** | API-first, commission-free, free paper-trading sandbox, websocket order updates; doubles as fallback market data |
 | Trading mode | **Manual + alerts-to-action** | Order tickets in the UI, plus one-click execution from triggered price alerts. Paper first, live behind an explicit switch |
+| Analysis | **Quant signals (local) + Claude API analyst** | Deterministic indicators computed in Rust for free; Claude for news synthesis, portfolio review, and recommendations with reasoning |
 
 ## 3. Market data strategy
 
@@ -42,7 +48,7 @@ Non-goals (deliberately out of scope):
 
 | Provider | Free real-time? | Streaming | Limits | Notes |
 |---|---|---|---|---|
-| **Finnhub** | Yes (US stocks) | WebSocket trades | 60 REST calls/min | Generous free quota, <100ms latency |
+| **Finnhub** | Yes (US stocks) | WebSocket trades | 60 REST calls/min | Generous free quota, <100ms latency; also free company news |
 | **Alpaca** | Yes (IEX feed only) | WebSocket | 30 symbols/conn, 1 conn, 200 REST/min | IEX is ~2-3% of volume but quotes track NBBO closely; account needed anyway for trading |
 | Polygon.io | No (EOD only on free) | Paid | 5 REST calls/min free | Best data, but real-time is paid |
 | Twelve Data | Trial only | Paid | 8 REST calls/min free | |
@@ -59,9 +65,9 @@ Provider-agnostic needs:
 - **Historical daily candles** → backfill the equity curve from first
   transaction date.
 - **Symbol search/metadata** → name, exchange, currency for order/trade entry.
+- **Company news** → Finnhub's free news endpoint feeds the AI analyst.
 - **Market calendar/hours** → don't burn quota nights and weekends; gate
-  order tickets with honest "market closed" state (or queue as Alpaca
-  day orders for the open).
+  order tickets with honest "market closed" state.
 
 ## 4. Execution strategy (trading)
 
@@ -103,26 +109,122 @@ supported for holdings outside Alpaca (track-only positions).
 Price alerts (e.g. "AAPL ≤ 170") fire a notification with an **arm-able
 pre-staged order ticket**: the alert can carry a draft order (side, qty,
 type) that triggering surfaces as a one-click-confirm ticket. The alert never
-auto-executes — confirmation is still human. (Auto-execution = algo trading
-= explicitly post-v1.)
+auto-executes — confirmation is still human. AI recommendations reuse this
+exact pipeline (see §5).
 
-## 5. Architecture
+## 5. Analysis & AI recommendations
+
+Two layers with a hard boundary between them: **deterministic quant signals
+computed locally in Rust** (facts), and an **AI analyst powered by the Claude
+API** (synthesis and judgment). The UI always distinguishes which is which.
+
+### Layer 1 — Quant signal engine (rekt-core, pure Rust, free)
+
+Computed from cached candles + live quotes on every relevant tick/close:
+
+- Trend: SMA/EMA (20/50/200) positions and crossovers; 52-week high/low distance.
+- Momentum: RSI(14), rate of change.
+- Risk: max drawdown, realized volatility, position concentration (% of
+  portfolio per name/sector), cash drag.
+- Relative: performance vs cash-flow-matched SPY benchmark.
+
+These are cheap, testable, and honest — they state what *is*, not what will
+be. They render as badges/sparklines on positions and feed the AI as inputs.
+
+### Layer 2 — AI analyst (Claude API)
+
+No official Rust SDK exists, so `rekt-analyst` speaks the Messages API over
+raw HTTP via `reqwest` — it's a clean JSON API and we already depend on
+reqwest. The analyst is an **agentic tool-use loop**: Claude is handed tools
+and iterates (call tool → get result → reason → call next) until it produces
+a structured report.
+
+**Tools we expose to Claude (read-only, all local):**
+
+| Tool | Returns |
+|---|---|
+| `get_portfolio` | positions, cost basis, P&L, cash, allocation, quant signals |
+| `get_quote` / `get_candles` | current + historical prices for any symbol |
+| `get_news` | recent company news headlines (Finnhub free endpoint) |
+| `get_transactions` | recent activity, realized P&L history |
+| **`web_search` (server-side)** | Anthropic-hosted web search — Claude researches market context, macro events, analyst commentary itself; no scraping code on our side |
+
+Claude never gets a tool that mutates anything. The analyst cannot place,
+cancel, or stage orders directly — it can only *return a report*.
+
+**Products of the analyst:**
+
+1. **Morning briefing** (scheduled, pre-market): cheap model summarizes
+   overnight news on held symbols, flags today's earnings/events, notes
+   signal changes. Lands as a card on the dashboard.
+2. **Weekly deep review** (scheduled, weekend): strong model with web search
+   does a full portfolio review — concentration risks, thesis check per
+   position, what the quant signals say, benchmark comparison — and emits
+   recommendations.
+3. **On-demand**: "analyze my portfolio" button and a per-position "what's
+   going on with NVDA?" deep dive; ad-hoc chat panel grounded in the same tools.
+
+**Recommendations** are structured records, not chat prose: action
+(buy/sell/trim/hold/watch), instrument, sizing suggestion, rationale,
+the data it relied on (tool calls are logged with the report), confidence,
+and an expiry. Each renders as a card with full reasoning expandable, and
+carries an optional **pre-staged order ticket that flows into the existing
+alerts-to-action confirm pipeline** — accepting a recommendation is still a
+human clicking a confirm button on a normal order ticket. We use the API's
+structured-output mode (`output_config.format` with a JSON schema) so
+recommendation records parse reliably.
+
+**Model tiering & cost** (current API pricing, June 2026):
+
+| Job | Model | Pricing (in/out per MTok) | Est. cost |
+|---|---|---|---|
+| Morning briefing, news summarization | `claude-haiku-4-5` | $1 / $5 | ~pennies/day |
+| Weekly deep review, on-demand analysis, chat | `claude-opus-4-8` (adaptive thinking + web search) | $5 / $25 | ~$0.50–$1.50 per deep run |
+
+A realistic month (daily briefings + weekly deep reviews + occasional
+on-demand) lands in the **single dollars**. Cost controls: a configurable
+monthly API budget with usage tracked per run, and **prompt caching** —
+the system prompt + tool definitions are stable and cached
+(`cache_control: ephemeral`; note Opus 4.8 needs a ≥4096-token prefix to
+cache, which our tool schemas + instructions will exceed), so repeat runs pay
+~10% of input price on the static prefix.
+
+### Honesty rails (the AI equivalent of the trading safety rails)
+
+- **No prediction theater.** The system prompt forbids price targets and
+  certainty language; recommendations must be framed as reasoning about
+  risk/positioning, and the UI labels them "analysis, not financial advice."
+- **Grounding required.** Every claim in a recommendation must trace to a
+  tool result (news item, signal, web source); the report stores citations
+  and we render them. A recommendation with no supporting tool calls is
+  rejected at ingestion.
+- **AI output is quarantined from execution.** Recommendations create
+  *draft* tickets only, subject to the same guardrails (max notional,
+  position caps) as manual orders. There is no code path from Claude's
+  output to Alpaca that doesn't pass through a human confirm.
+- **Budget cap.** When the monthly API budget is exhausted, scheduled runs
+  pause and say so, instead of silently degrading.
+
+## 6. Architecture
 
 ```
-                  ┌──────────────────────────────────────────────┐
-                  │               rekt (single binary)            │
-                  │                                              │
-  Finnhub WS ────▶│  ingest task ──▶ price cache (in-mem)        │
-  Finnhub REST ──▶│  backfill task ─▶ SQLite (sqlx)              │
-                  │                      │                       │
-  Alpaca trade ──▶│  fill ingest ──▶ transactions ──┐            │
-  updates WS      │                                 ▼            │
-  Alpaca REST ◀──▶│  order manager ◀── portfolio engine          │
-                  │  (place/cancel,    (positions, P&L, curve,   │
-                  │   guardrails)       alert evaluation)        │
-                  │        │                  │                  │
-                  │  axum: REST API + WS broadcast + static UI   │
-                  └────────┼──────────────────────────────────────┘
+                  ┌────────────────────────────────────────────────┐
+                  │               rekt (single binary)              │
+                  │                                                │
+  Finnhub WS ────▶│  ingest task ──▶ price cache (in-mem)          │
+  Finnhub REST ──▶│  backfill/news ─▶ SQLite (sqlx)                │
+                  │                      │                         │
+  Alpaca trade ──▶│  fill ingest ──▶ transactions ──┐              │
+  updates WS      │                                 ▼              │
+  Alpaca REST ◀──▶│  order manager ◀── portfolio engine ──▶ quant  │
+                  │  (place/cancel,    (positions, P&L,    signals │
+                  │   guardrails)       curve, alerts)        │    │
+                  │        ▲                                  ▼    │
+  Claude API ◀───▶│  AI analyst (tool-use loop, read-only tools,   │
+  (Messages,      │   briefings/reviews → recommendation records)  │
+   web_search)    │        │                                       │
+                  │  axum: REST API + WS broadcast + static UI     │
+                  └────────┼────────────────────────────────────────┘
                            ▼
                   Browser SPA (Vite + Svelte + lightweight-charts)
 ```
@@ -133,8 +235,9 @@ auto-executes — confirmation is still human. (Auto-execution = algo trading
   first-class websocket support. Actix wins ~10-15% throughput at thousands of
   connections — irrelevant for one browser tab on a LAN.
 - Core crates: `axum`, `tokio`, `sqlx` (SQLite), `tokio-tungstenite` (upstream
-  feed clients), `serde`, `rust_decimal` (money is never `f64`), `chrono-tz`
-  (market hours are America/New_York, always), `tracing`, `reqwest`.
+  feed clients), `reqwest` (Alpaca REST + Claude API), `serde`, `rust_decimal`
+  (money is never `f64`), `chrono-tz` (market hours are America/New_York,
+  always), `tracing`.
 
 ### Storage: **SQLite** via sqlx
 
@@ -147,32 +250,32 @@ queries. Postgres would be pure overhead for one user.
   series, tiny, free.
 - Embedded into the binary at build time via `rust-embed`: deployment stays
   *one file + one DB*.
-- One browser↔backend websocket carries portfolio deltas **and** order status
-  events. The browser never talks to Finnhub or Alpaca directly — both API
-  keys (especially the one that can move money) stay server-side.
+- One browser↔backend websocket carries portfolio deltas, order status
+  events, and analyst updates. The browser never talks to Finnhub, Alpaca,
+  or Anthropic directly — all three API keys stay server-side.
 
 ### Secrets
 
-Alpaca live keys can move real money. Keys live in a config file with `0600`
-perms (or env vars), are never logged (`tracing` redaction), never sent to
-the browser, and paper/live keys are separate config entries so a typo can't
-cross the streams.
+Three keys now: Finnhub, Alpaca (paper + live separately), Anthropic. All in
+a `0600` config file or env vars, never logged (`tracing` redaction), never
+sent to the browser. The Alpaca live key can move money and the Anthropic key
+can spend money — same discipline for both.
 
 ### Real-time flow
 
 1. Market-data ingest task holds one upstream websocket for all held +
    watched symbols. Auto-reconnect with backoff; resubscribe on reconnect.
 2. Ticks land in an in-memory price cache behind `tokio::sync::watch`.
-3. Portfolio engine recomputes derived state (throttled ~1 update/sec) and
-   evaluates alert conditions on each tick.
+3. Portfolio engine recomputes derived state (throttled ~1 update/sec),
+   evaluates alert conditions, and refreshes quant signals.
 4. Order manager mirrors Alpaca order state from `trade_updates`; terminal
    fills become transactions.
-5. Axum broadcasts compact JSON deltas (portfolio, orders, alerts) to the
-   browser.
-6. Scheduler: EOD portfolio snapshot, candle backfill on startup/new symbol,
-   periodic broker reconciliation.
+5. Axum broadcasts compact JSON deltas (portfolio, orders, alerts,
+   briefings) to the browser.
+6. Scheduler: EOD portfolio snapshot, candle backfill, broker reconciliation,
+   **pre-market briefing run, weekend deep-review run**.
 
-## 6. Data model
+## 7. Data model
 
 **Transactions are the source of truth; everything else is derived.**
 Positions, cost basis, realized P&L, and the equity curve are all
@@ -190,9 +293,17 @@ orders        (id, client_order_id, broker_order_id, instrument_id, side,
               -- mode: paper | live  — paper history survives mode switches
 alerts        (id, instrument_id, condition, threshold, draft_order_json,
                status, triggered_ts)
+analyses      (id, kind, model, started_ts, prompt_tokens, output_tokens,
+               cost_usd, report_md, tool_log_json, status)
+              -- kind: briefing | weekly_review | on_demand | position_dive
+recommendations (id, analysis_id, instrument_id, action, sizing, rationale,
+               citations_json, confidence, expires_ts, status, draft_order_json)
+              -- action: buy | sell | trim | hold | watch
+              -- status: open | accepted | dismissed | expired
 lots          (derived) -- open tax lots for FIFO cost-basis tracking
 snapshots     (date, total_value, cash, invested, realized_pnl, mode)
 candles       (instrument_id, date, o, h, l, c, v)                -- cached history
+news_cache    (instrument_id, headline, source, url, published_ts)
 watchlist     (instrument_id, added_ts)
 ```
 
@@ -200,9 +311,11 @@ watchlist     (instrument_id, added_ts)
   **equity** (market value) — that distinction is the name of the app.
 - Paper and live activity are segregated by `mode` so paper experiments never
   pollute the real equity curve.
+- `analyses.tool_log_json` records every tool call Claude made — full audit
+  trail for how a recommendation was derived, plus per-run cost tracking.
 - All money columns are integer cents or TEXT decimals — never floats.
 
-## 7. Features by phase
+## 8. Features by phase
 
 ### Phase 0 — Skeleton (the walking proof)
 - Cargo workspace, axum server, SQLite migrations, CI (fmt, clippy, test).
@@ -227,6 +340,7 @@ watchlist     (instrument_id, added_ts)
 - Daily snapshot job + candle backfill → **equity curve chart** (1M/1Y/All).
 - Per-position detail page: price chart with buy/sell markers overlaid.
 - Allocation donut; realized vs unrealized P&L; dividends received.
+- **Quant signal engine**: SMA/RSI/drawdown/concentration badges per position.
 - Benchmark overlay: "would I be less rekt if I'd just bought SPY?"
   (cash-flow-matched SPY comparison — a signature REKT feature).
 
@@ -237,12 +351,27 @@ watchlist     (instrument_id, added_ts)
   track-only accounts.
 - Dark mode by default, obviously. A "REKT meter" easter egg for drawdowns.
 
-## 8. Risks & open questions
+### Phase 5 — AI analyst: "What should I do next?"
+- `rekt-analyst` crate: Claude Messages API client (reqwest), tool-use loop,
+  structured-output recommendation parsing, prompt caching, cost metering.
+- Read-only tool suite (`get_portfolio`, `get_news`, candles/quotes,
+  server-side `web_search`).
+- **Morning briefing** (Haiku) → dashboard card.
+- **Weekly deep review** (Opus, adaptive thinking + web search) →
+  recommendation cards with citations and expandable reasoning.
+- Recommendations → pre-staged tickets through the alerts-to-action pipeline.
+- On-demand portfolio/position analysis + grounded chat panel.
+
+## 9. Risks & open questions
 
 - **Real money, real bugs.** The order path gets the highest test bar in the
   codebase: the guardrail/ticket logic lives in pure `rekt-core` functions,
   the Alpaca client is integration-tested against paper, and live mode ships
   only after a multi-week paper soak.
+- **AI overtrust.** The biggest product risk in Phase 5 is the user treating
+  synthesis as prophecy. Mitigations are structural (citations required,
+  no-prediction prompt rules, advisory labeling, human confirm on every
+  ticket) — but worth revisiting once real usage exists.
 - **Free-tier fragility**: providers nerf free tiers (IEX Cloud died in 2024).
   Mitigated by the trait + two data implementations from day one.
 - **Reconciliation drift**: external trades (made in Alpaca's own UI),
@@ -251,27 +380,36 @@ watchlist     (instrument_id, added_ts)
   are the answer; never silently overwrite the transaction log.
 - **PDT rule**: accounts under $25k get flagged for >3 day-trades/5 days.
   Surface Alpaca's day-trade counter in the UI before it bites.
+- **API spend control**: the Anthropic key spends real money per call.
+  Metered per run in `analyses`, monthly budget cap, caching for the static
+  prefix. Scheduled runs skip cleanly when the market was closed.
 - **Splits & dividends correctness**: the classic portfolio-tracker bug
   source. Explicit `split` transactions; flag mismatches when candle backfill
   disagrees with computed cost basis.
 - **CSV import formats**: deferred to Phase 4; manual entry + generic CSV
   unblock the MVP.
 
-## 9. Proposed repo layout
+## 10. Proposed repo layout
 
 ```
 rekt/
 ├── Cargo.toml            # workspace
 ├── crates/
-│   ├── rekt-server/      # axum app, ws broadcast, embedded UI
+│   ├── rekt-server/      # axum app, ws broadcast, scheduler, embedded UI
 │   ├── rekt-core/        # domain: portfolio engine, lots, P&L, order
-│   │                     #   guardrails, alert rules (pure, heavily tested)
-│   ├── rekt-data/        # MarketData trait + finnhub/alpaca impls
-│   └── rekt-broker/      # Broker trait + alpaca impl (orders, fills, account)
+│   │                     #   guardrails, alert rules, quant signals
+│   │                     #   (pure, heavily tested)
+│   ├── rekt-data/        # MarketData trait + finnhub/alpaca impls, news
+│   ├── rekt-broker/      # Broker trait + alpaca impl (orders, fills, account)
+│   └── rekt-analyst/     # Claude API client, tool-use loop, briefings,
+│                         #   recommendations, cost metering
 ├── ui/                   # Vite + Svelte + lightweight-charts
 ├── migrations/
 └── PLAN.md
 ```
 
-`rekt-core` stays I/O-free so the money math and the order-safety logic (the
-parts that must be right) are testable without a network or database.
+`rekt-core` stays I/O-free so the money math, order-safety logic, and signal
+math (the parts that must be right) are testable without a network or
+database. `rekt-analyst` depends on `rekt-core` for tool implementations but
+never on `rekt-broker` — the type system enforces that the AI can't touch
+order placement.
