@@ -26,14 +26,21 @@ pub async fn backfill_candles(state: &AppState) -> anyhow::Result<()> {
     let Some(bars) = &state.bars else {
         return Ok(());
     };
-    let Some(first) = repo::first_tx_date(&state.db).await? else {
-        return Ok(()); // nothing to chart yet
-    };
+    let first = repo::first_tx_date(&state.db).await?;
     // NY calendar date: plain UTC is a day ahead between 8pm and midnight ET.
     let today = Utc::now().with_timezone(&New_York).date_naive();
+    // Signals (SMA200, drawdown, drawdown alerts) want ~250 trading bars
+    // even for symbols never transacted (watchlist/alert-only), so the
+    // default window reaches back at least that far.
+    let signal_start = today - Duration::days(380);
+    let default_from = match first {
+        Some(first) => (first - Duration::days(7)).min(signal_start),
+        None => signal_start,
+    };
 
     let mut symbols = repo::all_symbols(&state.db).await?;
     symbols.extend(repo::watchlist_symbols(&state.db).await?);
+    symbols.extend(repo::alert_symbols(&state.db).await?); // drawdown alerts need closes
     symbols.push(BENCHMARK.to_string());
     symbols.sort();
     symbols.dedup();
@@ -44,7 +51,7 @@ pub async fn backfill_candles(state: &AppState) -> anyhow::Result<()> {
         // the most recent bar in case it was written intraday.
         let from = match repo::last_candle_date(&state.db, &symbol).await? {
             Some(last) => last - Duration::days(3),
-            None => first - Duration::days(7),
+            None => default_from,
         };
         if from >= today {
             continue;

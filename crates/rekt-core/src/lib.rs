@@ -4,6 +4,7 @@
 //! runtime. The money math that must be right lives here, where it can be
 //! tested exhaustively without mocks.
 
+pub mod alerts;
 pub mod history;
 pub mod market;
 pub mod orders;

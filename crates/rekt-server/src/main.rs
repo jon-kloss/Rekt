@@ -6,8 +6,10 @@
 //! - `FINNHUB_API_KEY`   enables quotes + the live trade stream; without it
 //!   the API answers 503 with an explanation instead of pretending.
 
+mod alerts;
 mod api;
 mod history;
+mod import;
 mod live;
 mod repo;
 mod trading;
@@ -41,6 +43,8 @@ pub struct AppState {
     /// Serializes transaction mutations: validation replays the whole log,
     /// so validate→insert must be atomic with respect to other mutations.
     pub mutations: Arc<Mutex<()>>,
+    /// ntfy push endpoint for triggered alerts (REKT_NTFY_URL / _TOPIC).
+    pub notify_url: Option<String>,
 }
 
 fn app(state: AppState) -> Router {
@@ -53,6 +57,18 @@ fn app(state: AppState) -> Router {
         .route("/api/transactions/{id}", delete(api::delete_tx))
         .route("/api/import/csv", post(api::import_csv))
         .route("/api/history", get(history::history))
+        .route(
+            "/api/watchlist",
+            get(api::watchlist_list).post(api::watchlist_add),
+        )
+        .route("/api/watchlist/{symbol}", delete(api::watchlist_remove))
+        .route(
+            "/api/alerts",
+            get(alerts::list_alerts).post(alerts::create_alert),
+        )
+        .route("/api/alerts/{id}", delete(alerts::delete_alert))
+        .route("/api/alerts/{id}/dismiss", post(alerts::dismiss_alert))
+        .route("/api/alerts/{id}/rearm", post(alerts::rearm_alert))
         .route(
             "/api/orders",
             get(trading::list_orders).post(trading::submit_order),
@@ -217,6 +233,20 @@ async fn main() -> anyhow::Result<()> {
 
     let guardrails = Arc::new(guardrails_from_env());
 
+    // Alert push: full URL wins, else a topic on the public ntfy.sh.
+    let notify_url = std::env::var("REKT_NTFY_URL")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .or_else(|| {
+            std::env::var("REKT_NTFY_TOPIC")
+                .ok()
+                .filter(|t| !t.is_empty())
+                .map(|t| format!("https://ntfy.sh/{t}"))
+        });
+    if notify_url.is_some() {
+        tracing::info!("alert push notifications enabled (ntfy)");
+    }
+
     let state = live::start(move |handles| AppState {
         db,
         market,
@@ -229,6 +259,7 @@ async fn main() -> anyhow::Result<()> {
         snapshots: handles.snapshots,
         symbols: Arc::new(handles.symbols),
         mutations: Arc::new(Mutex::new(())),
+        notify_url,
     });
 
     // Subscribe the stream to currently held symbols from the start.
@@ -288,6 +319,22 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Alert evaluator: every 15s against the in-memory price cache (price
+    // conditions) and cached candles (drawdown). Cheap when nothing is
+    // active; triggers persist + notify + surface in the next snapshot.
+    {
+        let alert_state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+            loop {
+                tick.tick().await;
+                if let Err(e) = alerts::evaluate_alerts(&alert_state).await {
+                    tracing::error!(error = %e, "alert evaluation failed");
+                }
+            }
+        });
+    }
+
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     tracing::info!(addr = %listen, "REKT listening — how rekt are you today?");
     axum::serve(listener, app(state))
@@ -324,6 +371,7 @@ mod tests {
             snapshots,
             symbols: Arc::new(symbols),
             mutations: Arc::new(Mutex::new(())),
+            notify_url: None,
         }
     }
 
@@ -909,5 +957,248 @@ mod tests {
 
         let (_, after) = request(state, "GET", "/api/portfolio", None).await;
         assert!(after["tx_revision"].as_u64().unwrap() > rev_before);
+    }
+
+    #[tokio::test]
+    async fn alert_lifecycle_trigger_dismiss_rearm() {
+        let state = test_state().await;
+
+        // Bad drafts fail at creation, not at 3am.
+        let (status, body) = request(
+            state.clone(),
+            "POST",
+            "/api/alerts",
+            Some(serde_json::json!({
+                "symbol": "AAPL", "condition": "price_at", "threshold": "170"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let (status, _) = request(
+            state.clone(),
+            "POST",
+            "/api/alerts",
+            Some(serde_json::json!({
+                "symbol": "AAPL", "condition": "price_below", "threshold": "170",
+                "draft_order": {"side": "buy", "order_type": "market", "qty": "5", "limit_price": "168"}
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        // A valid alert with a pre-staged limit buy.
+        let (status, created) = request(
+            state.clone(),
+            "POST",
+            "/api/alerts",
+            Some(serde_json::json!({
+                "symbol": "aapl", "condition": "price_below", "threshold": "170",
+                "draft_order": {"side": "buy", "order_type": "limit", "qty": "5", "limit_price": "168"},
+                "note": "dip buy"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"].as_i64().unwrap();
+
+        // No price data yet → evaluation leaves it armed.
+        alerts::evaluate_alerts(&state).await.unwrap();
+        let (_, list) = request(state.clone(), "GET", "/api/alerts", None).await;
+        assert_eq!(list[0]["status"], "active");
+        assert_eq!(list[0]["symbol"], "AAPL");
+
+        // Price above threshold → still armed; at/below → triggered once.
+        state
+            .live
+            .set_price("AAPL", rust_decimal::Decimal::from(171))
+            .await;
+        alerts::evaluate_alerts(&state).await.unwrap();
+        let (_, list) = request(state.clone(), "GET", "/api/alerts", None).await;
+        assert_eq!(list[0]["status"], "active");
+
+        state.live.set_price("AAPL", "169.5".parse().unwrap()).await;
+        alerts::evaluate_alerts(&state).await.unwrap();
+        alerts::evaluate_alerts(&state).await.unwrap(); // idempotent
+        let (_, list) = request(state.clone(), "GET", "/api/alerts", None).await;
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["status"], "triggered");
+        assert_eq!(list[0]["triggered_value"], "169.5");
+        assert_eq!(list[0]["draft_order"]["side"], "buy");
+        assert_eq!(list[0]["draft_order"]["qty"], "5");
+
+        // The snapshot payload carries the alert for the dashboard banner.
+        let (_, snapshot) = request(state.clone(), "GET", "/api/portfolio", None).await;
+        assert_eq!(snapshot["alerts"][0]["status"], "triggered");
+
+        // dismiss: only valid from triggered.
+        let (status, _) = request(
+            state.clone(),
+            "POST",
+            &format!("/api/alerts/{id}/dismiss"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = request(
+            state.clone(),
+            "POST",
+            &format!("/api/alerts/{id}/dismiss"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // rearm clears the trigger record.
+        let (status, _) = request(
+            state.clone(),
+            "POST",
+            &format!("/api/alerts/{id}/rearm"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, list) = request(state.clone(), "GET", "/api/alerts", None).await;
+        assert_eq!(list[0]["status"], "active");
+        assert!(list[0]["triggered_value"].is_null());
+
+        let (status, _) =
+            request(state.clone(), "DELETE", &format!("/api/alerts/{id}"), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, list) = request(state, "GET", "/api/alerts", None).await;
+        assert!(list.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn drawdown_alert_uses_cached_candles() {
+        let state = test_state().await;
+        let candle = |date: &str, close: &str| rekt_core::Candle {
+            date: date.parse().unwrap(),
+            open: close.parse().unwrap(),
+            high: close.parse().unwrap(),
+            low: close.parse().unwrap(),
+            close: close.parse().unwrap(),
+            volume: 1,
+        };
+        // Peak 200 → 150 = 25% drawdown.
+        repo::upsert_candles(
+            &state.db,
+            "TSLA",
+            &[
+                candle("2026-06-01", "200"),
+                candle("2026-06-02", "180"),
+                candle("2026-06-03", "150"),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let (status, _) = request(
+            state.clone(),
+            "POST",
+            "/api/alerts",
+            Some(serde_json::json!({
+                "symbol": "TSLA", "condition": "drawdown_above", "threshold": "20"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        alerts::evaluate_alerts(&state).await.unwrap();
+        let (_, list) = request(state, "GET", "/api/alerts", None).await;
+        assert_eq!(list[0]["status"], "triggered");
+        assert_eq!(list[0]["triggered_value"], "25.00");
+    }
+
+    #[tokio::test]
+    async fn watchlist_add_appears_in_snapshot_then_removes() {
+        let state = test_state().await;
+
+        let (status, _) = request(
+            state.clone(),
+            "POST",
+            "/api/watchlist",
+            Some(serde_json::json!({ "symbol": "vti" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        // Re-adding is fine (200, not duplicate).
+        let (status, _) = request(
+            state.clone(),
+            "POST",
+            "/api/watchlist",
+            Some(serde_json::json!({ "symbol": "VTI" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = request(
+            state.clone(),
+            "POST",
+            "/api/watchlist",
+            Some(serde_json::json!({ "symbol": "not a symbol!" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (_, list) = request(state.clone(), "GET", "/api/watchlist", None).await;
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0], "VTI");
+
+        // The live snapshot carries the watchlist block (price unknown here).
+        let (_, snapshot) = request(state.clone(), "GET", "/api/portfolio", None).await;
+        assert_eq!(snapshot["watchlist"][0]["symbol"], "VTI");
+        assert!(snapshot["watchlist"][0]["price"].is_null());
+
+        let (status, _) = request(state.clone(), "DELETE", "/api/watchlist/VTI", None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = request(state.clone(), "DELETE", "/api/watchlist/VTI", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (_, snapshot) = request(state, "GET", "/api/portfolio", None).await;
+        assert!(snapshot["watchlist"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn broker_preset_csv_imports_and_reports_skips() {
+        let state = test_state().await;
+        let schwab = "\
+\"Date\",\"Action\",\"Symbol\",\"Description\",\"Quantity\",\"Price\",\"Fees & Comm\",\"Amount\"\n\
+\"06/09/2026\",\"MoneyLink Transfer\",\"\",\"Tfr FROM CHECKING\",\"\",\"\",\"\",\"$10,000.00\"\n\
+\"06/10/2026\",\"Buy\",\"VOO\",\"VANGUARD S&P 500\",\"5\",\"$520.00\",\"$0.03\",\"-$2,600.03\"\n\
+\"06/11/2026\",\"Bank Interest\",\"\",\"INTEREST\",\"\",\"\",\"\",\"$1.23\"\n";
+        let request_body = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/import/csv?format=schwab")
+            .header("content-type", "text/csv")
+            .body(axum::body::Body::from(schwab))
+            .unwrap();
+        let response = app(state.clone()).oneshot(request_body).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["imported"], 2);
+        assert!(json["skipped"][0]
+            .as_str()
+            .unwrap()
+            .contains("Bank Interest"));
+
+        let (_, txs) = request(state.clone(), "GET", "/api/transactions", None).await;
+        let txs = txs.as_array().unwrap();
+        assert_eq!(txs.len(), 2);
+        // Newest first: the buy, then the deposit.
+        assert_eq!(txs[0]["kind"], "buy");
+        assert_eq!(txs[0]["symbol"], "VOO");
+        assert_eq!(txs[0]["fees"], "0.03");
+        assert_eq!(txs[1]["kind"], "deposit");
+        assert_eq!(txs[1]["price"], "10000.00");
+
+        // An unknown preset is rejected with guidance.
+        let request_body = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/import/csv?format=etrade")
+            .header("content-type", "text/csv")
+            .body(axum::body::Body::from("x"))
+            .unwrap();
+        let response = app(state).oneshot(request_body).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

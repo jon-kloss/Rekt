@@ -67,6 +67,13 @@
   .legend { font-size: 0.7rem; color: #8b949e; display: flex; gap: 1rem; margin-top: 0.3rem; }
   .legend .swatch { display: inline-block; width: 14px; height: 3px; vertical-align: middle; margin-right: 4px; }
   .sig { font-size: 0.7rem; white-space: nowrap; }
+  .alertbanner {
+    display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap;
+    padding: 0.6rem 0.8rem; margin-bottom: 0.6rem; border-radius: 6px;
+    background: #3a2d00; border: 1px solid #d2992255; color: #d29922; font-size: 0.85rem;
+  }
+  .alertbanner button { padding: 0.25rem 0.7rem; font-size: 0.75rem; }
+  .badge.rekt { color: #f85149; border-color: #f8514955; }
 </style>
 </head>
 <body>
@@ -76,6 +83,7 @@
   <div class="stat"><span class="label">Day P&amp;L</span><span class="val" id="day">—</span></div>
   <div class="stat"><span class="label">Unrealized</span><span class="val" id="unreal">—</span></div>
   <div class="stat"><span class="label">Cash</span><span class="val" id="cash">—</span></div>
+  <span class="badge" id="rektmeter" style="display:none"></span>
   <span class="badge" id="market">…</span>
   <span class="badge" id="feed">…</span>
 </header>
@@ -157,6 +165,56 @@
   </section>
 
   <section>
+    <h2>Watchlist</h2>
+    <table>
+      <thead><tr><th>Symbol</th><th>Price</th><th>Day Δ</th><th>Signals</th><th></th></tr></thead>
+      <tbody id="watchlist"><tr><td colspan="5" class="empty">nothing watched yet</td></tr></tbody>
+    </table>
+    <form class="tx" id="watchform" style="margin-top:0.75rem;max-width:340px;grid-template-columns:1fr auto">
+      <label>Symbol<input name="symbol" placeholder="VTI" style="text-transform:uppercase" required></label>
+      <button class="primary">watch</button>
+    </form>
+    <div id="wmsg" class="warn"></div>
+  </section>
+
+  <section>
+    <h2>Alerts</h2>
+    <div id="alertbanners"></div>
+    <table>
+      <thead><tr><th>Alert</th><th>Status</th><th>Triggered</th><th>Draft order</th><th>Note</th><th></th></tr></thead>
+      <tbody id="alerts"><tr><td colspan="6" class="empty">no alerts — set one below</td></tr></tbody>
+    </table>
+    <form class="tx" id="alertform" style="margin-top:0.75rem">
+      <label>Symbol<input name="symbol" placeholder="AAPL" style="text-transform:uppercase" required></label>
+      <label>Condition
+        <select name="condition">
+          <option value="price_below">price ≤</option>
+          <option value="price_above">price ≥</option>
+          <option value="drawdown_above">drawdown ≥ %</option>
+        </select>
+      </label>
+      <label>Threshold<input name="threshold" inputmode="decimal" required></label>
+      <label>Draft
+        <select name="draft_side" id="draftside">
+          <option value="">no order</option>
+          <option value="buy">buy</option>
+          <option value="sell">sell</option>
+        </select>
+      </label>
+      <label>Type
+        <select name="draft_type" id="drafttype" disabled>
+          <option value="market">market</option><option value="limit">limit</option>
+        </select>
+      </label>
+      <label>Qty<input name="draft_qty" inputmode="decimal" disabled></label>
+      <label>Limit<input name="draft_limit" inputmode="decimal" disabled></label>
+      <label>Note<input name="note"></label>
+      <button class="primary">arm alert</button>
+    </form>
+    <div id="amsg" class="warn"></div>
+  </section>
+
+  <section>
     <h2>Add transaction</h2>
     <form class="tx" id="txform">
       <label>Kind
@@ -176,7 +234,12 @@
     </form>
     <div id="msg"></div>
     <div class="csv">
-      <span>CSV import (<code>kind,symbol,qty,price,fees,taxes,ts,note</code>):</span>
+      <span>CSV import:</span>
+      <select id="csvformat">
+        <option value="generic">generic (kind,symbol,qty,price,fees,taxes,ts,note)</option>
+        <option value="fidelity">Fidelity activity export</option>
+        <option value="schwab">Schwab transactions export</option>
+      </select>
       <input type="file" id="csvfile" accept=".csv,text/csv">
     </div>
   </section>
@@ -265,10 +328,72 @@ function renderTrading(t) {
   </tr>`).join("");
 }
 
+const CONDITION_LABEL = { price_below: "≤ $", price_above: "≥ $", drawdown_above: "drawdown ≥ " };
+function describeAlert(a) {
+  const t = esc(a.threshold) + (a.condition === "drawdown_above" ? "%" : "");
+  return `${esc(a.symbol)} ${CONDITION_LABEL[a.condition] ?? a.condition} ${t}`;
+}
+
+let tradingEnabled = false;
+let lastAlerts = [];
+function renderAlerts(alerts) {
+  if (!Array.isArray(alerts)) return;
+  lastAlerts = alerts;
+  const banners = $("alertbanners");
+  const triggered = alerts.filter((a) => a.status === "triggered");
+  banners.innerHTML = triggered.map((a) => `<div class="alertbanner">
+    🚨 <strong>${describeAlert(a)}</strong> hit at ${esc(a.triggered_value)}
+    ${a.draft_order && tradingEnabled ? `<button class="primary" data-review="${esc(a.id)}">review order</button>` : ""}
+    <button data-dismiss="${esc(a.id)}">dismiss</button>
+    <button data-rearm="${esc(a.id)}">re-arm</button>
+  </div>`).join("");
+
+  const tbody = $("alerts");
+  if (!alerts.length) {
+    tbody.innerHTML = `<tr><td colspan="6" class="empty">no alerts — set one below</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = alerts.map((a) => {
+    const draft = a.draft_order
+      ? `${esc(a.draft_order.side)} ${esc(a.draft_order.qty)} ${esc(a.draft_order.order_type)}${a.draft_order.limit_price ? " @ " + esc(a.draft_order.limit_price) : ""}`
+      : "—";
+    const trig = a.triggered_ts ? `${esc(a.triggered_value)} · ${esc(a.triggered_ts.slice(0, 16).replace("T", " "))}` : "—";
+    const cls = a.status === "triggered" ? "down" : a.status === "active" ? "up" : "muted";
+    return `<tr>
+      <td>${describeAlert(a)}</td>
+      <td class="${cls}">${esc(a.status)}</td>
+      <td>${trig}</td><td>${draft}</td><td>${esc(a.note)}</td>
+      <td>${a.status !== "active" ? `<button data-rearm="${esc(a.id)}" title="re-arm">↻</button>` : ""}
+        <button class="danger" data-delalert="${esc(a.id)}" title="delete">✕</button></td>
+    </tr>`;
+  }).join("");
+}
+
+function renderWatchlist(rows) {
+  if (!Array.isArray(rows)) return;
+  const tbody = $("watchlist");
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="5" class="empty">nothing watched yet</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rows.map((w) => {
+    const day = w.price !== null && w.prev_close !== null ? signed(Number(w.price) - Number(w.prev_close)) : signed(null);
+    return `<tr>
+      <td>${esc(w.symbol)}</td><td>${fmt(w.price)}</td>
+      <td class="${day.cls}">${day.text}</td>
+      <td class="sig">${sigBadges(w.signals)}</td>
+      <td><button class="danger" data-unwatch="${esc(w.symbol)}" title="remove">✕</button></td>
+    </tr>`;
+  }).join("");
+}
+
 function renderPortfolio(payload) {
   trackRevision(payload);
+  tradingEnabled = !!(payload.trading && payload.trading.enabled);
   renderTrading(payload.trading);
+  renderAlerts(payload.alerts);
   if (payload.type === "error") { $("warn").textContent = payload.error; return; }
+  renderWatchlist(payload.watchlist);
   $("warn").textContent = payload.portfolio.unpriced_symbols.length
     ? `no price data for: ${payload.portfolio.unpriced_symbols.join(", ")} (equity excludes them)` : "";
   const p = payload.portfolio;
@@ -378,9 +503,38 @@ async function loadHistory() {
     set("m-div", data.totals?.dividends, true);
     $("histnote").textContent = points.length < 2
       ? (data.note ?? "not enough history yet — the curve grows daily")
-      : (data.candles_available ? "" : "no candle data yet — configure Alpaca keys for historical bars");
+      : (data.candles_available ? "" : (data.source === "snapshots"
+          ? "charting nightly snapshots — configure Alpaca keys for full daily history"
+          : "no candle data yet — configure Alpaca keys for historical bars"));
     drawChart(points);
+    // The meter always reads the full series (server-cached, so this extra
+    // fetch is free) — switching to 1M after a crash shouldn't read "zen".
+    const allPoints = currentRange === "all"
+      ? points
+      : ((await (await fetch("/api/history?range=all")).json()).points ?? []);
+    updateRektMeter(allPoints);
   } catch { $("histnote").textContent = "history unavailable — is the server up?"; }
+}
+
+// The REKT meter: how far off peak equity are we, really? (Phase 4 easter
+// egg — drawdown from all-time peak, faces calibrated to pain.)
+function updateRektMeter(points) {
+  const el = $("rektmeter");
+  if (!points || points.length < 2) { el.style.display = "none"; return; }
+  const peak = points.reduce((a, p) => Math.max(a, Number(p.equity)), -Infinity);
+  const last = Number(points[points.length - 1].equity);
+  if (peak <= 0) { el.style.display = "none"; return; }
+  const dd = Math.max(0, ((peak - last) / peak) * 100);
+  const [face, label] =
+    dd < 1 ? ["😌", "zen"] :
+    dd < 5 ? ["🙂", "chill"] :
+    dd < 10 ? ["😬", "mildly rekt"] :
+    dd < 20 ? ["🥵", "rekt"] :
+    dd < 35 ? ["💀", "very rekt"] : ["☠️", "ULTRA REKT"];
+  el.style.display = "";
+  el.className = "badge" + (dd >= 10 ? " rekt" : "");
+  el.textContent = `${face} ${label}`;
+  el.title = `REKT meter: ${dd.toFixed(1)}% off all-time peak equity`;
 }
 
 function drawChart(points) {
@@ -540,11 +694,105 @@ $("kind").addEventListener("change", () => {
 $("csvfile").addEventListener("change", async (e) => {
   const file = e.target.files[0];
   if (!file) return;
-  const json = await apiFetch("/api/import/csv", { method: "POST", body: await file.text() }, $("msg"));
-  if (json) $("msg").textContent = `imported ${json.imported} transactions`;
+  const format = $("csvformat").value;
+  const json = await apiFetch(`/api/import/csv?format=${format}`, { method: "POST", body: await file.text() }, $("msg"));
+  if (json) {
+    const skipped = (json.skipped ?? []).length;
+    $("msg").textContent = `imported ${json.imported} transactions` +
+      (skipped ? ` — skipped ${skipped} non-transaction rows (interest, journal entries, …)` : "");
+  }
   e.target.value = "";
   refresh();
 });
+
+// ---- watchlist ----
+$("watchform").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const symbol = new FormData(e.target).get("symbol").toString().trim().toUpperCase();
+  if (await apiFetch("/api/watchlist", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ symbol }),
+  }, $("wmsg"))) {
+    e.target.reset();
+    refresh();
+  }
+});
+
+$("watchlist").addEventListener("click", async (e) => {
+  const symbol = e.target.dataset?.unwatch;
+  if (!symbol) return;
+  if (await apiFetch(`/api/watchlist/${encodeURIComponent(symbol)}`, { method: "DELETE" }, $("wmsg")) !== null) refresh();
+});
+
+// ---- alerts ----
+$("draftside").addEventListener("change", () => {
+  const armed = $("draftside").value !== "";
+  for (const name of ["draft_type", "draft_qty", "draft_limit"]) {
+    const el = document.querySelector(`#alertform [name="${name}"]`);
+    el.disabled = !armed;
+    if (!armed) el.value = el.tagName === "SELECT" ? "market" : "";
+  }
+});
+
+$("alertform").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  const body = {
+    symbol: f.get("symbol").toString().trim().toUpperCase(),
+    condition: f.get("condition"),
+    threshold: f.get("threshold").toString().trim(),
+  };
+  const note = (f.get("note") || "").toString().trim();
+  if (note) body.note = note;
+  if (f.get("draft_side")) {
+    body.draft_order = {
+      side: f.get("draft_side"),
+      order_type: f.get("draft_type"),
+      qty: (f.get("draft_qty") || "").toString().trim(),
+    };
+    const limit = (f.get("draft_limit") || "").toString().trim();
+    if (body.draft_order.order_type === "limit") {
+      if (!limit) { $("amsg").textContent = "limit drafts need a limit price"; return; }
+      body.draft_order.limit_price = limit;
+    }
+  }
+  if (await apiFetch("/api/alerts", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  }, $("amsg"))) {
+    e.target.reset();
+    $("draftside").dispatchEvent(new Event("change"));
+    refresh();
+  }
+});
+
+// Alerts-to-action: "review order" prefills the normal ticket form — the
+// human still confirms, and every guardrail still applies server-side.
+function handleAlertAction(e) {
+  const review = e.target.dataset?.review, dismiss = e.target.dataset?.dismiss,
+    rearm = e.target.dataset?.rearm, del = e.target.dataset?.delalert;
+  if (review) {
+    const alert = lastAlerts.find((a) => String(a.id) === review);
+    if (!alert || !alert.draft_order) return;
+    const form = $("orderform");
+    form.symbol.value = alert.symbol;
+    form.side.value = alert.draft_order.side;
+    form.order_type.value = alert.draft_order.order_type;
+    form.qty.value = alert.draft_order.qty;
+    $("otype").dispatchEvent(new Event("change"));
+    form.limit_price.value = alert.draft_order.limit_price ?? "";
+    if (alert.draft_order.tif) form.tif.value = alert.draft_order.tif;
+    $("trading-section").scrollIntoView({ behavior: "smooth" });
+    $("omsg").textContent = `pre-staged from alert: ${alert.symbol} — review and place`;
+  } else if (dismiss) {
+    apiFetch(`/api/alerts/${dismiss}/dismiss`, { method: "POST" }, $("amsg")).then(() => refresh());
+  } else if (rearm) {
+    apiFetch(`/api/alerts/${rearm}/rearm`, { method: "POST" }, $("amsg")).then(() => refresh());
+  } else if (del) {
+    if (!confirm("Delete this alert?")) return;
+    apiFetch(`/api/alerts/${del}`, { method: "DELETE" }, $("amsg")).then(() => refresh());
+  }
+}
+$("alertbanners").addEventListener("click", handleAlertAction);
+$("alerts").addEventListener("click", handleAlertAction);
 
 refresh();
 connect();

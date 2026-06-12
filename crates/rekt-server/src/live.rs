@@ -47,15 +47,24 @@ pub struct Live {
     tx_revision: AtomicU64,
     /// Bumped when the candle cache gains data (signals must recompute).
     candles_revision: AtomicU64,
-    /// (tx_rev, candles_rev, per-symbol signals) — recomputed only when a
-    /// revision moves, not on every price tick.
-    signals_cache: RwLock<(u64, u64, HashMap<String, serde_json::Value>)>,
+    /// (tx_rev, candles_rev, watchlist_rev, per-symbol signals) — recomputed
+    /// only when a revision moves, not on every price tick.
+    signals_cache: RwLock<(u64, u64, u64, HashMap<String, serde_json::Value>)>,
     /// tx_rev → replayed basis: the broadcaster runs up to once a second on
     /// price ticks, and the transaction log only changes when tx_rev moves.
     basis_cache: RwLock<Option<(u64, Arc<PortfolioBasis>)>>,
     /// See [`HistoryCache`] — makes the 4 range buttons (and any reload)
     /// free once the series is built for the current revisions.
     pub(crate) history_cache: RwLock<Option<HistoryCache>>,
+    /// Bumped on alert create/delete/trigger/dismiss/rearm.
+    alerts_revision: AtomicU64,
+    /// alerts_rev → serialized alert list for the snapshot payload.
+    alerts_cache: RwLock<Option<(u64, serde_json::Value)>>,
+    /// Bumped on watchlist add/remove.
+    watchlist_revision: AtomicU64,
+    /// watchlist_rev → symbol list (the per-tick watchlist block reads this,
+    /// not the database).
+    watchlist_cache: RwLock<Option<(u64, Arc<Vec<String>>)>>,
 }
 
 pub struct LiveHandles {
@@ -101,6 +110,18 @@ impl Live {
         self.mark_dirty();
     }
 
+    /// Call on any alert mutation or trigger.
+    pub fn bump_alerts_revision(&self) {
+        self.alerts_revision.fetch_add(1, Ordering::Relaxed);
+        self.mark_dirty();
+    }
+
+    /// Call on watchlist add/remove.
+    pub fn bump_watchlist_revision(&self) {
+        self.watchlist_revision.fetch_add(1, Ordering::Relaxed);
+        self.mark_dirty();
+    }
+
     /// Current (tx, candles) revisions — cache keys for derived data.
     pub fn revisions(&self) -> (u64, u64) {
         (
@@ -108,20 +129,36 @@ impl Live {
             self.candles_revision.load(Ordering::Relaxed),
         )
     }
+
+    /// Test hook: inject a price as if a tick had arrived.
+    #[cfg(test)]
+    pub async fn set_price(&self, symbol: &str, price: Decimal) {
+        self.prices.write().await.insert(
+            symbol.to_uppercase(),
+            CacheEntry {
+                price,
+                prev_close: None,
+                ts: Some(Utc::now()),
+            },
+        );
+        self.mark_dirty();
+    }
 }
 
-/// Quant-signal badges per open position, cached by (tx, candles) revision
-/// so the per-second broadcaster never recomputes or re-queries needlessly.
+/// Quant-signal badges per symbol (open positions + watchlist), cached by
+/// (tx, candles, watchlist) revision so the per-second broadcaster never
+/// recomputes or re-queries needlessly.
 async fn position_signals(
     state: &AppState,
     symbols: &[String],
 ) -> HashMap<String, serde_json::Value> {
     let tx_rev = state.live.tx_revision.load(Ordering::Relaxed);
     let candle_rev = state.live.candles_revision.load(Ordering::Relaxed);
+    let watch_rev = state.live.watchlist_revision.load(Ordering::Relaxed);
     {
         let cache = state.live.signals_cache.read().await;
-        if cache.0 == tx_rev && cache.1 == candle_rev {
-            return cache.2.clone();
+        if cache.0 == tx_rev && cache.1 == candle_rev && cache.2 == watch_rev {
+            return cache.3.clone();
         }
     }
     let mut map = HashMap::new();
@@ -137,8 +174,41 @@ async fn position_signals(
             Err(e) => tracing::warn!(symbol, error = %e, "signal closes fetch failed"),
         }
     }
-    *state.live.signals_cache.write().await = (tx_rev, candle_rev, map.clone());
+    *state.live.signals_cache.write().await = (tx_rev, candle_rev, watch_rev, map.clone());
     map
+}
+
+/// Watchlist symbols via the revision-keyed cache (no DB hit per tick).
+async fn watchlist_symbols_cached(state: &AppState) -> anyhow::Result<Arc<Vec<String>>> {
+    let rev = state.live.watchlist_revision.load(Ordering::Relaxed);
+    {
+        let cache = state.live.watchlist_cache.read().await;
+        if let Some((r, symbols)) = &*cache {
+            if *r == rev {
+                return Ok(symbols.clone());
+            }
+        }
+    }
+    let symbols = Arc::new(repo::watchlist_symbols(&state.db).await?);
+    *state.live.watchlist_cache.write().await = Some((rev, symbols.clone()));
+    Ok(symbols)
+}
+
+/// Serialized alert list via the revision-keyed cache.
+async fn alerts_block(state: &AppState) -> anyhow::Result<serde_json::Value> {
+    let rev = state.live.alerts_revision.load(Ordering::Relaxed);
+    {
+        let cache = state.live.alerts_cache.read().await;
+        if let Some((r, value)) = &*cache {
+            if *r == rev {
+                return Ok(value.clone());
+            }
+        }
+    }
+    let alerts = repo::list_alerts(&state.db).await?;
+    let value = serde_json::to_value(&alerts).context("serialize alerts")?;
+    *state.live.alerts_cache.write().await = Some((rev, value.clone()));
+    Ok(value)
 }
 
 /// Spawn the whole pipeline; returns handles for the router + mutation paths.
@@ -297,13 +367,15 @@ pub async fn refresh_quotes(state: &AppState, symbols: &[String], only_missing: 
     }
 }
 
-/// Recompute the desired upstream subscription set after any transaction
-/// mutation: every symbol ever transacted (any mode — paper orders need
-/// prices too) + the watchlist. A superset of open positions is fine; a
-/// few extra subscriptions cost nothing at personal scale.
+/// Recompute the desired upstream subscription set after any transaction,
+/// watchlist or alert mutation: every symbol ever transacted (any mode —
+/// paper orders need prices too) + the watchlist + active-alert symbols
+/// (conditions need data to evaluate). A superset of open positions is
+/// fine; a few extra subscriptions cost nothing at personal scale.
 pub async fn refresh_symbols(state: &AppState) -> anyhow::Result<()> {
     let mut symbols = repo::all_symbols(&state.db).await?;
     symbols.extend(repo::watchlist_symbols(&state.db).await?);
+    symbols.extend(repo::alert_symbols(&state.db).await?);
     symbols.sort();
     symbols.dedup();
     state.symbols.send_if_modified(|current| {
@@ -360,12 +432,18 @@ pub async fn portfolio_snapshot(state: &AppState) -> anyhow::Result<serde_json::
         }
     };
 
+    let watch_symbols = watchlist_symbols_cached(state).await?;
+    let alerts = alerts_block(state).await?;
+
     let payload = match basis_result {
         Ok(basis) => {
             let view = value(&basis, &prices);
-            let open_symbols: Vec<String> =
+            let mut signal_symbols: Vec<String> =
                 view.positions.iter().map(|p| p.symbol.clone()).collect();
-            let signals = position_signals(state, &open_symbols).await;
+            signal_symbols.extend(watch_symbols.iter().cloned());
+            signal_symbols.sort();
+            signal_symbols.dedup();
+            let signals = position_signals(state, &signal_symbols).await;
             let mut view_value = serde_json::to_value(&view).context("serialize portfolio view")?;
             if let Some(positions) = view_value
                 .get_mut("positions")
@@ -379,6 +457,20 @@ pub async fn portfolio_snapshot(state: &AppState) -> anyhow::Result<serde_json::
                     }
                 }
             }
+            // Watchlist rows: cached symbols + in-memory prices/signals only.
+            let watchlist: Vec<serde_json::Value> = watch_symbols
+                .iter()
+                .map(|symbol| {
+                    let quote = prices.get(symbol);
+                    serde_json::json!({
+                        "symbol": symbol,
+                        "price": quote.map(|q| q.price),
+                        "prev_close": quote.and_then(|q| q.prev_close),
+                        "price_ts": quote.and_then(|q| q.ts),
+                        "signals": signals.get(symbol),
+                    })
+                })
+                .collect();
             serde_json::json!({
                 "type": "portfolio",
                 "ts": now,
@@ -388,6 +480,8 @@ pub async fn portfolio_snapshot(state: &AppState) -> anyhow::Result<serde_json::
                 "tx_revision": tx_revision,
                 "trading": trading,
                 "portfolio": view_value,
+                "watchlist": watchlist,
+                "alerts": alerts,
             })
         }
         // A historically invalid log (e.g. an oversell snuck in via CSV
@@ -397,6 +491,7 @@ pub async fn portfolio_snapshot(state: &AppState) -> anyhow::Result<serde_json::
             "ts": now,
             "tx_revision": tx_revision,
             "trading": trading,
+            "alerts": alerts,
             "error": format!("transaction log is inconsistent: {e}"),
         }),
     };

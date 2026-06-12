@@ -6,12 +6,14 @@ A self-hosted, single-user web dashboard for **tracking and trading** a US
 stocks & ETFs portfolio in real time, with an AI analyst watching over your
 shoulder. One Rust binary, one SQLite file, your keys never leave your box.
 
-**Status: Phase 3** — tracking, paper trading, and now **history & insight**:
-equity curve with a cash-flow-matched SPY benchmark, proper TWR + IRR,
-quant-signal badges (RSI / SMA distance / drawdown), daily candle backfill
-via Alpaca's free bars, and EOD snapshots. See [PLAN.md](PLAN.md) for the
-full design and roadmap, and [docs/RESEARCH.md](docs/RESEARCH.md) for the
-research behind it.
+**Status: Phase 4** — tracking, paper trading, history & insight, and now
+**alerts-to-action**: price/drawdown alerts that can carry a pre-staged
+order ticket (the alert never auto-executes — triggering surfaces a
+one-click-confirm ticket that still passes every guardrail), push
+notifications via [ntfy](https://ntfy.sh), a live watchlist with signal
+badges, Fidelity/Schwab CSV importers, and the REKT meter. See
+[PLAN.md](PLAN.md) for the full design and roadmap, and
+[docs/RESEARCH.md](docs/RESEARCH.md) for the research behind it.
 
 ## Quick start
 
@@ -33,9 +35,12 @@ with clear errors instead of pretending.
 
 Configuration (env vars): `REKT_DB` (default `rekt.db`), `REKT_LISTEN`
 (default `127.0.0.1:7777`), `FINNHUB_API_KEY`, `ALPACA_PAPER_KEY`/`_SECRET`,
-and guardrails: `REKT_MAX_ORDER_NOTIONAL` (default 10000),
-`REKT_MAX_POSITION_PCT` (default 25), `REKT_MAX_ORDERS_PER_DAY` (default 20),
-`REKT_MAX_DAILY_LOSS` (circuit breaker, default 1000; ≤0 disables).
+alert push: `REKT_NTFY_TOPIC` (topic on the public ntfy.sh) or
+`REKT_NTFY_URL` (full URL, e.g. self-hosted ntfy), and guardrails:
+`REKT_MAX_ORDER_NOTIONAL` (default 10000), `REKT_MAX_POSITION_PCT`
+(default 25), `REKT_MAX_ORDERS_PER_DAY` (default 20),
+`REKT_MAX_DAILY_LOSS` (circuit breaker on new buys, default 1000;
+≤0 disables).
 
 ## Development
 
