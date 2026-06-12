@@ -579,7 +579,9 @@ pub async fn submit_order(
     }
 
     let ticket = OrderTicket {
-        symbol: input.symbol.trim().to_uppercase(),
+        // Same one symbol rule as watchlist/alerts — a malformed symbol
+        // must fail here, not as a broker rejection after a round-trip.
+        symbol: crate::api::validate_symbol(&input.symbol)?,
         side: input.side,
         order_type: input.order_type,
         qty: input.qty,

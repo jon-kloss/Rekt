@@ -535,7 +535,16 @@ mod tests {
             .body(axum::body::Body::from(bad_csv))
             .unwrap();
         let response = app(state.clone()).oneshot(request_body).await.unwrap();
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        // Replay errors name the line in the ORIGINAL file (header = line 1;
+        // the oversell is data row 2 = file line 3), like every other path.
+        assert!(
+            body["error"].as_str().unwrap().starts_with("line 3:"),
+            "{body}"
+        );
 
         let (_, txs) = request(state.clone(), "GET", "/api/transactions", None).await;
         assert_eq!(txs.as_array().unwrap().len(), 0);
@@ -704,6 +713,19 @@ mod tests {
     #[tokio::test]
     async fn submit_persists_deterministic_client_id_then_accepts() {
         let state = trading_state().await;
+        // Tickets obey the same symbol rule as watchlist/alerts — a
+        // malformed symbol fails locally, not as a broker rejection.
+        let (status, _) = request(
+            state.clone(),
+            "POST",
+            "/api/orders",
+            Some(serde_json::json!({
+                "symbol": "not a symbol!", "side": "buy", "order_type": "market", "qty": "1"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
         let (status, json) = request(
             state.clone(),
             "POST",
@@ -1015,6 +1037,9 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CREATED, "{created}");
         let id = created["id"].as_i64().unwrap();
+        // No price data yet → the arm-time check couldn't run; the response
+        // says so instead of implying it passed.
+        assert!(created["note"].as_str().unwrap().contains("no market data"));
 
         // Bad symbols are rejected like the watchlist path.
         let (status, _) = request(
@@ -1084,7 +1109,23 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
 
-        // rearm clears the trigger record.
+        // rearm while the condition is STILL true (price 169.5 ≤ 170) is
+        // refused — it would just re-fire on the next tick.
+        let (status, body) = request(
+            state.clone(),
+            "POST",
+            &format!("/api/alerts/{id}/rearm"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("still true"));
+
+        // Once the condition resets, rearm clears the trigger record.
+        state
+            .live
+            .set_price("AAPL", rust_decimal::Decimal::from(175))
+            .await;
         let (status, _) = request(
             state.clone(),
             "POST",

@@ -26,10 +26,6 @@ pub async fn backfill_candles(state: &AppState) -> anyhow::Result<()> {
     let Some(bars) = &state.bars else {
         return Ok(());
     };
-    // One backfill at a time: a concurrent run would re-fetch the same
-    // ranges and contend for SQLite's single writer; the loser of the lock
-    // sees fresh last_candle_date values and no-ops.
-    let _guard = state.backfill_lock.lock().await;
     let first = repo::first_tx_date(&state.db).await?;
     // NY calendar date: plain UTC is a day ahead between 8pm and midnight ET.
     let today = Utc::now().with_timezone(&New_York).date_naive();
@@ -51,6 +47,12 @@ pub async fn backfill_candles(state: &AppState) -> anyhow::Result<()> {
 
     let mut fetched_any = false;
     for symbol in symbols {
+        // One symbol fetched at a time across ALL backfill runs: a
+        // concurrent run (watchlist-add spawn vs scheduler) would re-fetch
+        // the same range and contend for SQLite's single writer. Per-symbol
+        // scope so a waiter is blocked for one fetch, not a whole run —
+        // the loser re-reads last_candle_date and no-ops.
+        let _guard = state.backfill_lock.lock().await;
         // Resume after the last cached candle; a small overlap re-fetches
         // the most recent bar in case it was written intraday.
         let from = match repo::last_candle_date(&state.db, &symbol).await? {

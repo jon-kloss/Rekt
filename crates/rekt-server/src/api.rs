@@ -105,7 +105,15 @@ const CANDIDATE_ID_BASE: i64 = i64::MAX / 2;
 /// broker fill landed against deleted history), new transactions are
 /// allowed through — otherwise the user could never insert the correcting
 /// entry and the create path would be permanently bricked.
-async fn validate_with(state: &AppState, candidates: &[repo::NewTx]) -> Result<(), ApiError> {
+///
+/// `lines` (parallel to `candidates`) lets CSV imports report the failing
+/// candidate by its line in the ORIGINAL file, matching the other two
+/// import error paths.
+async fn validate_with(
+    state: &AppState,
+    candidates: &[repo::NewTx],
+    lines: Option<&[usize]>,
+) -> Result<(), ApiError> {
     let mut txs = repo::fetch_mode_txs(&state.db, "live")
         .await
         .map_err(internal)?;
@@ -135,12 +143,12 @@ async fn validate_with(state: &AppState, candidates: &[repo::NewTx]) -> Result<(
         // candidate by its input position instead.
         let msg = e.to_string();
         let msg = if e.tx_id() >= CANDIDATE_ID_BASE {
+            let idx = (e.tx_id() - CANDIDATE_ID_BASE) as usize;
             let detail = msg.split_once(": ").map(|(_, m)| m).unwrap_or(&msg);
-            if candidates.len() == 1 {
-                detail.to_string()
-            } else {
-                let row = e.tx_id() - CANDIDATE_ID_BASE + 1;
-                format!("row {row}: {detail}")
+            match lines.and_then(|l| l.get(idx)) {
+                Some(line) => format!("line {line}: {detail}"),
+                None if candidates.len() == 1 => detail.to_string(),
+                None => format!("row {}: {detail}", idx + 1),
             }
         } else {
             msg
@@ -158,7 +166,7 @@ pub async fn create_tx(
         .map_err(|m| err(StatusCode::UNPROCESSABLE_ENTITY, m))?;
 
     let _guard = state.mutations.lock().await;
-    validate_with(&state, std::slice::from_ref(&new_tx)).await?;
+    validate_with(&state, std::slice::from_ref(&new_tx), None).await?;
     let ids = repo::insert_txs(&state.db, std::slice::from_ref(&new_tx))
         .await
         .map_err(internal)?;
@@ -239,6 +247,7 @@ pub async fn import_csv(
     };
 
     let mut new_txs = Vec::new();
+    let mut new_tx_lines = Vec::new();
     for (line, input) in inputs {
         let tx = input.into_new_tx(repo::TxSource::Csv).map_err(|m| {
             err(
@@ -247,6 +256,7 @@ pub async fn import_csv(
             )
         })?;
         new_txs.push(tx);
+        new_tx_lines.push(line);
     }
     if new_txs.is_empty() {
         return Err(err(
@@ -260,7 +270,7 @@ pub async fn import_csv(
     }
 
     let _guard = state.mutations.lock().await;
-    validate_with(&state, &new_txs).await?;
+    validate_with(&state, &new_txs, Some(&new_tx_lines)).await?;
     repo::insert_txs(&state.db, &new_txs)
         .await
         .map_err(internal)?;

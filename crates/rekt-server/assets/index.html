@@ -209,6 +209,9 @@
       <label>Qty<input name="draft_qty" inputmode="decimal" disabled></label>
       <label>Limit<input name="draft_limit" inputmode="decimal" disabled></label>
       <label>Note<input name="note"></label>
+      <label title="arm even if the condition is already true (it will fire on the next check)">
+        Fire now OK<input type="checkbox" name="allow_immediate" style="height:1.2rem">
+      </label>
       <button class="primary">arm alert</button>
     </form>
     <div id="amsg" class="warn"></div>
@@ -270,14 +273,16 @@ const signed = (s) => {
   return { text: (n > 0 ? "+" : "") + fmt(s), cls: n > 0 ? "up" : "down" };
 };
 
-// Reload the transaction table only when the server says the log changed.
-let txRevision = null;
+// Reload server-derived views only when the relevant revision moves:
+// transactions on tx_revision; history/meter on EITHER revision (candle
+// backfill changes the curve without any transaction mutation).
+let txRevision = null, candlesRevision = null;
 function trackRevision(payload) {
-  if (payload.tx_revision !== undefined && payload.tx_revision !== txRevision) {
-    txRevision = payload.tx_revision;
-    loadTxs();
-    loadHistory();
-  }
+  const txChanged = payload.tx_revision !== undefined && payload.tx_revision !== txRevision;
+  const candlesChanged = payload.candles_revision !== undefined && payload.candles_revision !== candlesRevision;
+  if (txChanged) { txRevision = payload.tx_revision; loadTxs(); }
+  if (candlesChanged) candlesRevision = payload.candles_revision;
+  if (txChanged || candlesChanged) loadHistory();
 }
 
 // No cancel button for terminal orders OR pending_submit (no broker id
@@ -511,15 +516,16 @@ async function loadHistory() {
     // crash shouldn't read "zen". Cached per tx revision; a meter-only
     // fetch failure must not clobber the healthy chart's status note.
     try {
+      const rev = `${txRevision}:${candlesRevision}`;
       let allPoints;
       if (currentRange === "all") {
         allPoints = points;
-        allPointsCache = { rev: txRevision, points };
-      } else if (allPointsCache.points && allPointsCache.rev === txRevision) {
+        allPointsCache = { rev, points };
+      } else if (allPointsCache.points && allPointsCache.rev === rev) {
         allPoints = allPointsCache.points;
       } else {
         allPoints = (await (await fetch("/api/history?range=all")).json()).points ?? [];
-        allPointsCache = { rev: txRevision, points: allPoints };
+        allPointsCache = { rev, points: allPoints };
       }
       updateRektMeter(allPoints);
     } catch { $("rektmeter").style.display = "none"; }
@@ -754,6 +760,7 @@ $("alertform").addEventListener("submit", async (e) => {
   };
   const note = (f.get("note") || "").toString().trim();
   if (note) body.note = note;
+  if (f.get("allow_immediate")) body.allow_immediate = true;
   if (f.get("draft_side")) {
     body.draft_order = {
       side: f.get("draft_side"),
@@ -766,9 +773,12 @@ $("alertform").addEventListener("submit", async (e) => {
       body.draft_order.limit_price = limit;
     }
   }
-  if (await apiFetch("/api/alerts", {
+  const json = await apiFetch("/api/alerts", {
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
-  }, $("amsg"))) {
+  }, $("amsg"));
+  if (json) {
+    // e.g. "no market data yet — fires when data arrives if already true".
+    if (json.note) $("amsg").textContent = json.note;
     e.target.reset();
     $("draftside").dispatchEvent(new Event("change"));
     refresh();

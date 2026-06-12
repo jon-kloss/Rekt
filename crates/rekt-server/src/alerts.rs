@@ -70,10 +70,13 @@ async fn current_observed(
 }
 
 /// POST /api/alerts — create an alert (optionally with a pre-staged ticket).
-/// Draft tickets are shape-checked NOW (via the same `check_shape` rules
-/// real orders use) so a bad draft fails at creation, not when the alert
-/// fires at 3am — and an already-satisfied condition is rejected so a
-/// fresh alert can't fire 15 seconds after you arm it.
+/// Draft tickets are SHAPE-checked now (via the same `check_shape` rules
+/// real orders use) so a malformed draft fails at creation, not when the
+/// alert fires at 3am. The contextual guardrails (notional cap, breaker,
+/// long-only) deliberately run at confirm time instead — they depend on
+/// account state at the moment the user places the order, not now.
+/// An already-satisfied condition is rejected so a fresh alert can't fire
+/// 15 seconds after you arm it.
 pub async fn create_alert(
     State(state): State<AppState>,
     Json(input): Json<AlertInput>,
@@ -105,9 +108,11 @@ pub async fn create_alert(
     // Arm-time check: an alert means "tell me when this BECOMES true". If
     // it's already true (including against a stale after-hours price), the
     // next evaluator tick would fire it instantly — reject unless the user
-    // explicitly opted in.
+    // explicitly opted in. With no data yet the check can't run; be honest
+    // about that in the response instead of implying it passed.
+    let observed = current_observed(&state, condition, &symbol).await;
     if !input.allow_immediate {
-        if let Some(observed) = current_observed(&state, condition, &symbol).await {
+        if let Some(observed) = observed {
             if rekt_core::alerts::check(condition, input.threshold, observed).is_some() {
                 return Err(err(
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -135,7 +140,14 @@ pub async fn create_alert(
 
     // Subscribe the symbol so the condition has data to evaluate against.
     alert_set_changed(&state).await?;
-    Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
+    let mut response = serde_json::json!({ "id": id });
+    if observed.is_none() && !input.allow_immediate {
+        response["note"] = serde_json::Value::String(format!(
+            "no market data for {symbol} yet — if the condition is already true when data \
+             arrives, the alert will fire then"
+        ));
+    }
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 /// GET /api/alerts — every alert, triggered first.
@@ -181,10 +193,30 @@ pub async fn dismiss_alert(
 }
 
 /// POST /api/alerts/{id}/rearm — back to active, clearing the trigger.
+/// Same arm-time rule as creation: a condition that is STILL true hasn't
+/// "become true again", and re-arming it would just re-fire 15s later.
 pub async fn rearm_alert(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
+    let Some(alert) = repo::get_alert(&state.db, id).await.map_err(internal)? else {
+        return Err(err(StatusCode::NOT_FOUND, format!("no alert {id}")));
+    };
+    if let Ok(condition) = alert.condition.parse::<AlertCondition>() {
+        if let Some(observed) = current_observed(&state, condition, &alert.symbol).await {
+            if rekt_core::alerts::check(condition, alert.threshold, observed).is_some() {
+                return Err(err(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "condition is still true ({} — currently {observed}); re-arming would \
+                         fire it again immediately. It can re-arm once the condition resets, \
+                         or delete and recreate the alert with allow_immediate",
+                        condition.describe(&alert.symbol, alert.threshold)
+                    ),
+                ));
+            }
+        }
+    }
     if !repo::rearm_alert(&state.db, id).await.map_err(internal)? {
         return Err(err(StatusCode::NOT_FOUND, format!("no alert {id}")));
     }
@@ -265,6 +297,11 @@ pub async fn evaluate_alerts(
     }
     if any_triggered {
         state.live.bump_alerts_revision();
+        // Triggered alerts leave the ACTIVE set — drop subscriptions for
+        // symbols nothing else watches (don't fail the eval pass over it).
+        if let Err(e) = crate::live::refresh_symbols(state).await {
+            tracing::warn!(error = %e, "post-trigger symbol refresh failed");
+        }
     }
     Ok(())
 }

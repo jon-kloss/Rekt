@@ -396,6 +396,9 @@ pub async fn portfolio_snapshot(state: &AppState) -> anyhow::Result<serde_json::
     let prices = state.live.price_views().await;
     let now = Utc::now();
     let tx_revision = state.live.tx_revision.load(Ordering::Relaxed);
+    // Carried in the payload so clients can refresh candle-derived views
+    // (history chart, REKT meter) when backfill lands without a tx change.
+    let candles_revision = state.live.candles_revision.load(Ordering::Relaxed);
     let trading = crate::trading::snapshot_block(state).await;
     // stream = ticks push in live; poll = REST refresh every minute;
     // none = whatever was seeded (honesty for the UI badge).
@@ -478,6 +481,7 @@ pub async fn portfolio_snapshot(state: &AppState) -> anyhow::Result<serde_json::
                 "live_feed": state.finnhub_token.is_some(),
                 "quotes": quotes,
                 "tx_revision": tx_revision,
+                "candles_revision": candles_revision,
                 "trading": trading,
                 "portfolio": view_value,
                 "watchlist": watchlist,
@@ -490,6 +494,7 @@ pub async fn portfolio_snapshot(state: &AppState) -> anyhow::Result<serde_json::
             "type": "error",
             "ts": now,
             "tx_revision": tx_revision,
+            "candles_revision": candles_revision,
             "trading": trading,
             "alerts": alerts,
             "error": format!("transaction log is inconsistent: {e}"),
