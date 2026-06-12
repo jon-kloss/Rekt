@@ -4,13 +4,26 @@
 //! runtime. The money math that must be right lives here, where it can be
 //! tested exhaustively without mocks.
 
+pub mod history;
 pub mod market;
 pub mod orders;
 pub mod portfolio;
+pub mod signals;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+
+/// One daily OHLCV bar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Candle {
+    pub date: NaiveDate,
+    pub open: Decimal,
+    pub high: Decimal,
+    pub low: Decimal,
+    pub close: Decimal,
+    pub volume: i64,
+}
 
 /// A point-in-time quote for a single instrument.
 ///

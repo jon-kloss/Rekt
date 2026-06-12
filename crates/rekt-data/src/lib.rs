@@ -4,11 +4,13 @@
 //! nerfed (PLAN.md §3), so a provider change must be a new impl, not a
 //! refactor. Implementations: [`finnhub::Finnhub`]; Alpaca lands in Phase 2.
 
+pub mod alpaca_data;
 pub mod finnhub;
 pub mod stream;
 
 use async_trait::async_trait;
-use rekt_core::Quote;
+use chrono::NaiveDate;
+use rekt_core::{Candle, Quote};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DataError {
@@ -16,6 +18,8 @@ pub enum DataError {
     SymbolNotFound(String),
     #[error("provider rate limit hit")]
     RateLimited,
+    #[error("this provider does not support {0} (free tier or API limitation)")]
+    Unsupported(&'static str),
     #[error("upstream error: {0}")]
     Upstream(String),
 }
@@ -29,4 +33,15 @@ pub trait MarketData: Send + Sync {
 
     /// Fetch a current quote for one symbol.
     async fn quote(&self, symbol: &str) -> Result<Quote, DataError>;
+
+    /// Daily OHLCV bars in [start, end], oldest first. Default: unsupported
+    /// (Finnhub's free tier dropped candles; Alpaca provides them).
+    async fn daily_candles(
+        &self,
+        _symbol: &str,
+        _start: NaiveDate,
+        _end: NaiveDate,
+    ) -> Result<Vec<Candle>, DataError> {
+        Err(DataError::Unsupported("daily candles"))
+    }
 }

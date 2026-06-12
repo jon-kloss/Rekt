@@ -1,9 +1,13 @@
 //! SQLite repository. Money travels as TEXT decimal strings (PLAN.md §7);
 //! parsing failures are data corruption and surface as errors, never zeros.
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
+use rekt_core::history::Closes;
 use rekt_core::portfolio::{Tx, TxKind};
+use rekt_core::Candle;
 use rust_decimal::Decimal;
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
@@ -178,6 +182,130 @@ pub async fn insert_txs(pool: &SqlitePool, txs: &[NewTx]) -> Result<Vec<i64>> {
     }
     dbtx.commit().await?;
     Ok(ids)
+}
+
+/// Earliest transaction date across all modes (history/backfill start).
+pub async fn first_tx_date(pool: &SqlitePool) -> Result<Option<NaiveDate>> {
+    let row = sqlx::query("SELECT MIN(ts) AS ts FROM transactions")
+        .fetch_one(pool)
+        .await?;
+    let ts: Option<String> = row.get("ts");
+    Ok(ts
+        .as_deref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&Utc).date_naive()))
+}
+
+/// Upsert daily candles for a symbol (idempotent by (instrument, date)).
+pub async fn upsert_candles(pool: &SqlitePool, symbol: &str, candles: &[Candle]) -> Result<u64> {
+    if candles.is_empty() {
+        return Ok(0);
+    }
+    let mut dbtx = pool.begin().await?;
+    let instrument_id = ensure_instrument(&mut dbtx, symbol).await?;
+    let mut written = 0;
+    for candle in candles {
+        written += sqlx::query(
+            r#"INSERT OR REPLACE INTO candles
+               (instrument_id, date, open, high, low, close, volume)
+               VALUES (?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(instrument_id)
+        .bind(candle.date.to_string())
+        .bind(candle.open.to_string())
+        .bind(candle.high.to_string())
+        .bind(candle.low.to_string())
+        .bind(candle.close.to_string())
+        .bind(candle.volume)
+        .execute(&mut *dbtx)
+        .await?
+        .rows_affected();
+    }
+    dbtx.commit().await?;
+    Ok(written)
+}
+
+pub async fn last_candle_date(pool: &SqlitePool, symbol: &str) -> Result<Option<NaiveDate>> {
+    let row = sqlx::query(
+        r#"SELECT MAX(c.date) AS d FROM candles c
+           JOIN instruments i ON i.id = c.instrument_id WHERE i.symbol = ?"#,
+    )
+    .bind(symbol)
+    .fetch_one(pool)
+    .await?;
+    let date: Option<String> = row.get("d");
+    Ok(date.as_deref().and_then(|s| s.parse().ok()))
+}
+
+/// All cached closes for the given symbols, keyed by symbol.
+pub async fn closes_map(pool: &SqlitePool, symbols: &[String]) -> Result<HashMap<String, Closes>> {
+    let mut map: HashMap<String, Closes> = HashMap::new();
+    for symbol in symbols {
+        let rows = sqlx::query(
+            r#"SELECT c.date, c.close FROM candles c
+               JOIN instruments i ON i.id = c.instrument_id
+               WHERE i.symbol = ? ORDER BY c.date"#,
+        )
+        .bind(symbol)
+        .fetch_all(pool)
+        .await?;
+        let mut closes = Closes::new();
+        for row in rows {
+            let date: String = row.get("date");
+            closes.insert(
+                date.parse().context("corrupt candle date")?,
+                parse_dec(&row.get::<String, _>("close"), "candles.close")?,
+            );
+        }
+        if !closes.is_empty() {
+            map.insert(symbol.clone(), closes);
+        }
+    }
+    Ok(map)
+}
+
+/// Most recent `limit` closes for one symbol, oldest first (signals input).
+pub async fn recent_closes(pool: &SqlitePool, symbol: &str, limit: i64) -> Result<Vec<Decimal>> {
+    let rows = sqlx::query(
+        r#"SELECT c.close FROM candles c
+           JOIN instruments i ON i.id = c.instrument_id
+           WHERE i.symbol = ? ORDER BY c.date DESC LIMIT ?"#,
+    )
+    .bind(symbol)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    let mut closes: Vec<Decimal> = rows
+        .into_iter()
+        .map(|r| parse_dec(&r.get::<String, _>("close"), "candles.close"))
+        .collect::<Result<_>>()?;
+    closes.reverse();
+    Ok(closes)
+}
+
+/// Write (or overwrite) the EOD snapshot row for a date+mode.
+pub async fn upsert_snapshot(
+    pool: &SqlitePool,
+    date: NaiveDate,
+    mode: &str,
+    total_value: Decimal,
+    cash: Decimal,
+    invested: Decimal,
+    realized_pnl: Decimal,
+) -> Result<()> {
+    sqlx::query(
+        r#"INSERT OR REPLACE INTO snapshots (date, mode, total_value, cash, invested, realized_pnl)
+           VALUES (?, ?, ?, ?, ?, ?)"#,
+    )
+    .bind(date.to_string())
+    .bind(mode)
+    .bind(total_value.to_string())
+    .bind(cash.to_string())
+    .bind(invested.to_string())
+    .bind(realized_pnl.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Durable key/value settings (e.g. the trading pause switch).

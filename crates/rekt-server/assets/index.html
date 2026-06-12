@@ -58,6 +58,15 @@
   #modebar.paused { background: #3d0c0e; color: #f85149; border-color: #f8514955; }
   .controls { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; margin-top: 0.75rem; }
   button.kill { background: #3d0c0e; border-color: #f8514955; color: #f85149; }
+  .ranges button { padding: 0.25rem 0.7rem; font-size: 0.75rem; }
+  .ranges button.active { background: #1f6feb; border-color: #1f6feb; }
+  .metrics { display: flex; gap: 1.5rem; flex-wrap: wrap; margin: 0.6rem 0; }
+  #histchart { width: 100%; height: 240px; background: #0a0d12; border: 1px solid #21262d; border-radius: 6px; }
+  .perfwrap { display: grid; grid-template-columns: 1fr 220px; gap: 1.5rem; align-items: start; }
+  @media (max-width: 800px) { .perfwrap { grid-template-columns: 1fr; } }
+  .legend { font-size: 0.7rem; color: #8b949e; display: flex; gap: 1rem; margin-top: 0.3rem; }
+  .legend .swatch { display: inline-block; width: 14px; height: 3px; vertical-align: middle; margin-right: 4px; }
+  .sig { font-size: 0.7rem; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -103,14 +112,47 @@
     </table>
   </section>
 
+  <section id="perf-section">
+    <h2>Performance</h2>
+    <div class="ranges" id="ranges">
+      <button data-range="1m">1M</button>
+      <button data-range="3m">3M</button>
+      <button data-range="1y">1Y</button>
+      <button data-range="all" class="active">All</button>
+    </div>
+    <div class="metrics">
+      <div class="stat"><span class="label">TWR</span><span class="val" id="m-twr">—</span></div>
+      <div class="stat"><span class="label">IRR (ann.)</span><span class="val" id="m-irr">—</span></div>
+      <div class="stat"><span class="label">SPY (same flows)</span><span class="val" id="m-spy">—</span></div>
+      <div class="stat"><span class="label">Realized</span><span class="val" id="m-real">—</span></div>
+      <div class="stat"><span class="label">Dividends</span><span class="val" id="m-div">—</span></div>
+    </div>
+    <div class="perfwrap">
+      <div>
+        <svg id="histchart" preserveAspectRatio="none"></svg>
+        <div class="legend">
+          <span><span class="swatch" style="background:#58a6ff"></span>equity</span>
+          <span><span class="swatch" style="background:#d29922"></span>SPY (cash-flow matched)</span>
+          <span><span class="swatch" style="background:#30363d"></span>net deposited</span>
+        </div>
+      </div>
+      <div>
+        <h2 style="margin-top:0">Allocation</h2>
+        <svg id="donut" viewBox="0 0 120 120" width="180" height="180"></svg>
+        <div id="donut-legend" class="legend" style="flex-direction:column;gap:0.2rem"></div>
+      </div>
+    </div>
+    <div id="histnote" class="warn"></div>
+  </section>
+
   <section>
     <h2>Positions</h2>
     <table>
       <thead><tr>
         <th>Symbol</th><th>Qty</th><th>Avg cost</th><th>Price</th>
-        <th>Mkt value</th><th>Day Δ</th><th>Total Δ</th><th>Realized</th>
+        <th>Mkt value</th><th>Day Δ</th><th>Total Δ</th><th>Realized</th><th>Signals</th>
       </tr></thead>
-      <tbody id="positions"><tr><td colspan="8" class="empty">no positions yet — add a buy below</td></tr></tbody>
+      <tbody id="positions"><tr><td colspan="9" class="empty">no positions yet — add a buy below</td></tr></tbody>
     </table>
   </section>
 
@@ -171,6 +213,7 @@ function trackRevision(payload) {
   if (payload.tx_revision !== undefined && payload.tx_revision !== txRevision) {
     txRevision = payload.tx_revision;
     loadTxs();
+    loadHistory();
   }
 }
 
@@ -239,8 +282,9 @@ function renderPortfolio(payload) {
   $("feed").className = "badge" + (payload.live_feed ? " live" : "");
 
   const tbody = $("positions");
+  renderDonut(p.positions);
   if (!p.positions.length) {
-    tbody.innerHTML = `<tr><td colspan="8" class="empty">no positions yet — add a buy below</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9" class="empty">no positions yet — add a buy below</td></tr>`;
     return;
   }
   tbody.innerHTML = p.positions.map((pos) => {
@@ -252,6 +296,7 @@ function renderPortfolio(payload) {
       <td class="${day.cls}">${day.text}</td>
       <td class="${tot.cls}">${tot.text}${pct}</td>
       <td class="${re.cls}">${re.text}</td>
+      <td class="sig">${sigBadges(pos.signals)}</td>
     </tr>`;
   }).join("");
 }
@@ -267,6 +312,112 @@ async function loadTxs() {
     <td><button class="danger" data-id="${esc(t.id)}" title="delete">✕</button></td>
   </tr>`).join("");
 }
+
+function sigBadges(sig) {
+  if (!sig) return `<span class="muted">—</span>`;
+  const parts = [];
+  if (sig.rsi14 !== null && sig.rsi14 !== undefined) {
+    const rsi = Number(sig.rsi14);
+    const cls = rsi >= 70 ? "down" : rsi <= 30 ? "up" : "muted";
+    parts.push(`<span class="${cls}" title="RSI(14)">RSI ${esc(sig.rsi14)}</span>`);
+  }
+  if (sig.vs_sma50_pct !== null && sig.vs_sma50_pct !== undefined) {
+    const v = Number(sig.vs_sma50_pct);
+    parts.push(`<span class="${v >= 0 ? "up" : "down"}" title="vs 50-day SMA">${v >= 0 ? "▲" : "▼"}50d ${esc(sig.vs_sma50_pct)}%</span>`);
+  }
+  if (sig.drawdown_pct !== null && sig.drawdown_pct !== undefined && Number(sig.drawdown_pct) >= 20) {
+    parts.push(`<span class="down" title="max drawdown (1y window)">DD ${esc(sig.drawdown_pct)}%</span>`);
+  }
+  return parts.join(" ") || `<span class="muted">—</span>`;
+}
+
+const DONUT_COLORS = ["#58a6ff", "#3fb950", "#d29922", "#f85149", "#bc8cff", "#39c5cf", "#8b949e"];
+function renderDonut(positions) {
+  const svg = $("donut"), legend = $("donut-legend");
+  const priced = positions.filter((p) => p.market_value !== null);
+  const total = priced.reduce((sum, p) => sum + Number(p.market_value), 0);
+  if (!priced.length || total <= 0) {
+    svg.innerHTML = ""; legend.innerHTML = `<span class="muted">no priced positions</span>`;
+    return;
+  }
+  const sorted = [...priced].sort((a, b) => Number(b.market_value) - Number(a.market_value));
+  let angle = -Math.PI / 2, paths = "", items = "";
+  sorted.forEach((p, i) => {
+    const frac = Number(p.market_value) / total;
+    const sweep = frac * Math.PI * 2;
+    const color = DONUT_COLORS[Math.min(i, DONUT_COLORS.length - 1)];
+    const x1 = 60 + 50 * Math.cos(angle), y1 = 60 + 50 * Math.sin(angle);
+    angle += sweep;
+    const x2 = 60 + 50 * Math.cos(angle), y2 = 60 + 50 * Math.sin(angle);
+    const large = sweep > Math.PI ? 1 : 0;
+    paths += frac > 0.999
+      ? `<circle cx="60" cy="60" r="50" fill="none" stroke="${color}" stroke-width="16"/>`
+      : `<path d="M ${x1} ${y1} A 50 50 0 ${large} 1 ${x2} ${y2}" fill="none" stroke="${color}" stroke-width="16"/>`;
+    items += `<span><span class="swatch" style="background:${color};height:8px;width:8px;border-radius:50%"></span>${esc(p.symbol)} ${(frac * 100).toFixed(1)}%</span>`;
+  });
+  svg.innerHTML = paths;
+  legend.innerHTML = items;
+}
+
+let currentRange = "all";
+async function loadHistory() {
+  try {
+    const data = await (await fetch(`/api/history?range=${currentRange}`)).json();
+    const points = data.points ?? [];
+    const set = (id, v, money) => {
+      const el = $(id);
+      if (v === null || v === undefined) { el.textContent = "—"; el.className = "val muted"; return; }
+      const s = signed(v); el.textContent = money ? s.text : `${s.text}%`; el.className = "val " + s.cls;
+    };
+    set("m-twr", data.metrics?.twr_pct);
+    set("m-irr", data.metrics?.irr_pct);
+    set("m-spy", data.metrics?.benchmark_twr_pct);
+    set("m-real", data.totals?.realized_pnl, true);
+    set("m-div", data.totals?.dividends, true);
+    $("histnote").textContent = points.length < 2
+      ? (data.note ?? "not enough history yet — the curve grows daily")
+      : (data.candles_available ? "" : "no candle data yet — configure Alpaca keys for historical bars");
+    drawChart(points);
+  } catch { $("histnote").textContent = "history unavailable — is the server up?"; }
+}
+
+function drawChart(points) {
+  const svg = $("histchart");
+  if (points.length < 2) { svg.innerHTML = ""; return; }
+  const W = 1000, H = 240, PAD = 6;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const series = {
+    equity: points.map((p) => Number(p.equity)),
+    benchmark: points.map((p) => p.benchmark === null ? null : Number(p.benchmark)),
+    deposited: points.map((p) => Number(p.net_deposited)),
+  };
+  const all = [...series.equity, ...series.deposited, ...series.benchmark.filter((v) => v !== null)];
+  const min = Math.min(...all), max = Math.max(...all);
+  const span = max - min || 1;
+  const x = (i) => PAD + (i / (points.length - 1)) * (W - 2 * PAD);
+  const y = (v) => H - PAD - ((v - min) / span) * (H - 2 * PAD);
+  const path = (values) => values
+    .map((v, i) => v === null ? null : `${i === 0 || values[i - 1] === null ? "M" : "L"} ${x(i).toFixed(1)} ${y(v).toFixed(1)}`)
+    .filter(Boolean).join(" ");
+  const last = points[points.length - 1];
+  const fillTo = y(Math.max(min, 0));
+  svg.innerHTML = `
+    <path d="${path(series.equity)} L ${x(points.length - 1).toFixed(1)} ${fillTo} L ${x(0).toFixed(1)} ${fillTo} Z"
+          fill="#58a6ff18" stroke="none"/>
+    <path d="${path(series.deposited)}" stroke="#30363d" stroke-width="1.5" fill="none" stroke-dasharray="2 3"/>
+    ${series.benchmark.some((v) => v !== null) ? `<path d="${path(series.benchmark)}" stroke="#d29922" stroke-width="1.5" fill="none" stroke-dasharray="5 4"/>` : ""}
+    <path d="${path(series.equity)}" stroke="#58a6ff" stroke-width="2" fill="none"/>
+    <text x="${W - PAD}" y="${y(Number(last.equity)) - 6}" fill="#58a6ff" font-size="11" text-anchor="end">$${fmt(last.equity)}</text>
+  `;
+}
+
+$("ranges").addEventListener("click", (e) => {
+  const range = e.target.dataset?.range;
+  if (!range) return;
+  currentRange = range;
+  document.querySelectorAll("#ranges button").forEach((b) => b.classList.toggle("active", b === e.target));
+  loadHistory();
+});
 
 async function refresh() {
   try {

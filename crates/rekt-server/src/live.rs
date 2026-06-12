@@ -35,6 +35,11 @@ pub struct Live {
     /// Bumped on every transaction mutation; lets clients detect that the
     /// transaction list (not just prices) changed and refetch it.
     tx_revision: AtomicU64,
+    /// Bumped when the candle cache gains data (signals must recompute).
+    candles_revision: AtomicU64,
+    /// (tx_rev, candles_rev, per-symbol signals) — recomputed only when a
+    /// revision moves, not on every price tick.
+    signals_cache: RwLock<(u64, u64, HashMap<String, serde_json::Value>)>,
 }
 
 pub struct LiveHandles {
@@ -73,6 +78,43 @@ impl Live {
         self.tx_revision.fetch_add(1, Ordering::Relaxed);
         self.mark_dirty();
     }
+
+    /// Call when new candles land (daily backfill).
+    pub fn bump_candles_revision(&self) {
+        self.candles_revision.fetch_add(1, Ordering::Relaxed);
+        self.mark_dirty();
+    }
+}
+
+/// Quant-signal badges per open position, cached by (tx, candles) revision
+/// so the per-second broadcaster never recomputes or re-queries needlessly.
+async fn position_signals(
+    state: &AppState,
+    symbols: &[String],
+) -> HashMap<String, serde_json::Value> {
+    let tx_rev = state.live.tx_revision.load(Ordering::Relaxed);
+    let candle_rev = state.live.candles_revision.load(Ordering::Relaxed);
+    {
+        let cache = state.live.signals_cache.read().await;
+        if cache.0 == tx_rev && cache.1 == candle_rev {
+            return cache.2.clone();
+        }
+    }
+    let mut map = HashMap::new();
+    for symbol in symbols {
+        match repo::recent_closes(&state.db, symbol, 250).await {
+            Ok(closes) if !closes.is_empty() => {
+                let summary = rekt_core::signals::summarize(&closes);
+                if let Ok(value) = serde_json::to_value(summary) {
+                    map.insert(symbol.clone(), value);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(symbol, error = %e, "signal closes fetch failed"),
+        }
+    }
+    *state.live.signals_cache.write().await = (tx_rev, candle_rev, map.clone());
+    map
 }
 
 /// Spawn the whole pipeline; returns handles for the router + mutation paths.
@@ -236,6 +278,22 @@ pub async fn portfolio_snapshot(state: &AppState) -> anyhow::Result<serde_json::
     let payload = match compute_basis(&txs) {
         Ok(basis) => {
             let view = value(&basis, &prices);
+            let open_symbols: Vec<String> =
+                view.positions.iter().map(|p| p.symbol.clone()).collect();
+            let signals = position_signals(state, &open_symbols).await;
+            let mut view_value = serde_json::to_value(&view).unwrap_or_default();
+            if let Some(positions) = view_value
+                .get_mut("positions")
+                .and_then(|p| p.as_array_mut())
+            {
+                for position in positions {
+                    if let Some(symbol) = position["symbol"].as_str() {
+                        if let Some(signal) = signals.get(symbol) {
+                            position["signals"] = signal.clone();
+                        }
+                    }
+                }
+            }
             serde_json::json!({
                 "type": "portfolio",
                 "ts": now,
@@ -243,7 +301,7 @@ pub async fn portfolio_snapshot(state: &AppState) -> anyhow::Result<serde_json::
                 "live_feed": state.finnhub_token.is_some(),
                 "tx_revision": tx_revision,
                 "trading": trading,
-                "portfolio": view,
+                "portfolio": view_value,
             })
         }
         // A historically invalid log (e.g. an oversell snuck in via CSV
