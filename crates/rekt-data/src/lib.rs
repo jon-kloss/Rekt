@@ -5,6 +5,7 @@
 //! refactor. Implementations: [`finnhub::Finnhub`]; Alpaca lands in Phase 2.
 
 pub mod finnhub;
+pub mod stream;
 
 use async_trait::async_trait;
 use rekt_core::Quote;

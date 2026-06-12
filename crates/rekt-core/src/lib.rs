@@ -4,6 +4,9 @@
 //! runtime. The money math that must be right lives here, where it can be
 //! tested exhaustively without mocks.
 
+pub mod market;
+pub mod portfolio;
+
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -26,12 +29,18 @@ pub struct Quote {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_util {
+    use rust_decimal::Decimal;
 
-    fn dec(s: &str) -> Decimal {
+    pub(crate) fn dec(s: &str) -> Decimal {
         s.parse().unwrap()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::dec;
 
     #[test]
     fn quote_serde_roundtrip_preserves_decimal_precision() {
