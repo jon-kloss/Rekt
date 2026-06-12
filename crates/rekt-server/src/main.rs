@@ -9,6 +9,7 @@
 mod api;
 mod live;
 mod repo;
+mod trading;
 
 use std::sync::Arc;
 
@@ -28,6 +29,9 @@ pub struct AppState {
     pub db: SqlitePool,
     pub market: Option<Arc<dyn MarketData>>,
     pub finnhub_token: Option<String>,
+    pub broker: Option<Arc<dyn rekt_broker::Broker>>,
+    pub trading: Arc<trading::TradingState>,
+    pub guardrails: Arc<rekt_core::orders::Guardrails>,
     pub live: Arc<live::Live>,
     pub snapshots: broadcast::Sender<String>,
     pub symbols: Arc<watch::Sender<Vec<String>>>,
@@ -45,6 +49,14 @@ fn app(state: AppState) -> Router {
         .route("/api/transactions", get(api::list_txs).post(api::create_tx))
         .route("/api/transactions/{id}", delete(api::delete_tx))
         .route("/api/import/csv", post(api::import_csv))
+        .route(
+            "/api/orders",
+            get(trading::list_orders).post(trading::submit_order),
+        )
+        .route("/api/orders/{id}", delete(trading::cancel_order))
+        .route("/api/orders/cancel_all", post(trading::cancel_all))
+        .route("/api/trading/pause", post(trading::set_paused))
+        .route("/api/broker/account", get(trading::account))
         .route("/api/ws", get(ws_upgrade))
         .with_state(state)
 }
@@ -96,6 +108,38 @@ async fn quote(
     }
 }
 
+/// Guardrails from env with conservative defaults (PLAN.md §4):
+/// REKT_MAX_ORDER_NOTIONAL, REKT_MAX_POSITION_PCT, REKT_MAX_ORDERS_PER_DAY.
+fn guardrails_from_env() -> rekt_core::orders::Guardrails {
+    let mut rails = rekt_core::orders::Guardrails::default();
+    if let Some(v) = std::env::var("REKT_MAX_ORDER_NOTIONAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        rails.max_order_notional = v;
+    }
+    if let Some(v) = std::env::var("REKT_MAX_POSITION_PCT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        rails.max_position_pct = v;
+    }
+    if let Some(v) = std::env::var("REKT_MAX_ORDERS_PER_DAY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        rails.max_orders_per_day = v;
+    }
+    if let Some(v) = std::env::var("REKT_MAX_DAILY_LOSS")
+        .ok()
+        .and_then(|v| v.parse::<rust_decimal::Decimal>().ok())
+    {
+        // Zero or negative disables the breaker explicitly.
+        rails.max_daily_loss = (v > rust_decimal::Decimal::ZERO).then_some(v);
+    }
+    rails
+}
+
 async fn open_db(path: &str) -> anyhow::Result<SqlitePool> {
     let options = SqliteConnectOptions::new()
         .filename(path)
@@ -131,10 +175,35 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Phase 2 ships PAPER ONLY (PLAN.md §4): live mode arrives behind an
+    // explicit toggle after a paper soak, with separate key config.
+    let alpaca_keys = match (
+        std::env::var("ALPACA_PAPER_KEY")
+            .ok()
+            .filter(|k| !k.is_empty()),
+        std::env::var("ALPACA_PAPER_SECRET")
+            .ok()
+            .filter(|k| !k.is_empty()),
+    ) {
+        (Some(key), Some(secret)) => Some((key, secret)),
+        _ => {
+            tracing::warn!("ALPACA_PAPER_KEY/SECRET not set — trading disabled");
+            None
+        }
+    };
+    let broker: Option<Arc<dyn rekt_broker::Broker>> = alpaca_keys.clone().map(|(key, secret)| {
+        Arc::new(rekt_broker::alpaca::Alpaca::paper(key, secret)) as Arc<dyn rekt_broker::Broker>
+    });
+
+    let guardrails = Arc::new(guardrails_from_env());
+
     let state = live::start(move |handles| AppState {
         db,
         market,
         finnhub_token,
+        broker,
+        trading: Arc::new(trading::TradingState::default()),
+        guardrails,
         live: handles.live,
         snapshots: handles.snapshots,
         symbols: Arc::new(handles.symbols),
@@ -143,6 +212,42 @@ async fn main() -> anyhow::Result<()> {
 
     // Subscribe the stream to currently held symbols from the start.
     live::refresh_symbols(&state).await?;
+
+    // Restore persisted safety flags (pause survives restarts).
+    trading::load_persisted(&state).await?;
+
+    // Trading pipeline: trade_updates stream → event apply. Reconciliation
+    // runs (a) on every stream (re)connect, and (b) on a periodic timer
+    // whose first tick fires immediately — a permanently-blocked websocket
+    // can never lock trading out.
+    if let Some((key, secret)) = alpaca_keys {
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(256);
+        tokio::spawn(rekt_broker::stream::run_trade_updates(
+            rekt_broker::alpaca::PAPER_API.to_string(),
+            key,
+            secret,
+            events_tx,
+        ));
+        let event_state = state.clone();
+        tokio::spawn(async move {
+            while let Some(event) = events_rx.recv().await {
+                if let Err(e) = trading::apply_event(&event_state, event).await {
+                    tracing::error!(error = %e, "broker event apply failed");
+                }
+            }
+        });
+        let recon_state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+            loop {
+                tick.tick().await; // first tick is immediate
+                if let Err(e) = trading::reconcile(&recon_state).await {
+                    tracing::error!(error = %e, "periodic reconciliation failed");
+                }
+            }
+        });
+        tracing::info!(mode = "paper", "broker configured — reconciling");
+    }
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     tracing::info!(addr = %listen, "REKT listening — how rekt are you today?");
@@ -172,6 +277,9 @@ mod tests {
             db: pool,
             market: None,
             finnhub_token: None,
+            broker: None,
+            trading: Arc::new(trading::TradingState::default()),
+            guardrails: Arc::new(rekt_core::orders::Guardrails::default()),
             live: Arc::new(live::Live::default()),
             snapshots,
             symbols: Arc::new(symbols),
@@ -369,6 +477,323 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ----------------------------------------------------- trading tests --
+
+    struct MockBroker;
+
+    #[async_trait::async_trait]
+    impl rekt_broker::Broker for MockBroker {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+        fn mode(&self) -> rekt_broker::TradeMode {
+            rekt_broker::TradeMode::Paper
+        }
+        async fn submit_order(
+            &self,
+            client_order_id: &str,
+            _ticket: &rekt_core::orders::OrderTicket,
+        ) -> Result<rekt_broker::BrokerOrder, rekt_broker::BrokerError> {
+            Ok(rekt_broker::BrokerOrder {
+                broker_order_id: format!("mock-{client_order_id}"),
+                client_order_id: client_order_id.to_string(),
+                status: rekt_core::orders::OrderStatus::Accepted,
+                filled_qty: rust_decimal::Decimal::ZERO,
+                avg_fill_price: None,
+                updated_ts: None,
+                symbol: Some(_ticket.symbol.clone()),
+                side: Some(_ticket.side),
+                qty: Some(_ticket.qty),
+                order_type: Some(_ticket.order_type.as_str().to_string()),
+                limit_price: _ticket.limit_price,
+                tif: Some(_ticket.tif.as_str().to_string()),
+            })
+        }
+        async fn cancel_order(&self, _id: &str) -> Result<(), rekt_broker::BrokerError> {
+            Ok(())
+        }
+        async fn cancel_all(&self) -> Result<(), rekt_broker::BrokerError> {
+            Ok(())
+        }
+        async fn order_by_client_id(
+            &self,
+            _id: &str,
+        ) -> Result<Option<rekt_broker::BrokerOrder>, rekt_broker::BrokerError> {
+            Ok(None)
+        }
+        async fn list_orders(
+            &self,
+        ) -> Result<Vec<rekt_broker::BrokerOrder>, rekt_broker::BrokerError> {
+            Ok(Vec::new())
+        }
+        async fn executions_since(
+            &self,
+            _after: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<Vec<rekt_broker::Execution>, rekt_broker::BrokerError> {
+            Ok(Vec::new())
+        }
+        async fn account(&self) -> Result<rekt_broker::AccountInfo, rekt_broker::BrokerError> {
+            Ok(rekt_broker::AccountInfo {
+                cash: rust_decimal::Decimal::from(100_000),
+                buying_power: rust_decimal::Decimal::from(100_000),
+                equity: rust_decimal::Decimal::from(100_000),
+                daytrade_count: 0,
+            })
+        }
+    }
+
+    async fn trading_state() -> AppState {
+        let mut state = test_state().await;
+        state.broker = Some(Arc::new(MockBroker));
+        state
+            .trading
+            .ready
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Seed cash so guardrails have equity to work with.
+        let (status, _) = request(
+            state.clone(),
+            "POST",
+            "/api/transactions",
+            Some(serde_json::json!({ "kind": "deposit", "price": "100000" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        state
+    }
+
+    #[tokio::test]
+    async fn orders_without_broker_are_503() {
+        let (status, json) = request(
+            test_state().await,
+            "POST",
+            "/api/orders",
+            Some(serde_json::json!({
+                "symbol": "AAPL", "side": "buy", "order_type": "limit",
+                "qty": "1", "limit_price": "100"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(json["error"].as_str().unwrap().contains("ALPACA_PAPER_KEY"));
+    }
+
+    #[tokio::test]
+    async fn orders_locked_until_reconciled() {
+        let mut state = test_state().await;
+        state.broker = Some(Arc::new(MockBroker));
+        // trading.ready deliberately left false
+        let (status, json) = request(
+            state,
+            "POST",
+            "/api/orders",
+            Some(serde_json::json!({
+                "symbol": "AAPL", "side": "buy", "order_type": "limit",
+                "qty": "1", "limit_price": "100"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(json["error"].as_str().unwrap().contains("reconciliation"));
+    }
+
+    #[tokio::test]
+    async fn submit_persists_deterministic_client_id_then_accepts() {
+        let state = trading_state().await;
+        let (status, json) = request(
+            state.clone(),
+            "POST",
+            "/api/orders",
+            Some(serde_json::json!({
+                "symbol": "aapl", "side": "buy", "order_type": "limit",
+                "qty": "5", "limit_price": "100"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{json}");
+        let client_order_id = json["client_order_id"].as_str().unwrap();
+        assert!(client_order_id.starts_with("rekt-paper-"));
+        assert_eq!(json["status"], "accepted");
+        assert_eq!(json["est_notional"], "500");
+
+        let (_, orders) = request(state, "GET", "/api/orders", None).await;
+        assert_eq!(orders[0]["symbol"], "AAPL");
+        assert_eq!(orders[0]["status"], "accepted");
+        assert_eq!(
+            orders[0]["broker_order_id"].as_str().unwrap(),
+            format!("mock-{client_order_id}")
+        );
+    }
+
+    #[tokio::test]
+    async fn guardrails_block_paused_and_oversized_orders() {
+        let state = trading_state().await;
+        state
+            .trading
+            .paused
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let ticket = serde_json::json!({
+            "symbol": "AAPL", "side": "buy", "order_type": "limit",
+            "qty": "1", "limit_price": "100"
+        });
+        let (status, json) = request(state.clone(), "POST", "/api/orders", Some(ticket)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(json["error"].as_str().unwrap().contains("paused"));
+
+        state
+            .trading
+            .paused
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // Default notional cap is 10k; this is 20k.
+        let big = serde_json::json!({
+            "symbol": "AAPL", "side": "buy", "order_type": "limit",
+            "qty": "200", "limit_price": "100"
+        });
+        let (status, json) = request(state, "POST", "/api/orders", Some(big)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(json["error"].as_str().unwrap().contains("cap"));
+    }
+
+    #[tokio::test]
+    async fn fills_ingest_idempotently_into_transactions() {
+        let state = trading_state().await;
+        // Submit an order so the broker_order_id mapping exists.
+        let (status, json) = request(
+            state.clone(),
+            "POST",
+            "/api/orders",
+            Some(serde_json::json!({
+                "symbol": "AAPL", "side": "buy", "order_type": "limit",
+                "qty": "5", "limit_price": "100"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let client_order_id = json["client_order_id"].as_str().unwrap().to_string();
+
+        let fill_event = || rekt_broker::stream::BrokerEvent::OrderUpdate {
+            order: Box::new(
+                serde_json::from_value(serde_json::json!({
+                "id": format!("mock-{client_order_id}"),
+                "client_order_id": client_order_id,
+                "status": "filled",
+                "filled_qty": "5",
+                "filled_avg_price": "99.50"
+                }))
+                .unwrap(),
+            ),
+            event: "fill".into(),
+            execution: Some(rekt_broker::stream::StreamExecution {
+                execution_id: "exec-same-id".into(),
+                qty: "5".parse().unwrap(),
+                price: "99.50".parse().unwrap(),
+                ts: chrono::Utc::now(),
+            }),
+        };
+
+        // Apply the same fill twice — stream replays guarantee duplicates.
+        trading::apply_event(&state, fill_event()).await.unwrap();
+        trading::apply_event(&state, fill_event()).await.unwrap();
+
+        use sqlx::Row;
+        let fills: i64 = sqlx::query("SELECT COUNT(*) AS n FROM fills")
+            .fetch_one(&state.db)
+            .await
+            .unwrap()
+            .get("n");
+        assert_eq!(fills, 1, "duplicate execution must not double-ingest");
+        let broker_txs: i64 =
+            sqlx::query("SELECT COUNT(*) AS n FROM transactions WHERE source = 'broker_fill'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap()
+                .get("n");
+        assert_eq!(broker_txs, 1);
+
+        // Mode segregation (PLAN §7): the paper fill is recorded as a
+        // paper transaction but must NOT appear in the live portfolio.
+        let modes: Vec<String> =
+            sqlx::query("SELECT mode FROM transactions WHERE source = 'broker_fill'")
+                .fetch_all(&state.db)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| r.get("mode"))
+                .collect();
+        assert_eq!(modes, vec!["paper"]);
+
+        let (_, snapshot) = request(state, "GET", "/api/portfolio", None).await;
+        // Live portfolio holds only the deposit — no AAPL position.
+        assert!(snapshot["portfolio"]["positions"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(snapshot["trading"]["mode"], "paper");
+        assert_eq!(snapshot["trading"]["orders"][0]["status"], "filled");
+    }
+
+    #[tokio::test]
+    async fn stale_status_update_cannot_regress_a_filled_order() {
+        let state = trading_state().await;
+        let (_, json) = request(
+            state.clone(),
+            "POST",
+            "/api/orders",
+            Some(serde_json::json!({
+                "symbol": "AAPL", "side": "buy", "order_type": "limit",
+                "qty": "5", "limit_price": "100"
+            })),
+        )
+        .await;
+        let client_order_id = json["client_order_id"].as_str().unwrap().to_string();
+
+        let order_json = |status: &str| {
+            serde_json::json!({
+                "id": format!("mock-{client_order_id}"),
+                "client_order_id": client_order_id,
+                "status": status,
+                "filled_qty": if status == "filled" { "5" } else { "0" }
+            })
+        };
+
+        // Fast fill arrives first…
+        trading::apply_event(
+            &state,
+            rekt_broker::stream::BrokerEvent::OrderUpdate {
+                order: Box::new(serde_json::from_value(order_json("filled")).unwrap()),
+                event: "fill".into(),
+                execution: Some(rekt_broker::stream::StreamExecution {
+                    execution_id: "exec-race".into(),
+                    qty: "5".parse().unwrap(),
+                    price: "100".parse().unwrap(),
+                    ts: chrono::Utc::now(),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+        // …then the slower submit-response/duplicate event says "accepted".
+        trading::apply_event(
+            &state,
+            rekt_broker::stream::BrokerEvent::OrderUpdate {
+                order: Box::new(serde_json::from_value(order_json("accepted")).unwrap()),
+                event: "new".into(),
+                execution: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        use sqlx::Row;
+        let status: String = sqlx::query("SELECT status FROM orders WHERE client_order_id = ?")
+            .bind(&client_order_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap()
+            .get("status");
+        assert_eq!(status, "filled", "terminal state must never regress");
     }
 
     #[tokio::test]

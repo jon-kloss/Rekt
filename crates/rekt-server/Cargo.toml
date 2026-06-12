@@ -11,12 +11,15 @@ name = "rekt"
 path = "src/main.rs"
 
 [dependencies]
+rekt-broker = { workspace = true }
 rekt-core = { workspace = true }
 rekt-data = { workspace = true }
 
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 csv = { workspace = true }
 futures-util = { workspace = true }
 rust_decimal = { workspace = true }

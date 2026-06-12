@@ -1465,6 +1465,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "rekt-broker"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures-util",
+ "rekt-core",
+ "reqwest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+]
+
+[[package]]
 name = "rekt-core"
 version = "0.1.0"
 dependencies = [
@@ -1499,11 +1517,14 @@ name = "rekt-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "chrono",
+ "chrono-tz",
  "csv",
  "futures-util",
  "http-body-util",
+ "rekt-broker",
  "rekt-core",
  "rekt-data",
  "rust_decimal",

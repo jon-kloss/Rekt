@@ -5,6 +5,7 @@
 //! tested exhaustively without mocks.
 
 pub mod market;
+pub mod orders;
 pub mod portfolio;
 
 use chrono::{DateTime, Utc};
