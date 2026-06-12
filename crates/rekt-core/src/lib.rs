@@ -29,12 +29,18 @@ pub struct Quote {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_util {
+    use rust_decimal::Decimal;
 
-    fn dec(s: &str) -> Decimal {
+    pub(crate) fn dec(s: &str) -> Decimal {
         s.parse().unwrap()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::dec;
 
     #[test]
     fn quote_serde_roundtrip_preserves_decimal_precision() {

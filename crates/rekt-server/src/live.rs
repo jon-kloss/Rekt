@@ -8,7 +8,7 @@
 //! talk to providers directly.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,6 +32,9 @@ pub struct CacheEntry {
 pub struct Live {
     prices: RwLock<HashMap<String, CacheEntry>>,
     dirty: AtomicBool,
+    /// Bumped on every transaction mutation; lets clients detect that the
+    /// transaction list (not just prices) changed and refetch it.
+    tx_revision: AtomicU64,
 }
 
 pub struct LiveHandles {
@@ -64,6 +67,12 @@ impl Live {
     pub fn mark_dirty(&self) {
         self.dirty.store(true, Ordering::Relaxed);
     }
+
+    /// Call after any transaction mutation (create/delete/import).
+    pub fn bump_tx_revision(&self) {
+        self.tx_revision.fetch_add(1, Ordering::Relaxed);
+        self.mark_dirty();
+    }
 }
 
 /// Spawn the whole pipeline; returns handles for the router + mutation paths.
@@ -89,8 +98,11 @@ pub fn start(state_factory: impl FnOnce(LiveHandles) -> AppState) -> AppState {
         let ingest_live = live.clone();
         tokio::spawn(async move {
             while let Some(trade) = trades_rx.recv().await {
+                // Normalize: cache keys must match the uppercased position
+                // keys or live prices silently miss the lookup.
+                let symbol = trade.symbol.to_uppercase();
                 let mut prices = ingest_live.prices.write().await;
-                let entry = prices.entry(trade.symbol).or_insert(CacheEntry {
+                let entry = prices.entry(symbol).or_insert(CacheEntry {
                     price: trade.price,
                     prev_close: None,
                     ts: Some(trade.ts),
@@ -123,15 +135,18 @@ pub fn start(state_factory: impl FnOnce(LiveHandles) -> AppState) -> AppState {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             tick.tick().await;
-            if !bcast_state.live.dirty.swap(false, Ordering::Relaxed) {
-                continue;
-            }
+            // Listener check FIRST: consuming the dirty flag with nobody
+            // connected would drop the update — a later subscriber would
+            // wait for the next trade instead of getting fresh state.
             if bcast_state.snapshots.receiver_count() == 0 {
                 continue;
             }
-            match portfolio_snapshot_json(&bcast_state).await {
-                Ok(json) => {
-                    let _ = bcast_state.snapshots.send(json);
+            if !bcast_state.live.dirty.swap(false, Ordering::Relaxed) {
+                continue;
+            }
+            match portfolio_snapshot(&bcast_state).await {
+                Ok(snapshot) => {
+                    let _ = bcast_state.snapshots.send(snapshot.to_string());
                 }
                 Err(e) => tracing::error!(error = %e, "snapshot recompute failed"),
             }
@@ -145,14 +160,30 @@ pub async fn seed_missing_quotes(state: &AppState, symbols: &[String]) {
     let Some(provider) = &state.market else {
         return;
     };
-    for symbol in symbols {
-        let known = state.live.prices.read().await.contains_key(symbol);
-        if known {
-            continue;
-        }
-        match provider.quote(symbol).await {
+
+    // One lock to find the gaps, then fetch concurrently, then one lock to
+    // store — never hold the cache across network calls.
+    let missing: Vec<String> = {
+        let prices = state.live.prices.read().await;
+        symbols
+            .iter()
+            .filter(|s| !prices.contains_key(*s))
+            .cloned()
+            .collect()
+    };
+    if missing.is_empty() {
+        return;
+    }
+
+    let fetches = missing.iter().map(|symbol| provider.quote(symbol));
+    let results = futures_util::future::join_all(fetches).await;
+
+    let mut prices = state.live.prices.write().await;
+    let mut seeded = false;
+    for (symbol, result) in missing.iter().zip(results) {
+        match result {
             Ok(quote) => {
-                state.live.prices.write().await.insert(
+                prices.insert(
                     symbol.clone(),
                     CacheEntry {
                         price: quote.price,
@@ -160,10 +191,14 @@ pub async fn seed_missing_quotes(state: &AppState, symbols: &[String]) {
                         ts: Some(quote.ts),
                     },
                 );
-                state.live.mark_dirty();
+                seeded = true;
             }
             Err(e) => tracing::warn!(symbol, error = %e, "seed quote failed"),
         }
+    }
+    drop(prices);
+    if seeded {
+        state.live.mark_dirty();
     }
 }
 
@@ -180,7 +215,9 @@ pub async fn refresh_symbols(state: &AppState) -> anyhow::Result<()> {
             .collect(),
         Err(_) => Vec::new(), // invalid log is surfaced by the API path, not here
     };
+    symbols.extend(repo::watchlist_symbols(&state.db).await?);
     symbols.sort();
+    symbols.dedup();
     state.symbols.send_if_modified(|current| {
         if *current == symbols {
             false
@@ -193,11 +230,12 @@ pub async fn refresh_symbols(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Full dashboard payload: portfolio view + market status.
-pub async fn portfolio_snapshot_json(state: &AppState) -> anyhow::Result<String> {
+/// Full dashboard payload: portfolio view + market status + tx revision.
+pub async fn portfolio_snapshot(state: &AppState) -> anyhow::Result<serde_json::Value> {
     let txs = repo::fetch_all_txs(&state.db).await?;
     let prices = state.live.price_views().await;
     let now = Utc::now();
+    let tx_revision = state.live.tx_revision.load(Ordering::Relaxed);
     let payload = match compute_basis(&txs) {
         Ok(basis) => {
             let view = value(&basis, &prices);
@@ -206,6 +244,7 @@ pub async fn portfolio_snapshot_json(state: &AppState) -> anyhow::Result<String>
                 "ts": now,
                 "market": us_market_status(now),
                 "live_feed": state.finnhub_token.is_some(),
+                "tx_revision": tx_revision,
                 "portfolio": view,
             })
         }
@@ -214,17 +253,22 @@ pub async fn portfolio_snapshot_json(state: &AppState) -> anyhow::Result<String>
         Err(e) => serde_json::json!({
             "type": "error",
             "ts": now,
+            "tx_revision": tx_revision,
             "error": format!("transaction log is inconsistent: {e}"),
         }),
     };
-    Ok(payload.to_string())
+    Ok(payload)
 }
 
 /// Browser websocket: send one snapshot immediately, then forward broadcasts.
 pub async fn client_ws(socket: WebSocket, state: AppState) {
     let mut socket = socket;
-    if let Ok(snapshot) = portfolio_snapshot_json(&state).await {
-        if socket.send(Message::text(snapshot)).await.is_err() {
+    if let Ok(snapshot) = portfolio_snapshot(&state).await {
+        if socket
+            .send(Message::text(snapshot.to_string()))
+            .await
+            .is_err()
+        {
             return;
         }
     }
@@ -238,6 +282,8 @@ pub async fn client_ws(socket: WebSocket, state: AppState) {
                             return;
                         }
                     }
+                    // Lagged is fine: every message is a full snapshot, so
+                    // the next received one carries complete fresh state.
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => return,
                 }

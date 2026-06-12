@@ -5,12 +5,32 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rekt_core::portfolio::{Tx, TxKind};
 use rust_decimal::Decimal;
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, SqliteConnection, SqlitePool};
 
 fn parse_dec(value: &str, what: &str) -> Result<Decimal> {
     value
         .parse()
         .with_context(|| format!("corrupt decimal in column {what}: {value:?}"))
+}
+
+/// Where a transaction came from. Matches the schema CHECK constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxSource {
+    Manual,
+    Csv,
+    /// Phase 2: ingested from a broker fill (carries a fill_id).
+    #[allow(dead_code)]
+    BrokerFill,
+}
+
+impl TxSource {
+    fn as_str(&self) -> &'static str {
+        match self {
+            TxSource::Manual => "manual",
+            TxSource::Csv => "csv",
+            TxSource::BrokerFill => "broker_fill",
+        }
+    }
 }
 
 /// All transactions in replay order (ts, then id) with symbols resolved.
@@ -45,16 +65,26 @@ pub async fn fetch_all_txs(pool: &SqlitePool) -> Result<Vec<Tx>> {
         .collect()
 }
 
+/// Symbols on the watchlist (for stream subscriptions).
+pub async fn watchlist_symbols(pool: &SqlitePool) -> Result<Vec<String>> {
+    let rows = sqlx::query(
+        r#"SELECT i.symbol FROM watchlist w JOIN instruments i ON i.id = w.instrument_id"#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.get("symbol")).collect())
+}
+
 /// Find-or-create an instrument row for a symbol; returns its id.
-pub async fn ensure_instrument(pool: &SqlitePool, symbol: &str) -> Result<i64> {
+async fn ensure_instrument(conn: &mut SqliteConnection, symbol: &str) -> Result<i64> {
     let symbol = symbol.to_uppercase();
     sqlx::query("INSERT OR IGNORE INTO instruments (symbol) VALUES (?)")
         .bind(&symbol)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     let row = sqlx::query("SELECT id FROM instruments WHERE symbol = ?")
         .bind(&symbol)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
     Ok(row.get("id"))
 }
@@ -68,16 +98,20 @@ pub struct NewTx {
     pub taxes: Decimal,
     pub ts: DateTime<Utc>,
     pub note: String,
+    pub source: TxSource,
+    /// Phase 2: links broker-fill transactions to their execution record.
+    pub fill_id: Option<i64>,
 }
 
-pub async fn insert_tx(pool: &SqlitePool, tx: &NewTx) -> Result<i64> {
+async fn insert_one(conn: &mut SqliteConnection, tx: &NewTx) -> Result<i64> {
     let instrument_id = match &tx.symbol {
-        Some(symbol) => Some(ensure_instrument(pool, symbol).await?),
+        Some(symbol) => Some(ensure_instrument(conn, symbol).await?),
         None => None,
     };
     let result = sqlx::query(
-        r#"INSERT INTO transactions (instrument_id, kind, qty, price, fees, taxes, ts, source, note)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'manual', ?)"#,
+        r#"INSERT INTO transactions
+           (instrument_id, kind, qty, price, fees, taxes, ts, source, fill_id, note)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
     )
     .bind(instrument_id)
     .bind(tx.kind.as_str())
@@ -86,10 +120,24 @@ pub async fn insert_tx(pool: &SqlitePool, tx: &NewTx) -> Result<i64> {
     .bind(tx.fees.to_string())
     .bind(tx.taxes.to_string())
     .bind(tx.ts.to_rfc3339())
+    .bind(tx.source.as_str())
+    .bind(tx.fill_id)
     .bind(&tx.note)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(result.last_insert_rowid())
+}
+
+/// Insert a batch atomically: one SQL transaction, all rows or none.
+/// Returns the inserted ids.
+pub async fn insert_txs(pool: &SqlitePool, txs: &[NewTx]) -> Result<Vec<i64>> {
+    let mut dbtx = pool.begin().await?;
+    let mut ids = Vec::with_capacity(txs.len());
+    for tx in txs {
+        ids.push(insert_one(&mut dbtx, tx).await?);
+    }
+    dbtx.commit().await?;
+    Ok(ids)
 }
 
 /// Returns true if a row was deleted.

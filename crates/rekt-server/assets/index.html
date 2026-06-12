@@ -111,6 +111,10 @@
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
+// Every server-sourced string that lands in innerHTML goes through esc() —
+// notes/symbols are user input (forms, CSV files) and must never execute.
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const fmt = (s, dash = "—") => {
   if (s === null || s === undefined) return dash;
   const n = Number(s);
@@ -119,10 +123,21 @@ const fmt = (s, dash = "—") => {
 const signed = (s) => {
   if (s === null || s === undefined) return { text: "—", cls: "muted" };
   const n = Number(s);
-  return { text: (n >= 0 ? "+" : "") + fmt(s), cls: n >= 0 ? "up" : "down" };
+  if (n === 0) return { text: "0.00", cls: "muted" };
+  return { text: (n > 0 ? "+" : "") + fmt(s), cls: n > 0 ? "up" : "down" };
 };
 
+// Reload the transaction table only when the server says the log changed.
+let txRevision = null;
+function trackRevision(payload) {
+  if (payload.tx_revision !== undefined && payload.tx_revision !== txRevision) {
+    txRevision = payload.tx_revision;
+    loadTxs();
+  }
+}
+
 function renderPortfolio(payload) {
+  trackRevision(payload);
   if (payload.type === "error") { $("warn").textContent = payload.error; return; }
   $("warn").textContent = payload.portfolio.unpriced_symbols.length
     ? `no price data for: ${payload.portfolio.unpriced_symbols.join(", ")} (equity excludes them)` : "";
@@ -145,7 +160,7 @@ function renderPortfolio(payload) {
     const day = signed(pos.day_pnl), tot = signed(pos.unrealized_pnl), re = signed(pos.realized_pnl);
     const pct = pos.unrealized_pnl_pct === null ? "" : ` (${signed(pos.unrealized_pnl_pct).text}%)`;
     return `<tr>
-      <td>${pos.symbol}</td><td>${pos.qty}</td><td>${fmt(pos.avg_cost)}</td>
+      <td>${esc(pos.symbol)}</td><td>${esc(pos.qty)}</td><td>${fmt(pos.avg_cost)}</td>
       <td>${fmt(pos.price)}</td><td>${fmt(pos.market_value)}</td>
       <td class="${day.cls}">${day.text}</td>
       <td class="${tot.cls}">${tot.text}${pct}</td>
@@ -159,17 +174,17 @@ async function loadTxs() {
   const tbody = $("txs");
   if (!txs.length) { tbody.innerHTML = `<tr><td colspan="8" class="empty">nothing yet</td></tr>`; return; }
   tbody.innerHTML = txs.map((t) => `<tr>
-    <td>${t.ts.slice(0, 16).replace("T", " ")}</td><td>${t.kind}</td>
-    <td>${t.symbol ?? ""}</td><td>${t.qty}</td><td>${fmt(t.price)}</td><td>${fmt(t.fees)}</td>
-    <td>${t.note}</td>
-    <td><button class="danger" data-id="${t.id}" title="delete">✕</button></td>
+    <td>${esc(t.ts.slice(0, 16).replace("T", " "))}</td><td>${esc(t.kind)}</td>
+    <td>${esc(t.symbol)}</td><td>${esc(t.qty)}</td><td>${fmt(t.price)}</td><td>${fmt(t.fees)}</td>
+    <td>${esc(t.note)}</td>
+    <td><button class="danger" data-id="${esc(t.id)}" title="delete">✕</button></td>
   </tr>`).join("");
 }
 
 async function refresh() {
   try {
+    // trackRevision inside renderPortfolio reloads the tx table when needed.
     renderPortfolio(await (await fetch("/api/portfolio")).json());
-    await loadTxs();
   } catch { $("warn").textContent = "server unreachable"; }
 }
 
@@ -194,12 +209,30 @@ $("txform").addEventListener("submit", async (e) => {
     if (v) body[k] = k === "symbol" ? v.toUpperCase() : v;
   }
   if (f.get("ts")) body.ts = new Date(f.get("ts")).toISOString();
-  const res = await fetch("/api/transactions", {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
-  });
-  if (!res.ok) { $("msg").textContent = (await res.json()).error; return; }
-  $("msg").textContent = ""; e.target.reset();
-  refresh();
+  try {
+    const res = await fetch("/api/transactions", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+    });
+    if (!res.ok) { $("msg").textContent = (await res.json()).error; return; }
+    $("msg").textContent = ""; e.target.reset();
+    refresh();
+  } catch {
+    $("msg").textContent = "request failed — is the server up? Transaction may not be saved.";
+  }
+});
+
+// Delete buttons are created per-row; delegate one listener on the table.
+$("txs").addEventListener("click", async (e) => {
+  const id = e.target.dataset?.id;
+  if (!id || !confirm("Delete this transaction? Derived positions will be recomputed.")) return;
+  try {
+    const res = await fetch(`/api/transactions/${id}`, { method: "DELETE" });
+    if (!res.ok) { $("msg").textContent = (await res.json()).error; return; }
+    $("msg").textContent = "";
+    refresh();
+  } catch {
+    $("msg").textContent = "delete failed — is the server up?";
+  }
 });
 
 $("kind").addEventListener("change", () => {
@@ -212,9 +245,13 @@ $("kind").addEventListener("change", () => {
 $("csvfile").addEventListener("change", async (e) => {
   const file = e.target.files[0];
   if (!file) return;
-  const res = await fetch("/api/import/csv", { method: "POST", body: await file.text() });
-  const json = await res.json();
-  $("msg").textContent = res.ok ? `imported ${json.imported} transactions` : json.error;
+  try {
+    const res = await fetch("/api/import/csv", { method: "POST", body: await file.text() });
+    const json = await res.json();
+    $("msg").textContent = res.ok ? `imported ${json.imported} transactions` : json.error;
+  } catch {
+    $("msg").textContent = "import failed — is the server up? Nothing was imported.";
+  }
   e.target.value = "";
   refresh();
 });

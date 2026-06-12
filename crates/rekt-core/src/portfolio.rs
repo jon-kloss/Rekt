@@ -366,10 +366,7 @@ pub fn value(basis: &PortfolioBasis, prices: &HashMap<String, PriceView>) -> Por
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn dec(s: &str) -> Decimal {
-        s.parse().unwrap()
-    }
+    use crate::test_util::dec;
 
     fn ts(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)

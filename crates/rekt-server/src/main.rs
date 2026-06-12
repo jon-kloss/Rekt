@@ -21,7 +21,7 @@ use axum::{
 };
 use rekt_data::{finnhub::Finnhub, DataError, MarketData};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, watch, Mutex};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -31,6 +31,9 @@ pub struct AppState {
     pub live: Arc<live::Live>,
     pub snapshots: broadcast::Sender<String>,
     pub symbols: Arc<watch::Sender<Vec<String>>>,
+    /// Serializes transaction mutations: validation replays the whole log,
+    /// so validate→insert must be atomic with respect to other mutations.
+    pub mutations: Arc<Mutex<()>>,
 }
 
 fn app(state: AppState) -> Router {
@@ -70,27 +73,26 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 async fn quote(
     State(state): State<AppState>,
     Path(symbol): Path<String>,
-) -> Result<Json<rekt_core::Quote>, (StatusCode, Json<serde_json::Value>)> {
-    let err = |status: StatusCode, msg: String| (status, Json(serde_json::json!({ "error": msg })));
-
+) -> Result<Json<rekt_core::Quote>, api::ApiError> {
     let Some(provider) = &state.market else {
-        return Err(err(
+        return Err(api::err(
             StatusCode::SERVICE_UNAVAILABLE,
-            "no market data provider configured — set FINNHUB_API_KEY".into(),
+            "no market data provider configured — set FINNHUB_API_KEY",
         ));
     };
 
     let symbol = symbol.to_uppercase();
     match provider.quote(&symbol).await {
         Ok(quote) => Ok(Json(quote)),
-        Err(DataError::SymbolNotFound(s)) => {
-            Err(err(StatusCode::NOT_FOUND, format!("unknown symbol: {s}")))
-        }
-        Err(DataError::RateLimited) => Err(err(
-            StatusCode::TOO_MANY_REQUESTS,
-            "provider rate limit hit, try again shortly".into(),
+        Err(DataError::SymbolNotFound(s)) => Err(api::err(
+            StatusCode::NOT_FOUND,
+            format!("unknown symbol: {s}"),
         )),
-        Err(DataError::Upstream(msg)) => Err(err(StatusCode::BAD_GATEWAY, msg)),
+        Err(DataError::RateLimited) => Err(api::err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "provider rate limit hit, try again shortly",
+        )),
+        Err(DataError::Upstream(msg)) => Err(api::err(StatusCode::BAD_GATEWAY, msg)),
     }
 }
 
@@ -136,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
         live: handles.live,
         snapshots: handles.snapshots,
         symbols: Arc::new(handles.symbols),
+        mutations: Arc::new(Mutex::new(())),
     });
 
     // Subscribe the stream to currently held symbols from the start.
@@ -172,6 +175,7 @@ mod tests {
             live: Arc::new(live::Live::default()),
             snapshots,
             symbols: Arc::new(symbols),
+            mutations: Arc::new(Mutex::new(())),
         }
     }
 
@@ -338,7 +342,51 @@ mod tests {
         let response = app(state.clone()).oneshot(request_body).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let (_, txs) = request(state, "GET", "/api/transactions", None).await;
+        let (_, txs) = request(state.clone(), "GET", "/api/transactions", None).await;
         assert_eq!(txs.as_array().unwrap().len(), 2);
+
+        // CSV imports must be recorded with source='csv', not 'manual'.
+        use sqlx::Row;
+        let sources: Vec<String> = sqlx::query("SELECT source FROM transactions")
+            .fetch_all(&state.db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.get("source"))
+            .collect();
+        assert_eq!(sources, vec!["csv", "csv"]);
+    }
+
+    #[tokio::test]
+    async fn index_serves_embedded_shell() {
+        let response = app(test_state().await)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn snapshot_carries_tx_revision_that_bumps_on_mutation() {
+        let state = test_state().await;
+        let (_, before) = request(state.clone(), "GET", "/api/portfolio", None).await;
+        let rev_before = before["tx_revision"].as_u64().unwrap();
+
+        let (status, _) = request(
+            state.clone(),
+            "POST",
+            "/api/transactions",
+            Some(serde_json::json!({ "kind": "deposit", "price": "100" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (_, after) = request(state, "GET", "/api/portfolio", None).await;
+        assert!(after["tx_revision"].as_u64().unwrap() > rev_before);
     }
 }

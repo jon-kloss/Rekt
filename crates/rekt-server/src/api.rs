@@ -1,4 +1,9 @@
 //! REST handlers: transactions CRUD, CSV import, portfolio view.
+//!
+//! Concurrency: all mutations take `state.mutations` for their whole
+//! validate→insert span. Validation replays the entire log, so two
+//! interleaved mutations could otherwise both pass against the same
+//! snapshot and write a combination the engine would reject (TOCTOU).
 
 use axum::{
     extract::{Path, State},
@@ -12,9 +17,9 @@ use serde::Deserialize;
 
 use crate::{live, repo, AppState};
 
-type ApiError = (StatusCode, Json<serde_json::Value>);
+pub type ApiError = (StatusCode, Json<serde_json::Value>);
 
-fn err(status: StatusCode, msg: impl Into<String>) -> ApiError {
+pub fn err(status: StatusCode, msg: impl Into<String>) -> ApiError {
     (status, Json(serde_json::json!({ "error": msg.into() })))
 }
 
@@ -23,6 +28,8 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
     err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
+/// Shared input shape for both the JSON API and CSV rows (the csv crate
+/// maps empty fields to `None` for `Option` types).
 #[derive(Debug, Deserialize)]
 pub struct TxInput {
     pub kind: String,
@@ -43,7 +50,7 @@ pub struct TxInput {
 }
 
 impl TxInput {
-    fn into_new_tx(self) -> Result<repo::NewTx, String> {
+    fn into_new_tx(self, source: repo::TxSource) -> Result<repo::NewTx, String> {
         let kind: TxKind = self.kind.parse()?;
         let symbol = self
             .symbol
@@ -61,6 +68,8 @@ impl TxInput {
             taxes: self.taxes.unwrap_or_default(),
             ts: self.ts.unwrap_or_else(Utc::now),
             note: self.note.unwrap_or_default(),
+            source,
+            fill_id: None,
         })
     }
 }
@@ -112,14 +121,20 @@ pub async fn create_tx(
     Json(input): Json<TxInput>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let new_tx = input
-        .into_new_tx()
+        .into_new_tx(repo::TxSource::Manual)
         .map_err(|m| err(StatusCode::UNPROCESSABLE_ENTITY, m))?;
+
+    let _guard = state.mutations.lock().await;
     validate_with(&state, std::slice::from_ref(&new_tx)).await?;
-    let id = repo::insert_tx(&state.db, &new_tx)
+    let ids = repo::insert_txs(&state.db, std::slice::from_ref(&new_tx))
         .await
         .map_err(internal)?;
+    state.live.bump_tx_revision();
     live::refresh_symbols(&state).await.map_err(internal)?;
-    Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "id": ids[0] })),
+    ))
 }
 
 pub async fn list_txs(
@@ -134,62 +149,37 @@ pub async fn delete_tx(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
+    let _guard = state.mutations.lock().await;
     let deleted = repo::delete_tx(&state.db, id).await.map_err(internal)?;
     if !deleted {
         return Err(err(StatusCode::NOT_FOUND, format!("no transaction {id}")));
     }
+    state.live.bump_tx_revision();
     live::refresh_symbols(&state).await.map_err(internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// Generic CSV import. Header: `kind,symbol,qty,price,fees,taxes,ts,note`
 /// (qty/price/fees/taxes/symbol optional per kind; ts RFC 3339, defaults to
-/// now). All-or-nothing: one bad row rejects the whole file.
+/// now). All-or-nothing: validation rejects the whole file on one bad row,
+/// and the inserts run in a single SQL transaction so a database failure
+/// can't leave a partial import either.
 pub async fn import_csv(
     State(state): State<AppState>,
     body: String,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    #[derive(Debug, Deserialize)]
-    struct Row {
-        kind: String,
-        #[serde(default)]
-        symbol: Option<String>,
-        #[serde(default)]
-        qty: Option<Decimal>,
-        #[serde(default)]
-        price: Option<Decimal>,
-        #[serde(default)]
-        fees: Option<Decimal>,
-        #[serde(default)]
-        taxes: Option<Decimal>,
-        #[serde(default)]
-        ts: Option<DateTime<Utc>>,
-        #[serde(default)]
-        note: Option<String>,
-    }
-
     let mut reader = csv::ReaderBuilder::new()
         .trim(csv::Trim::All)
         .from_reader(body.as_bytes());
     let mut new_txs = Vec::new();
-    for (line, row) in reader.deserialize::<Row>().enumerate() {
-        let row = row.map_err(|e| {
+    for (line, row) in reader.deserialize::<TxInput>().enumerate() {
+        let input = row.map_err(|e| {
             err(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 format!("row {}: {e}", line + 2),
             )
         })?;
-        let input = TxInput {
-            kind: row.kind,
-            symbol: row.symbol,
-            qty: row.qty,
-            price: row.price,
-            fees: row.fees,
-            taxes: row.taxes,
-            ts: row.ts,
-            note: row.note,
-        };
-        let tx = input.into_new_tx().map_err(|m| {
+        let tx = input.into_new_tx(repo::TxSource::Csv).map_err(|m| {
             err(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 format!("row {}: {m}", line + 2),
@@ -201,10 +191,12 @@ pub async fn import_csv(
         return Err(err(StatusCode::UNPROCESSABLE_ENTITY, "no rows in CSV"));
     }
 
+    let _guard = state.mutations.lock().await;
     validate_with(&state, &new_txs).await?;
-    for tx in &new_txs {
-        repo::insert_tx(&state.db, tx).await.map_err(internal)?;
-    }
+    repo::insert_txs(&state.db, &new_txs)
+        .await
+        .map_err(internal)?;
+    state.live.bump_tx_revision();
     live::refresh_symbols(&state).await.map_err(internal)?;
     Ok(Json(serde_json::json!({ "imported": new_txs.len() })))
 }
@@ -216,8 +208,6 @@ pub async fn portfolio(State(state): State<AppState>) -> Result<Json<serde_json:
     live::refresh_symbols(&state).await.map_err(internal)?;
     let symbols: Vec<String> = state.symbols.borrow().clone();
     live::seed_missing_quotes(&state, &symbols).await;
-    let json = live::portfolio_snapshot_json(&state)
-        .await
-        .map_err(internal)?;
-    Ok(Json(serde_json::from_str(&json).map_err(internal)?))
+    let snapshot = live::portfolio_snapshot(&state).await.map_err(internal)?;
+    Ok(Json(snapshot))
 }
