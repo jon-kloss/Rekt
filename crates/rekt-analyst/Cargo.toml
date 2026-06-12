@@ -1,0 +1,20 @@
+[package]
+name = "rekt-analyst"
+description = "REKT AI analyst: Claude API client, tool loop, cost metering (advisory only)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# INVARIANT (PLAN.md §5): this crate must NEVER depend on rekt-broker.
+# The type system is the guarantee that the AI layer cannot place orders.
+
+[dependencies]
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

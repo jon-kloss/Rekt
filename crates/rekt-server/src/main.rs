@@ -7,6 +7,7 @@
 //!   the API answers 503 with an explanation instead of pretending.
 
 mod alerts;
+mod analyst;
 mod api;
 mod history;
 mod import;
@@ -14,6 +15,7 @@ mod live;
 mod repo;
 mod trading;
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use axum::{
@@ -49,6 +51,13 @@ pub struct AppState {
     /// (watchlist add) must not fetch the same symbol's history twice or
     /// contend for SQLite's single writer.
     pub backfill_lock: Arc<Mutex<()>>,
+    /// Claude API transport (ANTHROPIC_API_KEY) — None disables the analyst
+    /// honestly. NOTE: the analyst layer never touches `broker` (PLAN.md §5).
+    pub analyst: Option<Arc<dyn rekt_analyst::Transport>>,
+    /// Daily AI spend ceiling (REKT_AI_DAILY_BUDGET, USD).
+    pub ai_budget: rust_decimal::Decimal,
+    /// Single-flight latch: one analysis at a time.
+    pub analyst_running: Arc<AtomicBool>,
 }
 
 fn app(state: AppState) -> Router {
@@ -73,6 +82,19 @@ fn app(state: AppState) -> Router {
         .route("/api/alerts/{id}", delete(alerts::delete_alert))
         .route("/api/alerts/{id}/dismiss", post(alerts::dismiss_alert))
         .route("/api/alerts/{id}/rearm", post(alerts::rearm_alert))
+        .route("/api/analyst", get(analyst::summary))
+        .route("/api/analyst/briefing", post(analyst::run_briefing))
+        .route("/api/analyst/review", post(analyst::run_review))
+        .route("/api/analyst/ask", post(analyst::ask))
+        .route("/api/analyses/{id}", get(analyst::get_analysis))
+        .route(
+            "/api/recommendations/{id}/accept",
+            post(analyst::accept_recommendation),
+        )
+        .route(
+            "/api/recommendations/{id}/dismiss",
+            post(analyst::dismiss_recommendation),
+        )
         .route(
             "/api/orders",
             get(trading::list_orders).post(trading::submit_order),
@@ -259,6 +281,22 @@ async fn main() -> anyhow::Result<()> {
             }),
     };
 
+    // AI analyst (PLAN.md §5): env-only key, honest 503 without it.
+    let analyst: Option<Arc<dyn rekt_analyst::Transport>> = std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .map(|key| {
+            tracing::info!("AI analyst enabled (advisory only — it can never execute orders)");
+            Arc::new(rekt_analyst::HttpTransport::new(key)) as Arc<dyn rekt_analyst::Transport>
+        });
+    if analyst.is_none() {
+        tracing::warn!("no ANTHROPIC_API_KEY — AI analyst disabled");
+    }
+    let ai_budget = std::env::var("REKT_AI_DAILY_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| rust_decimal::Decimal::new(250, 2)); // $2.50/day
+
     let state = live::start(move |handles| AppState {
         db,
         market,
@@ -273,6 +311,9 @@ async fn main() -> anyhow::Result<()> {
         mutations: Arc::new(Mutex::new(())),
         notify_url,
         backfill_lock: Arc::new(Mutex::new(())),
+        analyst,
+        ai_budget,
+        analyst_running: Arc::new(AtomicBool::new(false)),
     });
 
     // Subscribe the stream to currently held symbols from the start.
@@ -327,6 +368,25 @@ async fn main() -> anyhow::Result<()> {
                 }
                 if let Err(e) = history::maybe_snapshot_eod(&hist_state).await {
                     tracing::error!(error = %e, "EOD snapshot failed");
+                }
+            }
+        });
+    }
+
+    // Scheduled analyst runs (REKT_AI_AUTO=0 disables): briefing on NY
+    // weekday mornings, deep review on Saturdays — each once per period.
+    let ai_auto = !matches!(
+        std::env::var("REKT_AI_AUTO").as_deref(),
+        Ok("0") | Ok("false") | Ok("off")
+    );
+    if state.analyst.is_some() && ai_auto {
+        let ai_state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(900));
+            loop {
+                tick.tick().await;
+                if let Err(e) = analyst::maybe_scheduled_runs(&ai_state).await {
+                    tracing::error!(error = %e, "scheduled analyst run failed");
                 }
             }
         });
@@ -387,6 +447,9 @@ mod tests {
             mutations: Arc::new(Mutex::new(())),
             notify_url: None,
             backfill_lock: Arc::new(Mutex::new(())),
+            analyst: None,
+            ai_budget: rust_decimal::Decimal::new(250, 2),
+            analyst_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1296,5 +1359,193 @@ mod tests {
             .unwrap();
         let response = app(state).oneshot(request_body).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// Scripted Claude transport: returns canned responses in order.
+    struct MockClaude {
+        responses: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl rekt_analyst::Transport for MockClaude {
+        async fn send(
+            &self,
+            _request: &serde_json::Value,
+        ) -> Result<rekt_analyst::MessageResponse, rekt_analyst::AnalystError> {
+            let next =
+                self.responses.lock().unwrap().pop().ok_or_else(|| {
+                    rekt_analyst::AnalystError::BadResponse("mock exhausted".into())
+                })?;
+            Ok(serde_json::from_value(next).unwrap())
+        }
+    }
+
+    async fn wait_for_analysis(state: &AppState, id: i64) -> repo::AnalysisRecord {
+        for _ in 0..100 {
+            let analysis = repo::get_analysis(&state.db, id).await.unwrap().unwrap();
+            if analysis.status != "running" {
+                return analysis;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("analysis {id} never finished");
+    }
+
+    #[tokio::test]
+    async fn analyst_disabled_without_key_and_budget_gates() {
+        let state = test_state().await;
+        // Honest 503 without a key.
+        let (status, body) = request(state.clone(), "POST", "/api/analyst/briefing", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        let (_, summary) = request(state.clone(), "GET", "/api/analyst", None).await;
+        assert_eq!(summary["enabled"], false);
+
+        // With a key but an exhausted budget → 429 and NO run started.
+        let mut state = state;
+        state.analyst = Some(Arc::new(MockClaude {
+            responses: std::sync::Mutex::new(vec![]),
+        }));
+        state.ai_budget = rust_decimal::Decimal::ZERO;
+        let (status, body) = request(state.clone(), "POST", "/api/analyst/briefing", None).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("budget"));
+    }
+
+    #[tokio::test]
+    async fn weekly_review_persists_report_cost_and_recommendations() {
+        let mut state = test_state().await;
+        let review_json = serde_json::json!({
+            "report_md": "## Review\nAll holdings fine.",
+            "recommendations": [
+                {"symbol": "aapl", "action": "trim", "sizing": "1% of equity",
+                 "rationale": "Concentration is high", "confidence": "medium"},
+                {"symbol": "not a symbol!", "action": "buy", "sizing": "",
+                 "rationale": "should be skipped", "confidence": "low"}
+            ]
+        });
+        state.analyst = Some(Arc::new(MockClaude {
+            responses: std::sync::Mutex::new(vec![serde_json::json!({
+                "content": [{"type": "text", "text": review_json.to_string()}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1000, "output_tokens": 500,
+                          "cache_creation_input_tokens": 2000, "cache_read_input_tokens": 0}
+            })]),
+        }));
+
+        let (status, body) = request(state.clone(), "POST", "/api/analyst/review", None).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = body["id"].as_i64().unwrap();
+
+        let analysis = wait_for_analysis(&state, id).await;
+        assert_eq!(analysis.status, "done", "{:?}", analysis.error);
+        assert_eq!(
+            analysis.report_md.as_deref(),
+            Some("## Review\nAll holdings fine.")
+        );
+        assert_eq!(analysis.input_tokens, 1000);
+        assert_eq!(analysis.cache_write_tokens, 2000);
+        // Opus 4.8: 1000×$5 + 2000×$6.25 + 500×$25 per MTok > 0.
+        assert!(analysis.cost_usd > rust_decimal::Decimal::ZERO);
+
+        // The valid recommendation persisted; the invalid symbol was skipped.
+        let (_, summary) = request(state.clone(), "GET", "/api/analyst", None).await;
+        // Poll payload stays light: list rows carry no report body; the
+        // full report rides only on "latest".
+        assert!(summary["analyses"][0]["report_md"].is_null());
+        assert_eq!(
+            summary["latest"]["report_md"].as_str().unwrap(),
+            "## Review\nAll holdings fine."
+        );
+        let recs = summary["recommendations"].as_array().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0]["symbol"], "AAPL");
+        assert_eq!(recs[0]["action"], "trim");
+        assert_eq!(recs[0]["status"], "open");
+        assert_eq!(summary["running"], false);
+        assert!(
+            summary["today_cost_usd"].as_str().is_some() || summary["today_cost_usd"].is_number()
+        );
+
+        // accept is one-shot; a second accept (or dismiss-after) conflicts.
+        let rec_id = recs[0]["id"].as_i64().unwrap();
+        let (status, _) = request(
+            state.clone(),
+            "POST",
+            &format!("/api/recommendations/{rec_id}/accept"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = request(
+            state.clone(),
+            "POST",
+            &format!("/api/recommendations/{rec_id}/dismiss"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn analyst_failures_are_recorded_and_release_the_latch() {
+        let mut state = test_state().await;
+        state.analyst = Some(Arc::new(MockClaude {
+            responses: std::sync::Mutex::new(vec![serde_json::json!({
+                "content": [],
+                "stop_reason": "refusal",
+                "usage": {"input_tokens": 1, "output_tokens": 0}
+            })]),
+        }));
+
+        let (status, body) = request(state.clone(), "POST", "/api/analyst/briefing", None).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = body["id"].as_i64().unwrap();
+        let analysis = wait_for_analysis(&state, id).await;
+        assert_eq!(analysis.status, "error");
+        assert!(analysis.error.unwrap().contains("declined"));
+        // The tokens the refused call billed are still accounted.
+        assert_eq!(analysis.input_tokens, 1);
+        assert!(analysis.cost_usd > rust_decimal::Decimal::ZERO);
+
+        // The single-flight latch released — a new run can start.
+        assert!(!state
+            .analyst_running
+            .load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn lapsed_recommendations_present_as_expired_and_refuse_transitions() {
+        let state = test_state().await;
+        let analysis_id = repo::insert_analysis(&state.db, "weekly_review", "m", None)
+            .await
+            .unwrap();
+        let rec_id = repo::insert_recommendation(
+            &state.db,
+            repo::NewRecommendation {
+                analysis_id,
+                symbol: "AAPL",
+                action: "buy",
+                sizing: "",
+                rationale: "was timely a week ago",
+                confidence: "low",
+                expires_ts: chrono::Utc::now() - chrono::Duration::hours(1),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Read-time computed status: presents as expired without any write.
+        let recs = repo::list_recommendations(&state.db, 10).await.unwrap();
+        assert_eq!(recs[0].status, "expired");
+
+        // And the transition guard refuses to act on it.
+        let (status, _) = request(
+            state,
+            "POST",
+            &format!("/api/recommendations/{rec_id}/accept"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 }

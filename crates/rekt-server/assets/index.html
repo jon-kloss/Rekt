@@ -74,6 +74,13 @@
   }
   .alertbanner button { padding: 0.25rem 0.7rem; font-size: 0.75rem; }
   .badge.rekt { color: #f85149; border-color: #f8514955; }
+  .aireport {
+    white-space: pre-wrap; background: #0a0d12; border: 1px solid #21262d;
+    border-radius: 6px; padding: 1rem; font-size: 0.85rem; line-height: 1.5;
+    max-height: 420px; overflow: auto; margin-top: 0.75rem;
+  }
+  .aireport strong { color: #58a6ff; }
+  td.wrap { white-space: normal; max-width: 360px; text-align: left; font-size: 0.75rem; }
 </style>
 </head>
 <body>
@@ -215,6 +222,26 @@
       <button class="primary">arm alert</button>
     </form>
     <div id="amsg" class="warn"></div>
+  </section>
+
+  <section>
+    <h2>AI Analyst <span id="ai-meta" class="muted" style="text-transform:none;letter-spacing:0"></span></h2>
+    <div class="controls" style="margin-top:0">
+      <button id="ai-briefing" disabled>☀ morning briefing</button>
+      <button id="ai-review" disabled>🔍 weekly deep review</button>
+      <input id="ai-question" placeholder="ask the analyst…" style="flex:1;min-width:220px">
+      <button id="ai-ask" class="primary" disabled>ask</button>
+    </div>
+    <div id="ai-msg" class="warn"></div>
+    <div id="ai-report" class="aireport muted">no analyses yet</div>
+    <table style="margin-top:1rem">
+      <thead><tr><th>Symbol</th><th>Action</th><th>Sizing</th><th>Conf.</th><th>Rationale</th><th>Status</th><th></th></tr></thead>
+      <tbody id="recs"><tr><td colspan="7" class="empty">no recommendations yet</td></tr></tbody>
+    </table>
+    <div class="muted" style="font-size:0.7rem;margin-top:0.5rem">
+      Advisory only — the analyst can never place orders; accepting a recommendation just prefills
+      the normal guarded ticket. Not financial advice.
+    </div>
   </section>
 
   <section>
@@ -815,8 +842,113 @@ function handleAlertAction(e) {
 $("alertbanners").addEventListener("click", handleAlertAction);
 $("alerts").addEventListener("click", handleAlertAction);
 
+// ---- AI analyst ----
+// Markdown-lite on TOP of esc(): every server string is escaped first, then
+// a few safe tags are layered in. Never feed raw model output to innerHTML.
+function mdLite(s) {
+  return esc(s)
+    .replace(/^#{1,4} (.*)$/gm, "<strong>$1</strong>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+}
+
+let aiPollTimer = null;
+async function loadAnalyst() {
+  try {
+    const data = await (await fetch("/api/analyst")).json();
+    const meta = $("ai-meta");
+    for (const id of ["ai-briefing", "ai-review", "ai-ask"]) $(id).disabled = !data.enabled || data.running;
+    if (!data.enabled) {
+      meta.textContent = "— disabled (set ANTHROPIC_API_KEY)";
+      return;
+    }
+    meta.textContent = `— $${fmt(data.today_cost_usd)} of $${fmt(data.budget_usd)} today` +
+      (data.running ? " · analyzing…" : "");
+
+    const latest = data.latest;
+    const report = $("ai-report");
+    if (latest) {
+      const when = latest.started_ts.slice(0, 16).replace("T", " ");
+      const head = `${latest.kind.replace("_", " ")} · ${when} · $${fmt(latest.cost_usd)}`;
+      if (latest.status === "running") {
+        report.className = "aireport muted";
+        report.textContent = `${head}\n\nanalyzing…`;
+      } else if (latest.error) {
+        report.className = "aireport";
+        report.innerHTML = `<strong>${esc(head)} — failed</strong>\n${esc(latest.error)}`;
+      } else {
+        report.className = "aireport";
+        report.innerHTML = `<strong>${esc(head)}</strong>\n\n${mdLite(latest.report_md ?? "")}`;
+      }
+    }
+
+    const tbody = $("recs");
+    const recs = data.recommendations ?? [];
+    if (!recs.length) {
+      tbody.innerHTML = `<tr><td colspan="7" class="empty">no recommendations yet</td></tr>`;
+    } else {
+      tbody.innerHTML = recs.map((r) => `<tr>
+        <td>${esc(r.symbol)}</td>
+        <td class="${r.action === "buy" ? "up" : r.action === "sell" || r.action === "trim" ? "down" : "muted"}">${esc(r.action)}</td>
+        <td>${esc(r.sizing)}</td><td>${esc(r.confidence)}</td>
+        <td class="wrap">${esc(r.rationale)}</td>
+        <td class="${r.status === "open" ? "up" : "muted"}">${esc(r.status)}</td>
+        <td>${r.status !== "open" ? "" :
+          `<button data-recaccept="${esc(r.id)}" data-symbol="${esc(r.symbol)}" data-action="${esc(r.action)}">accept</button>
+           <button class="danger" data-recdismiss="${esc(r.id)}" title="dismiss">✕</button>`}</td>
+      </tr>`).join("");
+    }
+
+    // Poll while a run is in flight so the report appears when it lands.
+    if (data.running && !aiPollTimer) aiPollTimer = setInterval(loadAnalyst, 3000);
+    if (!data.running && aiPollTimer) { clearInterval(aiPollTimer); aiPollTimer = null; }
+  } catch {
+    $("ai-msg").textContent = "analyst status unavailable";
+    // Stop polling into an outage; the next user action restarts it.
+    if (aiPollTimer) { clearInterval(aiPollTimer); aiPollTimer = null; }
+  }
+}
+
+async function aiTrigger(url, body) {
+  const json = await apiFetch(url, {
+    method: "POST",
+    ...(body ? { headers: { "content-type": "application/json" }, body: JSON.stringify(body) } : {}),
+  }, $("ai-msg"));
+  if (json) loadAnalyst();
+}
+
+$("ai-briefing").addEventListener("click", () => aiTrigger("/api/analyst/briefing"));
+$("ai-review").addEventListener("click", () => aiTrigger("/api/analyst/review"));
+$("ai-ask").addEventListener("click", () => {
+  const question = $("ai-question").value.trim();
+  if (!question) { $("ai-msg").textContent = "type a question first"; return; }
+  $("ai-question").value = "";
+  aiTrigger("/api/analyst/ask", { question });
+});
+
+$("recs").addEventListener("click", async (e) => {
+  const accept = e.target.dataset?.recaccept, dismiss = e.target.dataset?.recdismiss;
+  if (accept) {
+    if (await apiFetch(`/api/recommendations/${accept}/accept`, { method: "POST" }, $("ai-msg")) !== null) {
+      // Accepting prefills the NORMAL ticket — the human still reviews,
+      // sets quantity, and confirms; every guardrail applies server-side.
+      const action = e.target.dataset.action;
+      if (tradingEnabled && (action === "buy" || action === "sell" || action === "trim")) {
+        const form = $("orderform");
+        form.symbol.value = e.target.dataset.symbol;
+        form.side.value = action === "buy" ? "buy" : "sell";
+        $("trading-section").scrollIntoView({ behavior: "smooth" });
+        $("omsg").textContent = `prefilled from recommendation — set quantity and review`;
+      }
+      loadAnalyst();
+    }
+  } else if (dismiss) {
+    if (await apiFetch(`/api/recommendations/${dismiss}/dismiss`, { method: "POST" }, $("ai-msg")) !== null) loadAnalyst();
+  }
+});
+
 refresh();
 connect();
+loadAnalyst();
 </script>
 </body>
 </html>
