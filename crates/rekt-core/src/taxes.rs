@@ -18,8 +18,8 @@
 //!   consumed by the same sell never replace each other.
 //! - Replacement-share capacities are split-adjusted, but a wash whose
 //!   ±30-day window straddles a split still compares share counts
-//!   mechanically; a pending basis adjustment onto a post-split buy is
-//!   carried in pre-split per-share terms. Reconcile with your 1099-B.
+//!   mechanically (10 pre-split shares don't match 40 post-split ones).
+//!   Reconcile with your 1099-B.
 //! - This is bookkeeping, not tax advice.
 
 use std::collections::{BTreeMap, HashMap};
@@ -296,10 +296,12 @@ fn tax_disposals(txs: &[Tx]) -> Result<Vec<TaxDisposal>, PortfolioError> {
                     lot.unit_basis /= tx.qty;
                 }
                 // Capacities of shares bought BEFORE the split scale with
-                // them; later buys are already in post-split units.
+                // them; later buys are already in post-split units. Replay
+                // order is (ts, id) — the id tie-break keeps a same-instant
+                // post-split buy from gaining phantom capacity.
                 for cap in caps
                     .iter_mut()
-                    .filter(|c| c.symbol == symbol && c.ts <= tx.ts)
+                    .filter(|c| c.symbol == symbol && (c.ts, c.id) < (tx.ts, tx.id))
                 {
                     cap.cap *= tx.qty;
                 }
@@ -415,13 +417,17 @@ fn sell(
                     };
                     adj_alloc += amount;
                     let per_share_add = amount / r;
-                    let anchor = *buy_date - held;
-                    if *buy_ts <= tx.ts {
-                        // Replacement already held: adjust its lots now.
+                    // Saturate rather than panic: cascading tacks on
+                    // crafted ancient dates could otherwise underflow
+                    // chrono's range. A floor anchor stays long-term.
+                    let anchor = buy_date.checked_sub_signed(held).unwrap_or(NaiveDate::MIN);
+                    // Replay order is (ts, id): only a buy replayed BEFORE
+                    // this sell has a lot to adjust in place — a same-
+                    // instant later-id buy must go through the pending map
+                    // or the carried basis would silently vanish.
+                    if (*buy_ts, *buy_id) < (tx.ts, tx.id) {
                         adjust_held_lots(lots, *buy_id, *r, per_share_add, anchor);
                     } else {
-                        // Replacement bought after the sale: adjust the
-                        // lot when that buy is replayed.
                         pending.entry(*buy_id).or_default().push(PendingAdj {
                             qty: *r,
                             per_share_add,
@@ -447,6 +453,11 @@ fn sell(
 /// Designate `qty` still-held shares of `buy_id` as replacement shares:
 /// bump their per-share basis and tack the holding anchor, splitting a lot
 /// when only part of it is designated.
+///
+/// The adjusted sub-lot is inserted BEFORE the unadjusted remainder: its
+/// tacked anchor makes it the older holding, so FIFO must consume it
+/// first — otherwise the deferred loss would sit in the book longer than
+/// strict first-in-first-out reporting allows.
 fn adjust_held_lots(
     lots: &mut Vec<TaxLot>,
     buy_id: i64,
@@ -464,6 +475,7 @@ fn adjust_held_lots(
         if take == lots[i].qty {
             lots[i].unit_basis += per_share_add;
             lots[i].holding_from = anchor;
+            i += 1;
         } else {
             lots[i].qty -= take;
             let adjusted = TaxLot {
@@ -472,11 +484,10 @@ fn adjust_held_lots(
                 unit_basis: lots[i].unit_basis + per_share_add,
                 holding_from: anchor,
             };
-            lots.insert(i + 1, adjusted);
-            i += 1; // don't revisit the lot we just inserted
+            lots.insert(i, adjusted);
+            i += 2; // past the inserted sub-lot and the remainder
         }
         qty -= take;
-        i += 1;
     }
 }
 
@@ -809,6 +820,67 @@ mod tests {
         ];
         assert_eq!(tax_report(&txs, 2025).unwrap().rows.len(), 1);
         assert!(tax_report(&txs, 2026).unwrap().rows.is_empty());
+    }
+
+    #[test]
+    fn same_instant_split_then_buy_gains_no_phantom_capacity() {
+        // A split and a buy at the SAME timestamp, split first by id: the
+        // buy is post-split and its capacity must not be scaled — selling
+        // everything at a loss with no rebuy is not a wash.
+        let txs = vec![
+            tx(1, TxKind::Buy, "NVDA", "10", "400", "2026-01-02T15:00:00Z"),
+            tx(2, TxKind::Split, "NVDA", "4", "0", "2026-01-10T15:00:00Z"),
+            tx(3, TxKind::Buy, "NVDA", "10", "100", "2026-01-10T15:00:00Z"),
+            tx(4, TxKind::Sell, "NVDA", "50", "80", "2026-01-20T15:00:00Z"),
+        ];
+        let report = tax_report(&txs, 2026).unwrap();
+        assert_eq!(report.rows.len(), 2);
+        assert_eq!(report.rows[0].disallowed, Decimal::ZERO);
+        assert_eq!(report.rows[1].disallowed, Decimal::ZERO);
+        // Full exit: 4000 + 1000 paid, 4000 received.
+        assert_eq!(report.short.reportable, dec("-1000"));
+    }
+
+    #[test]
+    fn same_instant_rebuy_after_the_sell_still_carries_basis() {
+        // Sell and rebuy share a timestamp, sell first by id: the
+        // adjustment must route through the pending map (the rebuy lot
+        // doesn't exist yet) and land when the buy is replayed.
+        let txs = vec![
+            tx(1, TxKind::Buy, "TSLA", "10", "100", "2026-01-05T15:00:00Z"),
+            tx(2, TxKind::Sell, "TSLA", "10", "90", "2026-02-02T15:00:00Z"),
+            tx(3, TxKind::Buy, "TSLA", "10", "90", "2026-02-02T15:00:00Z"),
+            tx(4, TxKind::Sell, "TSLA", "10", "90", "2026-12-01T15:00:00Z"),
+        ];
+        let report = tax_report(&txs, 2026).unwrap();
+        assert_eq!(report.rows[0].disallowed, dec("100"));
+        // The carried basis lands: 900 + 100 deferred.
+        assert_eq!(report.rows[1].basis, dec("1000"));
+        // Conservation: bought 1900, sold 1800.
+        assert_eq!(report.short.reportable, dec("-100"));
+    }
+
+    #[test]
+    fn adjusted_sub_lot_sells_before_the_unadjusted_remainder() {
+        // Partial wash inside one purchase: the 4 adjusted shares carry a
+        // tacked (older) anchor, so FIFO must surface their deferred loss
+        // on the NEXT sale, not leave it parked behind the remainder.
+        let txs = vec![
+            tx(1, TxKind::Buy, "VOO", "10", "100", "2026-04-01T15:00:00Z"),
+            tx(2, TxKind::Sell, "VOO", "4", "90", "2026-04-10T15:00:00Z"),
+            tx(3, TxKind::Sell, "VOO", "4", "100", "2026-08-03T15:00:00Z"),
+        ];
+        let report = tax_report(&txs, 2026).unwrap();
+        // Loss 40, fully washed against the still-held remainder.
+        assert_eq!(report.rows[0].disallowed, dec("40"));
+        // The August sale consumes the ADJUSTED sub-lot first: basis
+        // 4×100 + 40 carried = 440, anchor tacked to Mar 23.
+        assert_eq!(report.rows[1].basis, dec("440"));
+        assert_eq!(report.rows[1].gain, dec("-40"));
+        assert_eq!(
+            report.rows[1].acquired,
+            NaiveDate::from_ymd_opt(2026, 3, 23).unwrap()
+        );
     }
 
     #[test]

@@ -177,9 +177,12 @@ pub fn compute_basis(txs: &[Tx]) -> Result<PortfolioBasis, PortfolioError> {
 /// [`compute_basis`], exposed so replays (e.g. the daily equity series) can
 /// advance incrementally instead of recomputing the whole prefix.
 pub fn apply_tx(book: &mut PortfolioBasis, tx: &Tx) -> Result<(), PortfolioError> {
+    // Trim + uppercase in lockstep with the tax replay (crate::taxes): the
+    // two engines must accept and reject exactly the same logs.
     let symbol = || -> Result<String, PortfolioError> {
         tx.symbol
             .as_deref()
+            .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_uppercase)
             .ok_or(PortfolioError::MissingSymbol {

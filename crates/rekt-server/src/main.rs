@@ -1562,6 +1562,10 @@ mod tests {
                 "ts": "2026-03-02T15:00:00Z"}),
             serde_json::json!({"kind": "buy", "symbol": "TSLA", "qty": "10", "price": "240",
                 "ts": "2026-03-20T15:00:00Z"}),
+            // Exit the replacement lot at its purchase price: the deferred
+            // loss must re-emerge through the carried basis.
+            serde_json::json!({"kind": "sell", "symbol": "TSLA", "qty": "10", "price": "240",
+                "ts": "2026-12-01T15:00:00Z"}),
         ] {
             let (status, _) = request(state.clone(), "POST", "/api/transactions", Some(body)).await;
             assert_eq!(status, StatusCode::CREATED);
@@ -1576,8 +1580,15 @@ mod tests {
         assert_eq!(row["disallowed"], "500");
         assert_eq!(row["gain"], "-500");
         assert_eq!(row["long_term"], false);
-        // Schedule D: the washed loss nets to zero reportable.
-        assert_eq!(json["short"]["reportable"], "0");
+        // The replacement lot carries the deferred loss: basis 2400 + 500,
+        // acquired tacked back by the 56 days the original lot was held.
+        let row = &json["rows"][1];
+        assert_eq!(row["basis"], "2900");
+        assert_eq!(row["gain"], "-500");
+        assert_eq!(row["acquired"], "2026-01-23");
+        // Schedule D: deferred, not lost — the year nets to the economic
+        // truth (bought 5400, sold 4900).
+        assert_eq!(json["short"]["reportable"], "-500");
 
         // The CSV export carries the same row, Form 8949-shaped.
         let response = app(state)
@@ -1610,6 +1621,11 @@ mod tests {
         assert!(csv.starts_with("Description,Date Acquired,Date Sold,"));
         assert!(
             csv.contains("10 sh TSLA,01/05/2026,03/02/2026,2500,3000,W,500,0,short"),
+            "{csv}"
+        );
+        // The replacement lot's row: tacked acquired date, carried basis.
+        assert!(
+            csv.contains("10 sh TSLA,01/23/2026,12/01/2026,2400,2900,,0,-500,short"),
             "{csv}"
         );
     }
