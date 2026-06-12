@@ -154,19 +154,27 @@ fn points_from_snapshots(snaps: &[repo::SnapshotRow]) -> Vec<DayPoint> {
 
 /// GET /api/history?range=1m|3m|1y|all — the equity curve with benchmark
 /// overlay and window-accurate TWR/IRR.
-///
-/// The full series is cached on (tx_revision, candles_revision, day): range
-/// clicks and reloads slice the cached points instead of replaying the log.
 pub async fn history(
     State(state): State<AppState>,
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let days = match query.range.as_deref() {
-        Some("1m") => Some(31),
-        Some("3m") => Some(92),
-        Some("1y") => Some(366),
-        Some("all") | None => None,
-        Some(other) => {
+    Ok(Json(
+        history_payload(&state, query.range.as_deref().unwrap_or("all")).await?,
+    ))
+}
+
+/// The history response body, callable outside the HTTP layer too (the AI
+/// analyst's get_performance tool reads the same numbers the UI shows).
+///
+/// The full series is cached on (tx_revision, candles_revision, day): range
+/// clicks and reloads slice the cached points instead of replaying the log.
+pub async fn history_payload(state: &AppState, range: &str) -> Result<serde_json::Value, ApiError> {
+    let days = match range {
+        "1m" => Some(31),
+        "3m" => Some(92),
+        "1y" => Some(366),
+        "all" => None,
+        other => {
             return Err(err(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 format!("unknown range {other:?} (use 1m, 3m, 1y or all)"),
@@ -189,7 +197,7 @@ pub async fn history(
     };
     let (points, meta) = match cached {
         Some(hit) => hit,
-        None => build_series(&state, key).await?,
+        None => build_series(state, key).await?,
     };
 
     let sliced: &[DayPoint] = match days {
@@ -207,7 +215,7 @@ pub async fn history(
         "metrics".into(),
         serde_json::to_value(metrics).map_err(internal)?,
     );
-    Ok(Json(serde_json::Value::Object(body)))
+    Ok(serde_json::Value::Object(body))
 }
 
 /// Build (and cache) the full equity series + range-independent metadata.

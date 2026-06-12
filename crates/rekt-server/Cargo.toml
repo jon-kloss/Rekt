@@ -11,6 +11,7 @@ name = "rekt"
 path = "src/main.rs"
 
 [dependencies]
+rekt-analyst = { workspace = true }
 rekt-broker = { workspace = true }
 rekt-core = { workspace = true }
 rekt-data = { workspace = true }

@@ -532,6 +532,253 @@ pub async fn rearm_alert(pool: &SqlitePool, id: i64) -> Result<bool> {
     Ok(result.rows_affected() > 0)
 }
 
+/// One AI analysis run, with full cost accounting.
+#[derive(Debug, serde::Serialize)]
+pub struct AnalysisRecord {
+    pub id: i64,
+    pub kind: String,
+    pub model: String,
+    pub status: String,
+    pub started_ts: String,
+    pub finished_ts: Option<String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub cost_usd: Decimal,
+    pub question: Option<String>,
+    pub report_md: Option<String>,
+    pub error: Option<String>,
+}
+
+fn analysis_from_row(row: sqlx::sqlite::SqliteRow) -> Result<AnalysisRecord> {
+    Ok(AnalysisRecord {
+        id: row.get("id"),
+        kind: row.get("kind"),
+        model: row.get("model"),
+        status: row.get("status"),
+        started_ts: row.get("started_ts"),
+        finished_ts: row.get("finished_ts"),
+        input_tokens: row.get("input_tokens"),
+        output_tokens: row.get("output_tokens"),
+        cache_read_tokens: row.get("cache_read_tokens"),
+        cache_write_tokens: row.get("cache_write_tokens"),
+        cost_usd: parse_dec(&row.get::<String, _>("cost_usd"), "analyses.cost_usd")?,
+        question: row.get("question"),
+        report_md: row.get("report_md"),
+        error: row.get("error"),
+    })
+}
+
+const ANALYSIS_COLUMNS: &str = r#"id, kind, model, status, started_ts, finished_ts,
+    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+    cost_usd, question, report_md, error"#;
+
+pub async fn insert_analysis(
+    pool: &SqlitePool,
+    kind: &str,
+    model: &str,
+    question: Option<&str>,
+) -> Result<i64> {
+    let result =
+        sqlx::query("INSERT INTO analyses (kind, model, started_ts, question) VALUES (?, ?, ?, ?)")
+            .bind(kind)
+            .bind(model)
+            .bind(Utc::now().to_rfc3339())
+            .bind(question)
+            .execute(pool)
+            .await?;
+    Ok(result.last_insert_rowid())
+}
+
+pub struct AnalysisOutcome<'a> {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub cost_usd: Decimal,
+    pub report_md: Option<&'a str>,
+    pub tool_log_json: Option<&'a str>,
+    pub error: Option<&'a str>,
+}
+
+/// Mark a run finished — `done` with a report, or `error` with the reason.
+pub async fn finish_analysis(
+    pool: &SqlitePool,
+    id: i64,
+    outcome: AnalysisOutcome<'_>,
+) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE analyses SET status = ?, finished_ts = ?, input_tokens = ?,
+           output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?,
+           cost_usd = ?, report_md = ?, tool_log_json = ?, error = ?
+           WHERE id = ?"#,
+    )
+    .bind(if outcome.error.is_some() {
+        "error"
+    } else {
+        "done"
+    })
+    .bind(Utc::now().to_rfc3339())
+    .bind(outcome.input_tokens)
+    .bind(outcome.output_tokens)
+    .bind(outcome.cache_read_tokens)
+    .bind(outcome.cache_write_tokens)
+    .bind(outcome.cost_usd.to_string())
+    .bind(outcome.report_md)
+    .bind(outcome.tool_log_json)
+    .bind(outcome.error)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_analysis(pool: &SqlitePool, id: i64) -> Result<Option<AnalysisRecord>> {
+    let row = sqlx::query(&format!(
+        "SELECT {ANALYSIS_COLUMNS} FROM analyses WHERE id = ?"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(analysis_from_row).transpose()
+}
+
+/// Recent analyses, newest first.
+pub async fn recent_analyses(pool: &SqlitePool, limit: i64) -> Result<Vec<AnalysisRecord>> {
+    let rows = sqlx::query(&format!(
+        "SELECT {ANALYSIS_COLUMNS} FROM analyses ORDER BY id DESC LIMIT ?"
+    ))
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(analysis_from_row).collect()
+}
+
+/// Spend across all analyses started at/after `since` (budget input).
+pub async fn analyses_cost_since(pool: &SqlitePool, since: DateTime<Utc>) -> Result<Decimal> {
+    let rows = sqlx::query("SELECT cost_usd FROM analyses WHERE started_ts >= ?")
+        .bind(since.to_rfc3339())
+        .fetch_all(pool)
+        .await?;
+    let mut total = Decimal::ZERO;
+    for row in rows {
+        total += parse_dec(&row.get::<String, _>("cost_usd"), "analyses.cost_usd")?;
+    }
+    Ok(total)
+}
+
+/// True if an analysis of `kind` was started at/after `since` (scheduler
+/// once-per-period guard).
+pub async fn analysis_ran_since(
+    pool: &SqlitePool,
+    kind: &str,
+    since: DateTime<Utc>,
+) -> Result<bool> {
+    let row = sqlx::query("SELECT 1 FROM analyses WHERE kind = ? AND started_ts >= ? LIMIT 1")
+        .bind(kind)
+        .bind(since.to_rfc3339())
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some())
+}
+
+/// One advisory recommendation (joined with its symbol).
+#[derive(Debug, serde::Serialize)]
+pub struct RecommendationRecord {
+    pub id: i64,
+    pub analysis_id: i64,
+    pub symbol: String,
+    pub action: String,
+    pub sizing: String,
+    pub rationale: String,
+    pub confidence: String,
+    pub status: String,
+    pub created_ts: String,
+    pub expires_ts: Option<String>,
+}
+
+pub struct NewRecommendation<'a> {
+    pub analysis_id: i64,
+    pub symbol: &'a str,
+    pub action: &'a str,
+    pub sizing: &'a str,
+    pub rationale: &'a str,
+    pub confidence: &'a str,
+    pub expires_ts: DateTime<Utc>,
+}
+
+pub async fn insert_recommendation(pool: &SqlitePool, rec: NewRecommendation<'_>) -> Result<i64> {
+    let mut dbtx = pool.begin().await?;
+    let instrument_id = ensure_instrument(&mut dbtx, rec.symbol).await?;
+    let result = sqlx::query(
+        r#"INSERT INTO recommendations
+           (analysis_id, instrument_id, action, sizing, rationale, confidence, created_ts, expires_ts)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
+    )
+    .bind(rec.analysis_id)
+    .bind(instrument_id)
+    .bind(rec.action)
+    .bind(rec.sizing)
+    .bind(rec.rationale)
+    .bind(rec.confidence)
+    .bind(Utc::now().to_rfc3339())
+    .bind(rec.expires_ts.to_rfc3339())
+    .execute(&mut *dbtx)
+    .await?;
+    dbtx.commit().await?;
+    Ok(result.last_insert_rowid())
+}
+
+/// Recommendations, newest first, after lapsing anything past its expiry —
+/// stale advice must never look current.
+pub async fn list_recommendations(
+    pool: &SqlitePool,
+    limit: i64,
+) -> Result<Vec<RecommendationRecord>> {
+    sqlx::query(
+        "UPDATE recommendations SET status = 'expired' WHERE status = 'open' AND expires_ts < ?",
+    )
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    let rows = sqlx::query(
+        r#"SELECT r.id, r.analysis_id, i.symbol, r.action, r.sizing, r.rationale,
+                  r.confidence, r.status, r.created_ts, r.expires_ts
+           FROM recommendations r JOIN instruments i ON i.id = r.instrument_id
+           ORDER BY (r.status = 'open') DESC, r.id DESC LIMIT ?"#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| RecommendationRecord {
+            id: row.get("id"),
+            analysis_id: row.get("analysis_id"),
+            symbol: row.get("symbol"),
+            action: row.get("action"),
+            sizing: row.get("sizing"),
+            rationale: row.get("rationale"),
+            confidence: row.get("confidence"),
+            status: row.get("status"),
+            created_ts: row.get("created_ts"),
+            expires_ts: row.get("expires_ts"),
+        })
+        .collect())
+}
+
+/// open → accepted/dismissed; the status guard keeps double-clicks honest.
+pub async fn set_recommendation_status(pool: &SqlitePool, id: i64, status: &str) -> Result<bool> {
+    let result =
+        sqlx::query("UPDATE recommendations SET status = ? WHERE id = ? AND status = 'open'")
+            .bind(status)
+            .bind(id)
+            .execute(pool)
+            .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Durable key/value settings (e.g. the trading pause switch).
 pub async fn get_setting(pool: &SqlitePool, key: &str) -> Result<Option<String>> {
     let row = sqlx::query("SELECT value FROM settings WHERE key = ?")
