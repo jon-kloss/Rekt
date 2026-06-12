@@ -1,0 +1,21 @@
+[package]
+name = "rekt-data"
+description = "MarketData trait and provider implementations (Finnhub, Alpaca)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rekt-core = { workspace = true }
+
+async-trait = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

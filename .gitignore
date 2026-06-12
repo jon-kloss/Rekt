@@ -1,0 +1,7 @@
+/target
+*.db
+*.db-shm
+*.db-wal
+.env
+node_modules/
+ui/dist/
