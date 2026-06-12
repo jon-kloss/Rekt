@@ -116,6 +116,18 @@ pub async fn watchlist_symbols(pool: &SqlitePool) -> Result<Vec<String>> {
     Ok(rows.into_iter().map(|r| r.get("symbol")).collect())
 }
 
+/// Symbols the analyst ever recommended — outcome tracking needs their
+/// closes, so they join the candle backfill set.
+pub async fn recommendation_symbols(pool: &SqlitePool) -> Result<Vec<String>> {
+    let rows = sqlx::query(
+        r#"SELECT DISTINCT i.symbol FROM recommendations r
+           JOIN instruments i ON i.id = r.instrument_id"#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.get("symbol")).collect())
+}
+
 /// Symbols with active alerts (their conditions need data to evaluate).
 pub async fn alert_symbols(pool: &SqlitePool) -> Result<Vec<String>> {
     let rows = sqlx::query(

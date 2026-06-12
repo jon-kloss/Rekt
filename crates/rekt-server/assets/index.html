@@ -235,8 +235,8 @@
     <div id="ai-msg" class="warn"></div>
     <div id="ai-report" class="aireport muted">no analyses yet</div>
     <table style="margin-top:1rem">
-      <thead><tr><th>Symbol</th><th>Action</th><th>Sizing</th><th>Conf.</th><th>Rationale</th><th>Status</th><th></th></tr></thead>
-      <tbody id="recs"><tr><td colspan="7" class="empty">no recommendations yet</td></tr></tbody>
+      <thead><tr><th>Symbol</th><th>Action</th><th>Sizing</th><th>Conf.</th><th>Rationale</th><th>Outcome</th><th>Status</th><th></th></tr></thead>
+      <tbody id="recs"><tr><td colspan="8" class="empty">no recommendations yet</td></tr></tbody>
     </table>
     <div class="muted" style="font-size:0.7rem;margin-top:0.5rem">
       Advisory only — the analyst can never place orders; accepting a recommendation just prefills
@@ -925,7 +925,9 @@ async function loadAnalyst() {
       meta.textContent = "— disabled (set ANTHROPIC_API_KEY)";
       return;
     }
+    const track = data.track_record;
     meta.textContent = `— $${fmt(data.today_cost_usd)} of $${fmt(data.budget_usd)} today` +
+      (track && track.tested > 0 ? ` · calls: ${track.favorable}/${track.tested} favorable` : "") +
       (data.running ? " · analyzing…" : "");
 
     const latest = data.latest;
@@ -948,18 +950,28 @@ async function loadAnalyst() {
     const tbody = $("recs");
     const recs = data.recommendations ?? [];
     if (!recs.length) {
-      tbody.innerHTML = `<tr><td colspan="7" class="empty">no recommendations yet</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="8" class="empty">no recommendations yet</td></tr>`;
     } else {
-      tbody.innerHTML = recs.map((r) => `<tr>
+      tbody.innerHTML = recs.map((r) => {
+        // Outcome since the recommendation date: green when the CALL was
+        // right (a sell that fell is favorable), not when the price rose.
+        const oc = r.outcome;
+        const outcome = oc
+          ? `<td class="${oc.favorable === true ? "up" : oc.favorable === false ? "down" : "muted"}"
+               title="close ${fmt(oc.baseline)} → ${fmt(oc.latest)} since ${esc(r.created_ts.slice(0, 10))}">${signed(oc.return_pct).text}%</td>`
+          : `<td class="muted" title="no closes since the recommendation yet">—</td>`;
+        return `<tr>
         <td>${esc(r.symbol)}</td>
         <td class="${r.action === "buy" ? "up" : r.action === "sell" || r.action === "trim" ? "down" : "muted"}">${esc(r.action)}</td>
         <td>${esc(r.sizing)}</td><td>${esc(r.confidence)}</td>
         <td class="wrap">${esc(r.rationale)}</td>
+        ${outcome}
         <td class="${r.status === "open" ? "up" : "muted"}">${esc(r.status)}</td>
         <td>${r.status !== "open" ? "" :
           `<button data-recaccept="${esc(r.id)}" data-symbol="${esc(r.symbol)}" data-action="${esc(r.action)}">accept</button>
            <button class="danger" data-recdismiss="${esc(r.id)}" title="dismiss">✕</button>`}</td>
-      </tr>`).join("");
+      </tr>`;
+      }).join("");
     }
 
     // Poll while a run is in flight so the report appears when it lands.

@@ -41,6 +41,7 @@ pub async fn backfill_candles(state: &AppState) -> anyhow::Result<()> {
     let mut symbols = repo::all_symbols(&state.db).await?;
     symbols.extend(repo::watchlist_symbols(&state.db).await?);
     symbols.extend(repo::alert_symbols(&state.db).await?); // drawdown alerts need closes
+    symbols.extend(repo::recommendation_symbols(&state.db).await?); // outcome tracking
     symbols.push(BENCHMARK.to_string());
     symbols.sort();
     symbols.dedup();
