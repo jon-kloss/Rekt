@@ -3,6 +3,7 @@
 //! HUMAN confirmation. Nothing here executes orders — confirmed tickets go
 //! through the normal /api/orders path with every guardrail applied.
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use axum::{
@@ -11,12 +12,12 @@ use axum::{
     response::Json,
 };
 use rekt_core::alerts::AlertCondition;
-use rekt_core::orders::{OrderType, Side, TimeInForce};
+use rekt_core::orders::{check_shape, OrderType, Side, TimeInForce};
 use rekt_core::signals::max_drawdown_pct;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::api::{err, internal, ApiError};
+use crate::api::{err, internal, validate_symbol, ApiError};
 use crate::live::SIGNAL_WINDOW_BARS;
 use crate::{repo, AppState};
 
@@ -43,19 +44,41 @@ pub struct AlertInput {
     pub draft_order: Option<DraftOrder>,
     #[serde(default)]
     pub note: Option<String>,
+    /// Arm even if the condition is ALREADY satisfied (it would then fire
+    /// on the next evaluation). Off by default: "alert me at ≤170" while
+    /// the price sits at 150 is almost always a mistake, not intent.
+    #[serde(default)]
+    pub allow_immediate: bool,
+}
+
+/// What the condition's input currently reads: last cached price for price
+/// conditions, rolling drawdown over cached candles for drawdown. `None`
+/// when no data exists yet.
+async fn current_observed(
+    state: &AppState,
+    condition: AlertCondition,
+    symbol: &str,
+) -> Option<Decimal> {
+    if condition.needs_price() {
+        state.live.price_views().await.get(symbol).map(|p| p.price)
+    } else {
+        let closes = repo::recent_closes(&state.db, symbol, SIGNAL_WINDOW_BARS)
+            .await
+            .ok()?;
+        max_drawdown_pct(&closes)
+    }
 }
 
 /// POST /api/alerts — create an alert (optionally with a pre-staged ticket).
-/// Draft tickets are shape-checked NOW so a bad draft fails at creation,
-/// not when the alert fires at 3am.
+/// Draft tickets are shape-checked NOW (via the same `check_shape` rules
+/// real orders use) so a bad draft fails at creation, not when the alert
+/// fires at 3am — and an already-satisfied condition is rejected so a
+/// fresh alert can't fire 15 seconds after you arm it.
 pub async fn create_alert(
     State(state): State<AppState>,
     Json(input): Json<AlertInput>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let symbol = input.symbol.trim().to_uppercase();
-    if symbol.is_empty() {
-        return Err(err(StatusCode::UNPROCESSABLE_ENTITY, "symbol is required"));
-    }
+    let symbol = validate_symbol(&input.symbol)?;
     let condition: AlertCondition = input
         .condition
         .parse()
@@ -68,31 +91,36 @@ pub async fn create_alert(
     }
     let draft_json = match &input.draft_order {
         Some(draft) => {
-            if draft.qty <= Decimal::ZERO {
-                return Err(err(
+            check_shape(draft.order_type, draft.qty, draft.limit_price).map_err(|v| {
+                err(
                     StatusCode::UNPROCESSABLE_ENTITY,
-                    "draft order qty must be positive",
-                ));
-            }
-            match draft.order_type {
-                OrderType::Limit if draft.limit_price.unwrap_or_default() <= Decimal::ZERO => {
-                    return Err(err(
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        "draft limit orders require a positive limit price",
-                    ));
-                }
-                OrderType::Market if draft.limit_price.is_some() => {
-                    return Err(err(
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        "draft market orders cannot carry a limit price",
-                    ));
-                }
-                _ => {}
-            }
+                    format!("draft order: {v}"),
+                )
+            })?;
             Some(serde_json::to_string(draft).map_err(internal)?)
         }
         None => None,
     };
+
+    // Arm-time check: an alert means "tell me when this BECOMES true". If
+    // it's already true (including against a stale after-hours price), the
+    // next evaluator tick would fire it instantly — reject unless the user
+    // explicitly opted in.
+    if !input.allow_immediate {
+        if let Some(observed) = current_observed(&state, condition, &symbol).await {
+            if rekt_core::alerts::check(condition, input.threshold, observed).is_some() {
+                return Err(err(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!(
+                        "condition is already true ({} — currently {observed}); this would fire \
+                         immediately. Pick a threshold the market hasn't met, or pass \
+                         allow_immediate to arm anyway",
+                        condition.describe(&symbol, input.threshold)
+                    ),
+                ));
+            }
+        }
+    }
 
     let id = repo::insert_alert(
         &state.db,
@@ -106,10 +134,7 @@ pub async fn create_alert(
     .map_err(internal)?;
 
     // Subscribe the symbol so the condition has data to evaluate against.
-    state.live.bump_alerts_revision();
-    crate::live::refresh_symbols(&state)
-        .await
-        .map_err(internal)?;
+    alert_set_changed(&state).await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
 }
 
@@ -120,6 +145,15 @@ pub async fn list_alerts(
     Ok(Json(repo::list_alerts(&state.db).await.map_err(internal)?))
 }
 
+/// Every alert mutation changes the ACTIVE set, which feeds the stream
+/// subscription and backfill sets — refresh after each one (cheap,
+/// idempotent), so e.g. deleting the last alert on a not-held symbol
+/// actually unsubscribes it.
+async fn alert_set_changed(state: &AppState) -> Result<(), ApiError> {
+    state.live.bump_alerts_revision();
+    crate::live::refresh_symbols(state).await.map_err(internal)
+}
+
 pub async fn delete_alert(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -127,7 +161,7 @@ pub async fn delete_alert(
     if !repo::delete_alert(&state.db, id).await.map_err(internal)? {
         return Err(err(StatusCode::NOT_FOUND, format!("no alert {id}")));
     }
-    state.live.bump_alerts_revision();
+    alert_set_changed(&state).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -142,7 +176,7 @@ pub async fn dismiss_alert(
             format!("alert {id} is not in triggered state"),
         ));
     }
-    state.live.bump_alerts_revision();
+    alert_set_changed(&state).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -154,20 +188,35 @@ pub async fn rearm_alert(
     if !repo::rearm_alert(&state.db, id).await.map_err(internal)? {
         return Err(err(StatusCode::NOT_FOUND, format!("no alert {id}")));
     }
-    state.live.bump_alerts_revision();
+    alert_set_changed(&state).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Drawdown values carried across evaluator ticks: drawdown only changes
+/// when new candles land, so the cache is invalidated by candles_revision
+/// instead of being re-queried from SQLite every 15 seconds.
+#[derive(Default)]
+pub struct DrawdownCache {
+    candles_rev: u64,
+    map: HashMap<String, Option<Decimal>>,
 }
 
 /// Evaluate every active alert against current data; fires triggers and
 /// notifications. Runs on the scheduler — cheap when nothing is active.
-pub async fn evaluate_alerts(state: &AppState) -> anyhow::Result<()> {
+pub async fn evaluate_alerts(
+    state: &AppState,
+    drawdowns: &mut DrawdownCache,
+) -> anyhow::Result<()> {
     let alerts = repo::active_alerts(&state.db).await?;
     if alerts.is_empty() {
         return Ok(());
     }
     let prices = state.live.price_views().await;
-    let mut drawdowns: std::collections::HashMap<String, Option<Decimal>> =
-        std::collections::HashMap::new();
+    let (_, candles_rev) = state.live.revisions();
+    if drawdowns.candles_rev != candles_rev {
+        drawdowns.map.clear();
+        drawdowns.candles_rev = candles_rev;
+    }
 
     let mut any_triggered = false;
     for alert in &alerts {
@@ -179,7 +228,7 @@ pub async fn evaluate_alerts(state: &AppState) -> anyhow::Result<()> {
             prices.get(&alert.symbol).map(|p| p.price)
         } else {
             // Rolling drawdown over the same window the signal badges use.
-            match drawdowns.entry(alert.symbol.clone()) {
+            match drawdowns.map.entry(alert.symbol.clone()) {
                 std::collections::hash_map::Entry::Occupied(e) => *e.get(),
                 std::collections::hash_map::Entry::Vacant(e) => {
                     let dd = match repo::recent_closes(&state.db, &alert.symbol, SIGNAL_WINDOW_BARS)

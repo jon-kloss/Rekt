@@ -26,6 +26,10 @@ pub async fn backfill_candles(state: &AppState) -> anyhow::Result<()> {
     let Some(bars) = &state.bars else {
         return Ok(());
     };
+    // One backfill at a time: a concurrent run would re-fetch the same
+    // ranges and contend for SQLite's single writer; the loser of the lock
+    // sees fresh last_candle_date values and no-ops.
+    let _guard = state.backfill_lock.lock().await;
     let first = repo::first_tx_date(&state.db).await?;
     // NY calendar date: plain UTC is a day ahead between 8pm and midnight ET.
     let today = Utc::now().with_timezone(&New_York).date_naive();

@@ -13,10 +13,12 @@ use rust_decimal::Decimal;
 
 use crate::api::TxInput;
 
-/// A preset parse: importable rows + human-readable skip reasons.
+/// A preset parse: importable rows (tagged with their 1-based line number
+/// in the original file, so validation errors name the line the user is
+/// staring at) + human-readable skip reasons.
 #[derive(Debug)]
 pub struct PresetParse {
-    pub rows: Vec<TxInput>,
+    pub rows: Vec<(usize, TxInput)>,
     pub skipped: Vec<String>,
 }
 
@@ -60,6 +62,9 @@ static FIDELITY: BrokerPreset = BrokerPreset {
     amount: &["amount"],
     classify: |action| {
         let a = action.to_uppercase();
+        // Fidelity exports a reinvested dividend as TWO rows: "DIVIDEND
+        // RECEIVED" (cash in) + "REINVESTMENT" (buy, cash out). Importing
+        // both is intentional and cash-neutral — do NOT dedupe them.
         if a.contains("BOUGHT") || a.contains("REINVESTMENT") {
             Some("buy")
         } else if a.contains("SOLD") {
@@ -142,7 +147,9 @@ fn parse_money(raw: &str) -> Result<Option<Decimal>, String> {
     let value: Decimal = cleaned
         .parse()
         .map_err(|_| format!("unparseable number {raw:?}"))?;
-    Ok(Some(if negative { -value } else { value }))
+    // Parens force negative even when a minus also survived the filter —
+    // "(-$5.00)" must come out -5, not flip back to +5.
+    Ok(Some(if negative { -value.abs() } else { value }))
 }
 
 /// "06/12/2026" (optionally "… as of 06/15/2026") → 4pm New York, as UTC.
@@ -193,14 +200,17 @@ fn parse_broker(body: &str, preset: &BrokerPreset) -> Result<PresetParse, String
             .iter()
             .find_map(|n| headers.iter().position(|h| h == n))
     };
+    // Value-bearing columns are REQUIRED: a mangled export missing the
+    // Amount column must fail loudly, not import zero-value transactions.
     let col_date = find(preset.date).ok_or("missing date column")?;
     let col_action = find(preset.action).ok_or("missing action column")?;
-    let col_symbol = find(preset.symbol);
-    let col_qty = find(preset.qty);
-    let col_price = find(preset.price);
+    let col_symbol = Some(find(preset.symbol).ok_or("missing symbol column")?);
+    let col_qty = Some(find(preset.qty).ok_or("missing quantity column")?);
+    let col_price = Some(find(preset.price).ok_or("missing price column")?);
+    let col_amount = Some(find(preset.amount).ok_or("missing amount column")?);
+    // Fees/commission stay optional: Schwab has no commission column.
     let col_fees = find(preset.fees);
     let col_commission = find(preset.commission);
-    let col_amount = find(preset.amount);
 
     let mut rows = Vec::new();
     let mut skipped = Vec::new();
@@ -234,20 +244,23 @@ fn parse_broker(body: &str, preset: &BrokerPreset) -> Result<PresetParse, String
         );
         let symbol = Some(field(col_symbol).to_string()).filter(|s| !s.is_empty());
 
-        rows.push(TxInput {
-            kind: kind.to_string(),
-            symbol,
-            qty,
-            // dividends/deposits/withdrawals carry their cash in `price`.
-            price: match kind {
-                "buy" | "sell" => price,
-                _ => amount,
+        rows.push((
+            line,
+            TxInput {
+                kind: kind.to_string(),
+                symbol,
+                qty,
+                // dividends/deposits/withdrawals carry their cash in `price`.
+                price: match kind {
+                    "buy" | "sell" => price,
+                    _ => amount,
+                },
+                fees,
+                taxes: None,
+                ts: Some(ts),
+                note: Some(format!("{}: {}", preset.name, action)),
             },
-            fees,
-            taxes: None,
-            ts: Some(ts),
-            note: Some(format!("{}: {}", preset.name, action)),
-        });
+        ));
     }
     Ok(PresetParse { rows, skipped })
 }
@@ -267,6 +280,11 @@ mod tests {
             "-123.45"
         );
         assert_eq!(parse_money("-$5").unwrap().unwrap().to_string(), "-5");
+        // Parens win even with an embedded minus (contra/correction rows).
+        assert_eq!(
+            parse_money("(-$5.00)").unwrap().unwrap().to_string(),
+            "-5.00"
+        );
         assert_eq!(parse_money("").unwrap(), None);
         assert!(parse_money("abc").is_err());
         // 4pm ET June (EDT, UTC-4) → 20:00Z.
@@ -292,18 +310,19 @@ Run Date,Action,Symbol,Description,Type,Quantity,Price ($),Commission ($),Fees (
         assert_eq!(parse.skipped.len(), 1);
         assert!(parse.skipped[0].contains("INTEREST EARNED"));
 
-        let buy = &parse.rows[0];
+        let (buy_line, buy) = &parse.rows[0];
+        assert_eq!(*buy_line, 4); // 1-based line in the original file
         assert_eq!(buy.kind, "buy");
         assert_eq!(buy.symbol.as_deref(), Some("AAPL"));
         assert_eq!(buy.qty.unwrap().to_string(), "10");
         assert_eq!(buy.price.unwrap().to_string(), "150.25");
         assert_eq!(buy.fees.unwrap().to_string(), "5.00"); // commission + fees
 
-        let dividend = &parse.rows[1];
+        let (_, dividend) = &parse.rows[1];
         assert_eq!(dividend.kind, "dividend");
         assert_eq!(dividend.price.unwrap().to_string(), "25.50");
 
-        let deposit = &parse.rows[2];
+        let (_, deposit) = &parse.rows[2];
         assert_eq!(deposit.kind, "deposit");
         assert_eq!(deposit.price.unwrap().to_string(), "5000.00");
         assert!(deposit.symbol.is_none());
@@ -324,16 +343,16 @@ Run Date,Action,Symbol,Description,Type,Quantity,Price ($),Commission ($),Fees (
         assert_eq!(parse.rows.len(), 4, "skipped: {:?}", parse.skipped);
         assert_eq!(parse.skipped.len(), 1); // Journal (totals row has no action)
 
-        let sell = &parse.rows[0];
+        let (_, sell) = &parse.rows[0];
         assert_eq!(sell.kind, "sell");
         assert_eq!(sell.qty.unwrap().to_string(), "5"); // abs of -5
         assert_eq!(sell.price.unwrap().to_string(), "520.10");
 
-        assert_eq!(parse.rows[1].kind, "dividend");
-        assert_eq!(parse.rows[2].kind, "buy");
-        assert_eq!(parse.rows[2].qty.unwrap().to_string(), "0.06");
+        assert_eq!(parse.rows[1].1.kind, "dividend");
+        assert_eq!(parse.rows[2].1.kind, "buy");
+        assert_eq!(parse.rows[2].1.qty.unwrap().to_string(), "0.06");
 
-        let transfer = &parse.rows[3];
+        let (_, transfer) = &parse.rows[3];
         assert_eq!(transfer.kind, "deposit");
         assert_eq!(transfer.price.unwrap().to_string(), "1000.00");
     }
@@ -343,5 +362,13 @@ Run Date,Action,Symbol,Description,Type,Quantity,Price ($),Commission ($),Fees (
         assert!(parse_preset("ibkr", "x").is_err());
         let err = parse_preset("fidelity", "just,some,csv\n1,2,3\n").unwrap_err();
         assert!(err.contains("header row"), "{err}");
+        // A recognizable header missing a value column must fail loudly,
+        // not import zero-value transactions.
+        let err = parse_preset(
+            "schwab",
+            "\"Date\",\"Action\",\"Symbol\",\"Description\",\"Quantity\",\"Price\"\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("missing amount column"), "{err}");
     }
 }

@@ -331,7 +331,7 @@ function renderTrading(t) {
 const CONDITION_LABEL = { price_below: "≤ $", price_above: "≥ $", drawdown_above: "drawdown ≥ " };
 function describeAlert(a) {
   const t = esc(a.threshold) + (a.condition === "drawdown_above" ? "%" : "");
-  return `${esc(a.symbol)} ${CONDITION_LABEL[a.condition] ?? a.condition} ${t}`;
+  return `${esc(a.symbol)} ${CONDITION_LABEL[a.condition] ?? esc(a.condition)} ${t}`;
 }
 
 let tradingEnabled = false;
@@ -507,14 +507,25 @@ async function loadHistory() {
           ? "charting nightly snapshots — configure Alpaca keys for full daily history"
           : "no candle data yet — configure Alpaca keys for historical bars"));
     drawChart(points);
-    // The meter always reads the full series (server-cached, so this extra
-    // fetch is free) — switching to 1M after a crash shouldn't read "zen".
-    const allPoints = currentRange === "all"
-      ? points
-      : ((await (await fetch("/api/history?range=all")).json()).points ?? []);
-    updateRektMeter(allPoints);
+    // The meter always reads the full series — switching to 1M after a
+    // crash shouldn't read "zen". Cached per tx revision; a meter-only
+    // fetch failure must not clobber the healthy chart's status note.
+    try {
+      let allPoints;
+      if (currentRange === "all") {
+        allPoints = points;
+        allPointsCache = { rev: txRevision, points };
+      } else if (allPointsCache.points && allPointsCache.rev === txRevision) {
+        allPoints = allPointsCache.points;
+      } else {
+        allPoints = (await (await fetch("/api/history?range=all")).json()).points ?? [];
+        allPointsCache = { rev: txRevision, points: allPoints };
+      }
+      updateRektMeter(allPoints);
+    } catch { $("rektmeter").style.display = "none"; }
   } catch { $("histnote").textContent = "history unavailable — is the server up?"; }
 }
+let allPointsCache = { rev: null, points: null };
 
 // The REKT meter: how far off peak equity are we, really? (Phase 4 easter
 // egg — drawdown from all-time peak, faces calibrated to pain.)

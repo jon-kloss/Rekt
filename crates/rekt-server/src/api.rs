@@ -28,6 +28,24 @@ pub fn internal(e: impl std::fmt::Display) -> ApiError {
     err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
+/// One symbol rule for every entry point (watchlist, alerts, …): trimmed,
+/// uppercased, alphanumeric-or-dot. A typo'd symbol would otherwise create
+/// an instruments row and a stream subscription that never resolves.
+pub fn validate_symbol(raw: &str) -> Result<String, ApiError> {
+    let symbol = raw.trim().to_uppercase();
+    if symbol.is_empty()
+        || !symbol
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.')
+    {
+        return Err(err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "symbol must be alphanumeric (dots allowed, e.g. BRK.B)",
+        ));
+    }
+    Ok(symbol)
+}
+
 /// Shared input shape for both the JSON API and CSV rows (the csv crate
 /// maps empty fields to `None` for `Option` types).
 #[derive(Debug, Deserialize)]
@@ -194,19 +212,24 @@ pub async fn import_csv(
     body: String,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let format = query.format.as_deref().unwrap_or("generic");
+    // Every input carries its 1-based line number in the ORIGINAL file so
+    // both parse and validation errors point at the same line the user
+    // sees in their editor (header = line 1 for generic; presets track
+    // their own offsets past preamble lines).
     let (inputs, skipped) = if format == "generic" {
         let mut reader = csv::ReaderBuilder::new()
             .trim(csv::Trim::All)
             .from_reader(body.as_bytes());
         let mut inputs = Vec::new();
-        for (line, row) in reader.deserialize::<TxInput>().enumerate() {
+        for (i, row) in reader.deserialize::<TxInput>().enumerate() {
+            let line = i + 2;
             let input = row.map_err(|e| {
                 err(
                     StatusCode::UNPROCESSABLE_ENTITY,
-                    format!("row {}: {e}", line + 2),
+                    format!("line {line}: {e}"),
                 )
             })?;
-            inputs.push(input);
+            inputs.push((line, input));
         }
         (inputs, Vec::new())
     } else {
@@ -216,11 +239,11 @@ pub async fn import_csv(
     };
 
     let mut new_txs = Vec::new();
-    for (i, input) in inputs.into_iter().enumerate() {
+    for (line, input) in inputs {
         let tx = input.into_new_tx(repo::TxSource::Csv).map_err(|m| {
             err(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                format!("row {}: {m}", i + 1),
+                format!("line {line}: {m}"),
             )
         })?;
         new_txs.push(tx);
@@ -258,29 +281,22 @@ pub async fn watchlist_add(
     State(state): State<AppState>,
     Json(input): Json<WatchlistInput>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let symbol = input.symbol.trim().to_uppercase();
-    if symbol.is_empty()
-        || !symbol
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.')
-    {
-        return Err(err(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "symbol must be alphanumeric",
-        ));
-    }
+    let symbol = validate_symbol(&input.symbol)?;
     let added = repo::watchlist_add(&state.db, &symbol)
         .await
         .map_err(internal)?;
     state.live.bump_watchlist_revision();
     live::refresh_symbols(&state).await.map_err(internal)?;
-    // Pull candles for the new symbol soon (signals); idempotent + resumable.
-    let bg = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = crate::history::backfill_candles(&bg).await {
-            tracing::warn!(error = %e, "watchlist candle backfill failed");
-        }
-    });
+    // Pull candles for a NEW symbol soon (signals); idempotent + resumable,
+    // and serialized against the scheduler by the backfill lock.
+    if added {
+        let bg = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::history::backfill_candles(&bg).await {
+                tracing::warn!(error = %e, "watchlist candle backfill failed");
+            }
+        });
+    }
     Ok((
         if added {
             StatusCode::CREATED
