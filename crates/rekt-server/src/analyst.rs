@@ -779,8 +779,14 @@ pub async fn summary(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
             value
         })
         .collect();
+    // Which backend is live, so the UI can say so (None when disabled).
+    let backend = state
+        .analyst
+        .as_ref()
+        .map(|_| if state.analyst_cli { "cli" } else { "http" });
     Ok(Json(json!({
         "enabled": state.analyst.is_some(),
+        "backend": backend,
         "running": state.analyst_running.load(Ordering::Relaxed),
         "today_cost_usd": spent,
         "budget_usd": state.ai_budget,
