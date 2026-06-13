@@ -34,12 +34,12 @@ export FINNHUB_API_KEY=your_key
 export ALPACA_PAPER_KEY=your_key
 export ALPACA_PAPER_SECRET=your_secret
 
-# AI analyst (optional — advisory only). Two backends:
-#   1. HTTP API — set an API key from https://platform.claude.com:
-export ANTHROPIC_API_KEY=your_key
-#   2. Local Claude Code CLI — reuse the `claude` you already signed in,
-#      no API key needed (must be on PATH). Runs tool-less by design:
-# export REKT_ANALYST_BACKEND=cli
+# AI analyst (advisory only). Defaults to the local Claude Code CLI — it
+# reuses the `claude` you've already signed in (must be on PATH), so no API
+# key is needed. Runs tool-less by design (it can never place orders).
+# To use the HTTP API instead, set a key and opt in:
+# export ANTHROPIC_API_KEY=your_key
+# export REKT_ANALYST_BACKEND=http
 
 cargo run -p rekt-server
 # → http://127.0.0.1:7777
@@ -53,9 +53,11 @@ Configuration (env vars): `REKT_DB` (default `rekt.db`), `REKT_LISTEN`
 alert push: `REKT_NTFY_TOPIC` (topic on the public ntfy.sh — **the topic
 name is the only secret**: anyone who guesses it can read your trade
 alerts, so use a long random string, or better, self-host ntfy and set
-`REKT_NTFY_URL`), AI analyst: `ANTHROPIC_API_KEY` (or `REKT_ANALYST_BACKEND=cli` to drive the
-local `claude` CLI instead — reuses its auth, runs tool-less so it can never
-place orders or touch the filesystem), `REKT_AI_DAILY_BUDGET`
+`REKT_NTFY_URL`), AI analyst: `REKT_ANALYST_BACKEND` (default `cli` — drives the local `claude`
+CLI, reusing its auth and running tool-less so it can never place orders or
+touch the filesystem; set to `http` to use the API instead),
+`ANTHROPIC_API_KEY` (required only for the `http` backend),
+`REKT_AI_DAILY_BUDGET`
 (USD/day, default 2.50 — gates new runs, reserving each run's worst-case
 output cost; a run already in flight may finish somewhat past the ceiling
 and the next run is then blocked), `REKT_AI_AUTO` (set 0 to disable the

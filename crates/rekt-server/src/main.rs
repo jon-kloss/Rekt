@@ -315,13 +315,19 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // AI analyst (PLAN.md §5): two backends, both advisory only.
-    //   REKT_ANALYST_BACKEND=cli → drive the local Claude Code CLI
-    //     (`claude -p`), reusing its auth; no ANTHROPIC_API_KEY needed.
+    //   default (or REKT_ANALYST_BACKEND=cli) → drive the local Claude Code
+    //     CLI (`claude -p`), reusing its auth; no ANTHROPIC_API_KEY needed.
     //     Runs tool-less with injected context (no orders — empty allowlist).
-    //   else                     → the HTTP API client (ANTHROPIC_API_KEY).
-    let analyst_cli = std::env::var("REKT_ANALYST_BACKEND")
-        .map(|v| v.eq_ignore_ascii_case("cli"))
-        .unwrap_or(false);
+    //   REKT_ANALYST_BACKEND=http (or =api)   → the HTTP API client
+    //     (ANTHROPIC_API_KEY), which also produces structured recs.
+    // The CLI is the default because REKT is self-hosted alongside Claude
+    // Code; opt into the API explicitly when you'd rather spend a key.
+    let analyst_cli = match std::env::var("REKT_ANALYST_BACKEND") {
+        Ok(v) if v.trim().eq_ignore_ascii_case("http") || v.trim().eq_ignore_ascii_case("api") => {
+            false
+        }
+        _ => true, // default: local Claude Code CLI
+    };
     let analyst: Option<Arc<dyn rekt_analyst::Transport>> = if analyst_cli {
         tracing::info!(
             "AI analyst enabled via Claude Code CLI (claude -p; advisory only, no tools)"
@@ -337,7 +343,7 @@ async fn main() -> anyhow::Result<()> {
             });
         if t.is_none() {
             tracing::warn!(
-                "no ANTHROPIC_API_KEY and REKT_ANALYST_BACKEND!=cli — AI analyst disabled"
+                "REKT_ANALYST_BACKEND=http but no ANTHROPIC_API_KEY — AI analyst disabled"
             );
         }
         t

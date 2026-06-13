@@ -223,6 +223,53 @@ fn review_schema() -> Value {
     })
 }
 
+/// In-prompt instruction that makes the CLI backend emit the same
+/// `{report_md, recommendations[]}` shape the HTTP backend gets from the
+/// API's output schema, so `claude -p` weekly reviews still populate the
+/// recommendation-outcome tracker. Mirrors [`review_schema`] — keep in sync.
+fn cli_review_json_instruction() -> &'static str {
+    "You have no web access for this review — reason from the portfolio state \
+     above and your own knowledge; do not claim to have looked anything up.\n\n\
+     Respond with ONLY a single JSON object — no prose before or after it, no \
+     markdown code fences — of exactly this shape:\n\
+     {\n  \
+       \"report_md\": \"<the full review, markdown>\",\n  \
+       \"recommendations\": [\n    \
+         {\n      \
+           \"symbol\": \"TICKER\",\n      \
+           \"action\": \"buy|sell|trim|hold|watch\",\n      \
+           \"sizing\": \"plain words, e.g. '2% of equity' or '5 shares'\",\n      \
+           \"rationale\": \"why\",\n      \
+           \"confidence\": \"low|medium|high\"\n    \
+         }\n  \
+       ]\n\
+     }\n\
+     The recommendations array may be empty if you have no concrete calls."
+}
+
+/// Extract a JSON object from model output. The HTTP backend's strict output
+/// schema returns clean JSON (the trivial case), but the CLI backend returns
+/// free text that may wrap the object in ```json fences or surround it with
+/// prose, so fall back to slicing the outermost `{…}`. Returns `None` only
+/// when no parseable object is present — an honest signal to the caller.
+fn extract_json_object(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    if let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(trimmed) {
+        return Some(v);
+    }
+    // Slice from the first '{' to the last '}' — covers fenced blocks and
+    // any leading/trailing prose around a single object.
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    match serde_json::from_str::<Value>(&trimmed[start..=end]) {
+        Ok(v @ Value::Object(_)) => Some(v),
+        _ => None,
+    }
+}
+
 /// "Today is …" line for every user turn (volatile data lives after the
 /// cached prefix, never in the system prompt).
 fn date_line() -> String {
@@ -357,32 +404,32 @@ pub async fn run_analysis(state: AppState, id: i64, kind: String, question: Opti
             let tool_log = serde_json::to_string(&outcome.tool_log).ok();
             let cost = pricing::cost_usd(model, &outcome.usage);
             // The weekly review answers in structured JSON; split it into
-            // the report + persisted recommendations. A parse failure is an
+            // the report + persisted recommendations. Both backends produce
+            // the same shape — the HTTP one via the API's output schema, the
+            // CLI one via the in-prompt instruction (`extract_json_object`
+            // tolerates fences/prose the CLI may add). A parse failure is an
             // honest error (with the tokens we PAID for still accounted),
             // never a silently-mangled report.
-            // The CLI backend returns prose (no structured schema), so only
-            // the API-backed weekly review parses into recommendations.
-            let (report, error): (String, Option<String>) =
-                if kind == "weekly_review" && !state.analyst_cli {
-                    match serde_json::from_str::<Value>(&outcome.text) {
-                        Ok(parsed) => {
-                            store_recommendations(&state, id, &parsed).await;
-                            (
-                                parsed["report_md"]
-                                    .as_str()
-                                    .unwrap_or(&outcome.text)
-                                    .to_string(),
-                                None,
-                            )
-                        }
-                        Err(e) => (
-                            outcome.text.clone(), // keep the raw output for debugging
-                            Some(format!("structured output did not parse: {e}")),
-                        ),
+            let (report, error): (String, Option<String>) = if kind == "weekly_review" {
+                match extract_json_object(&outcome.text) {
+                    Some(parsed) => {
+                        store_recommendations(&state, id, &parsed).await;
+                        (
+                            parsed["report_md"]
+                                .as_str()
+                                .unwrap_or(&outcome.text)
+                                .to_string(),
+                            None,
+                        )
                     }
-                } else {
-                    (outcome.text.clone(), None)
-                };
+                    None => (
+                        outcome.text.clone(), // keep the raw output for debugging
+                        Some("structured output did not contain a JSON object".to_string()),
+                    ),
+                }
+            } else {
+                (outcome.text.clone(), None)
+            };
             let row = repo::AnalysisOutcome {
                 input_tokens: outcome.usage.input_tokens as i64,
                 output_tokens: outcome.usage.output_tokens as i64,
@@ -503,6 +550,13 @@ async fn run_analysis_inner(
                 "{user_content}\n\nCurrent portfolio state:\n{}",
                 portfolio_context(state).await
             );
+        }
+        // The HTTP backend gets structured recommendations from the API's
+        // output schema; the CLI has no such knob, so we ask for the same
+        // shape in-prompt and parse it back out (see `extract_json_object`).
+        // It also has no web access, so say so rather than have it pretend.
+        if kind == "weekly_review" {
+            user_content = format!("{user_content}\n\n{}", cli_review_json_instruction());
         }
     }
 
@@ -814,4 +868,35 @@ pub async fn maybe_scheduled_runs(state: &AppState) -> anyhow::Result<()> {
         tracing::info!("scheduled weekly review started");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_json_object;
+
+    #[test]
+    fn extracts_clean_json_object() {
+        // The HTTP backend's strict schema returns exactly this — the trivial case.
+        let v = extract_json_object(r#"{"report_md":"hi","recommendations":[]}"#).unwrap();
+        assert_eq!(v["report_md"], "hi");
+        assert!(v["recommendations"].is_array());
+    }
+
+    #[test]
+    fn extracts_json_from_fences_and_prose() {
+        // The CLI backend may wrap the object in a fenced block with chatter.
+        let out = "Sure, here's the review:\n\n```json\n{\"report_md\":\"r\",\
+                   \"recommendations\":[{\"symbol\":\"NVDA\",\"action\":\"hold\"}]}\n```\nHope that helps!";
+        let v = extract_json_object(out).unwrap();
+        assert_eq!(v["report_md"], "r");
+        assert_eq!(v["recommendations"][0]["symbol"], "NVDA");
+    }
+
+    #[test]
+    fn no_object_present_is_none() {
+        assert!(extract_json_object("just prose, no json here").is_none());
+        assert!(extract_json_object("").is_none());
+        // A bare JSON array is not the object shape we persist.
+        assert!(extract_json_object("[1, 2, 3]").is_none());
+    }
 }

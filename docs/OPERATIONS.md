@@ -31,8 +31,8 @@ errors or `None`, never fabricated data.
 | `REKT_LISTEN` | `127.0.0.1:7777` | bind address (loopback by default — see Security) |
 | `FINNHUB_API_KEY` | — | live quotes + trade stream; falls back to Alpaca data |
 | `ALPACA_PAPER_KEY` / `ALPACA_PAPER_SECRET` | — | **paper** trading + daily bars |
-| `ANTHROPIC_API_KEY` | — | AI analyst via HTTP API (advisory only) |
-| `REKT_ANALYST_BACKEND` | `http` | `cli` drives the local `claude` CLI (`claude -p`) instead of the HTTP API — reuses its auth, no key needed; runs tool-less (empty allowlist) so it still cannot place orders or touch the filesystem |
+| `REKT_ANALYST_BACKEND` | `cli` | analyst backend. Default `cli` drives the local `claude` CLI (`claude -p`) — reuses its auth, no key needed; runs tool-less (empty allowlist) so it cannot place orders or touch the filesystem. Set to `http` (or `api`) to use the HTTP API instead |
+| `ANTHROPIC_API_KEY` | — | AI analyst via HTTP API (advisory only); required only when `REKT_ANALYST_BACKEND=http` |
 | `REKT_AI_DAILY_BUDGET` | `2.50` | USD/day ceiling that gates analyst runs |
 | `REKT_AI_AUTO` | enabled (unset) | `0`, `false`, or `off` disable the scheduled briefing/review |
 | `REKT_NTFY_TOPIC` / `REKT_NTFY_URL` | — | alert push (see Security for the topic warning) |
