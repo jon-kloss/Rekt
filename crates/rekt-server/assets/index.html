@@ -50,16 +50,73 @@ function signedMoney(n){ n = num(n); return (n>=0?'+$':'−$') + Math.abs(n).toL
 function signedPct(n){ n = num(n); return (n>=0?'+':'−') + Math.abs(n).toFixed(2) + '%'; }
 function qtyFmt(n){ return num(n).toLocaleString('en-US',{maximumFractionDigits:4}); }
 function compact(n){ n = num(n); const a=Math.abs(n); if(a>=1e6) return '$'+(n/1e6).toFixed(2)+'M'; if(a>=1e3) return '$'+(n/1e3).toFixed(1)+'k'; return money(n); }
+// Drawdown severity gauge: a professional risk read (label + color), driven
+// by % off peak equity.
 function rektMeter(dd){
-  if(dd<1) return {face:'😌',label:'ZEN'};
-  if(dd<5) return {face:'🙂',label:'CHILL'};
-  if(dd<10) return {face:'😬',label:'MILDLY REKT'};
-  if(dd<20) return {face:'🥵',label:'REKT'};
-  if(dd<35) return {face:'💀',label:'VERY REKT'};
-  return {face:'☠️',label:'ULTRA REKT'};
+  if(dd<1) return {label:'MINIMAL', color:C.green};
+  if(dd<5) return {label:'LOW', color:C.green};
+  if(dd<10) return {label:'MODERATE', color:C.amber};
+  if(dd<20) return {label:'ELEVATED', color:C.amber};
+  if(dd<35) return {label:'HIGH', color:C.red};
+  return {label:'SEVERE', color:C.red};
 }
 const UP=C.green, DN=C.red, AM=C.amber;
 const dirColor = (n) => num(n) > 0 ? UP : num(n) < 0 ? DN : C.label;
+
+//================================================================ markdown (AI output)
+// Render a SAFE subset of markdown. CRITICAL: escape HTML first, then apply
+// markdown transforms to the escaped text — so server/AI output can never
+// inject markup (the esc() invariant holds), only our own tags are produced.
+function mdInline(s){
+  return s
+    .replace(/`([^`]+)`/g, '<code style="background:#11161D;border:1px solid '+C.border+';border-radius:3px;padding:1px 5px;font-size:0.92em;">$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong style="color:'+C.bright+';font-weight:600;">$1</strong>')
+    .replace(/(^|[^*\w])\*([^*\n]+)\*/g, '$1<em>$2</em>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer" style="color:'+C.blue+';text-decoration:underline;">$1</a>');
+}
+function mdToHtml(src){
+  const lines=esc(src||'').split('\n');
+  let html='', list=null;
+  const close=()=>{ if(list){ html+='</'+list+'>'; list=null; } };
+  for(const raw of lines){
+    const line=raw.replace(/\s+$/,'');
+    let m;
+    if(/^\s*###\s+/.test(line)){ close(); html+='<div style="font-size:12px;font-weight:600;color:'+C.bright+';letter-spacing:0.4px;margin:12px 0 4px;">'+mdInline(line.replace(/^\s*###\s+/,''))+'</div>'; }
+    else if(/^\s*##\s+/.test(line)){ close(); html+='<div style="font-size:11px;font-weight:700;color:'+C.amber+';letter-spacing:1px;text-transform:uppercase;margin:15px 0 6px;">'+mdInline(line.replace(/^\s*##\s+/,''))+'</div>'; }
+    else if(/^\s*#\s+/.test(line)){ close(); html+='<div style="font-size:14px;font-weight:700;color:'+C.bright+';margin:14px 0 6px;">'+mdInline(line.replace(/^\s*#\s+/,''))+'</div>'; }
+    else if(/^\s*---+\s*$/.test(line)){ close(); html+='<hr style="border:none;border-top:1px solid '+C.border+';margin:11px 0;">'; }
+    else if((m=line.match(/^\s*[-*]\s+(.*)$/))){ if(list!=='ul'){ close(); html+='<ul style="margin:5px 0 5px 18px;padding:0;">'; list='ul'; } html+='<li style="margin:3px 0;">'+mdInline(m[1])+'</li>'; }
+    else if((m=line.match(/^\s*\d+\.\s+(.*)$/))){ if(list!=='ol'){ close(); html+='<ol style="margin:5px 0 5px 20px;padding:0;">'; list='ol'; } html+='<li style="margin:3px 0;">'+mdInline(m[1])+'</li>'; }
+    else if(line.trim()===''){ close(); }
+    else { close(); html+='<div style="margin:5px 0;">'+mdInline(line)+'</div>'; }
+  }
+  close();
+  return html;
+}
+// One highly-skimmable line for the top: an explicit TL;DR / bottom-line /
+// headline section if present, else the first real paragraph. Markdown
+// stripped to plain text; escape at the call site.
+function mdSummary(src){
+  const text=String(src||'');
+  const sec=text.match(/^#{1,3}\s*(?:tl;?dr|bottom[ -]?line|headline|summary|key takeaway)[^\n]*\n+([\s\S]*?)(?:\n\s*\n|\n#{1,3}\s|$)/im);
+  let s = sec ? sec[1] : '';
+  if(!s.trim()){
+    const paras=text.split(/\n\s*\n/).map(p=>p.trim()).filter(p=>p && !/^#{1,6}\s/.test(p));
+    s = paras[0]||'';
+  }
+  s = s.replace(/^[-*]\s+/gm,'').replace(/[*_`>#]/g,'').replace(/\[([^\]]+)\]\([^)]*\)/g,'$1').replace(/\s+/g,' ').trim();
+  return s.length>300 ? s.slice(0,297).replace(/\s+\S*$/,'')+'…' : s;
+}
+// Highly-skimmable TL;DR card for the top of an analysis. Empty until a real
+// analysis exists (briefingHead is set only then). Server text → esc().
+function aiSummaryCard(){
+  if(!M.briefingHead) return '';
+  const s=mdSummary(M.briefing);
+  if(!s) return '';
+  return '<div style="display:flex;gap:11px;align-items:flex-start;background:rgba(230,169,62,0.06);border:1px solid #2A2517;border-left:3px solid '+C.amber+';border-radius:4px;padding:11px 14px;margin-bottom:14px;">'+
+    '<span style="font-size:9px;font-weight:700;letter-spacing:1px;color:'+C.amber+';padding-top:3px;flex-shrink:0;">TL;DR</span>'+
+    '<span style="font-size:12.5px;line-height:1.55;color:'+C.bright+';">'+esc(s)+'</span></div>';
+}
 
 //================================================================ state + data store
 const VIEWS = ['overview','positions','performance','analyst','alerts','blotter','taxes'];
@@ -293,7 +350,10 @@ function ticket(){
   // it. Fall back to the live portfolio only before the paper account loads.
   const paperKnown = M.paperBuyingPower!=null || (M.paperPositions && Object.keys(M.paperPositions).length>0);
   const cash = M.paperBuyingPower!=null ? M.paperBuyingPower : M.cash;
-  const equity = M.paperEquity!=null ? M.paperEquity : M.equity;
+  // Keep the position-cap denominator on the SAME ledger as `cash`: use paper
+  // equity when the paper account is loaded, otherwise live — never mix a
+  // paper cost estimate against a live equity denominator.
+  const equity = M.paperEquity!=null ? M.paperEquity : (paperKnown ? null : M.equity);
   const heldQty = (M.paperPositions && has(M.paperPositions[symU])) ? num(M.paperPositions[symU]) : (paperKnown ? 0 : (livePos?livePos.qty:0));
   const heldVal = heldQty*refPx;
   const held = heldQty>0 ? { qty:heldQty, avg:(paperKnown?null:(livePos?livePos.avg:0)) } : null;
@@ -304,7 +364,7 @@ function ticket(){
   } else {
     if(estCost>cash){ canPlace=false; warns.push({text:'✕ over buying power by '+money(estCost-cash),color:DN}); }
     if(estCost>MAX_NOTIONAL) warns.push({text:'⚠ exceeds max notional '+money(MAX_NOTIONAL),color:AM});
-    if(equity>0 && (heldVal+estCost)/equity>MAX_POS_PCT/100) warns.push({text:'⚠ position would exceed '+MAX_POS_PCT+'% cap',color:AM});
+    if(equity!=null && equity>0 && (heldVal+estCost)/equity>MAX_POS_PCT/100) warns.push({text:'⚠ position would exceed '+MAX_POS_PCT+'% cap',color:AM});
   }
   const bpAfter = S.side==='buy' ? cash-estCost : cash+estCost;
   return { symU, held, heldQty, qty, px, estCost, bpAfter, warns, canPlace, blockMsg };
@@ -367,7 +427,11 @@ function kpiStrip(){
     '<div style="flex:1;padding:10px 16px;border-right:1px solid '+C.border+';"><div style="font-size:9.5px;letter-spacing:1px;color:'+C.label+';">DAY P&amp;L</div><div style="font-size:19px;font-weight:600;color:'+dirColor(M.dayPnl)+';margin-top:4px;white-space:nowrap;">'+(ready?signedMoney(M.dayPnl):'—')+' <span style="font-size:11px;">'+(ready?signedPct(M.dayPct):'')+'</span></div></div>'+
     cell('UNREAL', ready?signedMoney(M.unreal):'—', dirColor(M.unreal)) +
     cell('BUYING POWER', ready?money(M.cash):'—', C.text) +
-    '<div style="flex:1.1;padding:8px 16px;display:flex;align-items:center;gap:10px;"><span style="font-size:22px;" aria-hidden="true">'+meter.face+'</span><div><div style="font-size:12px;font-weight:600;color:'+C.amber+';">'+meter.label+'</div><div style="font-size:9.5px;color:'+C.label+';">'+drawdownPct().toFixed(1)+'% off peak</div></div></div>'+
+    '<div style="flex:1.1;padding:9px 16px;display:flex;flex-direction:column;justify-content:center;gap:5px;">'+
+      '<div style="display:flex;align-items:center;justify-content:space-between;"><span style="font-size:9.5px;letter-spacing:1px;color:'+C.label+';">DRAWDOWN</span><span style="font-size:9px;font-weight:600;letter-spacing:0.5px;color:'+(ready?meter.color:C.label)+';">'+(ready?meter.label:'—')+'</span></div>'+
+      '<div style="font-size:19px;font-weight:600;color:'+(ready?meter.color:C.bright)+';white-space:nowrap;">'+(ready?drawdownPct().toFixed(1)+'%':'—')+'<span style="font-size:10px;color:'+C.label+';font-weight:400;"> off peak</span></div>'+
+      '<div style="height:3px;background:#11161D;border-radius:2px;overflow:hidden;"><div style="height:100%;width:'+(ready?Math.min(100,drawdownPct()*2).toFixed(0):0)+'%;background:'+(ready?meter.color:C.border)+';transition:width 0.4s ease;"></div></div>'+
+    '</div>'+
   '</div>';
 }
 
@@ -461,7 +525,9 @@ function eqHoverTip(){
   // viewBox scaled to fill width) so the tooltip lands on the in-chart
   // crosshair + marker. The crosshair line itself is drawn ONCE, inside the
   // SVG — no second overlay line here (that caused the split-line artifact).
-  const n=M.hist.length, fx=8+(n>1?S.eqHoverIdx/(n-1):0)*(1000-16), left=(fx/1000*100).toFixed(2)+'%';
+  // Crosshair sits at the true x (drawn in-SVG); the tooltip BOX is clamped to
+  // [8%,92%] so it never spills off the panel edge at the first/last point.
+  const n=M.hist.length, fx=8+(n>1?S.eqHoverIdx/(n-1):0)*(1000-16), left=Math.max(8,Math.min(92,fx/1000*100)).toFixed(2)+'%';
   const row=(l,v,c1,c2)=>'<div style="display:flex;justify-content:space-between;gap:16px;font-size:10.5px;line-height:1.6;"><span style="color:'+c1+';">'+l+'</span><span style="color:'+(c2||C.text)+';">'+v+'</span></div>';
   return '<div style="position:absolute;top:4px;left:'+left+';transform:translateX(-50%);pointer-events:none;z-index:6;background:'+C.bg+';border:1px solid #2A323E;border-radius:5px;padding:7px 10px;min-width:132px;box-shadow:0 8px 24px rgba(0,0,0,0.6);">'+
     '<div style="font-size:10px;color:'+C.body+';margin-bottom:5px;">'+esc(hp.date||'')+'</div>'+row('EQUITY',money(hp.equity),C.amber)+row('SPY',hp.benchmark!=null?money(hp.benchmark):'—','#8A93A6')+row('DEPOSITED',money(hp.net_deposited),C.gray,'#9BA5B4')+'</div>';
@@ -492,7 +558,7 @@ function overviewView(){
       '<span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">AI BRIEFING</span>'+
       '<span style="font-size:9px;letter-spacing:0.5px;color:'+C.amber+';border:1px solid #3A2F18;padding:2px 7px;border-radius:3px;">CLAUDE//HAIKU</span>'+head+
       '<span style="margin-left:auto;font-size:9.5px;color:'+C.faint+';">'+(S.briefOpen?'click to collapse':'click to expand')+'</span></button>'+
-    (S.briefOpen?'<div style="padding:0 16px 14px 35px;font-size:12.5px;line-height:1.65;color:'+C.body+';max-width:940px;white-space:pre-wrap;">'+esc(M.briefing)+'</div>':'')+
+    (S.briefOpen?'<div style="padding:2px 16px 14px 35px;font-size:12.5px;line-height:1.6;color:'+C.body+';max-width:940px;">'+aiSummaryCard()+mdToHtml(M.briefing)+'</div>':'')+
   '</div>';
   html += '<div style="padding:14px 16px;border-bottom:1px solid '+C.border+';">'+
     '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;"><span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">EQUITY CURVE <span style="color:'+C.faint+';">· VS SPY · DEPOSITED</span></span>'+
@@ -530,7 +596,7 @@ function analystView(){
   const backendLabel = M.analystBackend==='cli' ? 'CLAUDE CODE · CLI' : M.analystBackend==='http' ? 'CLAUDE API' : 'CLAUDE';
   let html='<div style="display:flex;border-bottom:1px solid '+C.border+';">'+
     '<div style="flex:1;padding:14px 16px;border-right:1px solid '+C.border+';"><div style="display:flex;align-items:center;gap:10px;margin-bottom:9px;"><span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">LATEST ANALYSIS</span><span style="font-size:9px;letter-spacing:0.5px;color:'+C.amber+';border:1px solid #3A2F18;padding:2px 7px;border-radius:3px;">'+esc(backendLabel)+'</span><span style="font-size:10px;color:'+C.label+';">'+esc(M.briefingHead)+'</span></div>'+
-      '<div style="font-size:12.5px;line-height:1.65;color:'+C.body+';white-space:pre-wrap;">'+esc(M.briefing)+'</div></div>'+
+      '<div style="font-size:12.5px;line-height:1.6;color:'+C.body+';">'+aiSummaryCard()+mdToHtml(M.briefing)+'</div></div>'+
     '<div style="width:200px;padding:14px 16px;"><div style="font-size:9.5px;letter-spacing:1px;color:'+C.label+';">TRACK RECORD</div><div style="font-size:26px;font-weight:600;color:'+C.bright+';margin-top:6px;">'+hit+'</div>'+
       '<div style="font-size:10px;color:'+C.label+';margin-top:3px;">'+M.track.favorable+'/'+M.track.tested+' FAVORABLE</div>'+
       '<div style="font-size:9.5px;letter-spacing:1px;color:'+C.label+';margin-top:14px;">TODAY SPEND</div><div style="font-size:15px;font-weight:600;color:'+C.text+';margin-top:5px;">'+money(M.todayCost)+' <span style="font-size:11px;color:'+C.label+';">/ '+money(M.budget)+'</span></div>'+
@@ -801,7 +867,7 @@ function wireCharts(){
   });
   const arr=selectedCandles(); const n=(Array.isArray(arr)?arr.length:0);
   document.querySelectorAll('[id="candlechart"]').forEach(cc=>{
-    cc.onmousemove=(e)=>{ const r=cc.getBoundingClientRect(); const f=(e.clientX-r.left)/r.width;
+    cc.onmousemove=(e)=>{ if(n===0) return; const r=cc.getBoundingClientRect(); const f=(e.clientX-r.left)/r.width;
       let i=Math.floor((f*CHART_W-CHART_PAD)/CHART_INNER*n); i=Math.max(0,Math.min(n-1,i));
       if(i!==S.hoverIdx){ S.hoverIdx=i; render(); } };
     cc.onmouseleave=()=>{ if(S.hoverIdx!=null){ S.hoverIdx=null; render(); } };

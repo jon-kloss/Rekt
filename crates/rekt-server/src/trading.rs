@@ -73,8 +73,11 @@ const CLIENT_ID_NONCE_SETTING: &str = "client_order_id.nonce";
 /// backups, and restores), and a deterministic `rekt-{mode}-{rowid}` id would
 /// REPLAY ids 1, 2, 3… on a fresh/restored DB — which the broker rejects with
 /// "client_order_id must be unique". Generated once and persisted, so ids stay
-/// stable for crash-recovery WITHIN an install but never collide across DB
-/// instances on the same broker account.
+/// stable for crash-recovery WITHIN an install while a FRESH or RESET database
+/// gets a new nonce and never replays a prior DB's ids. (Restoring a backup
+/// taken AFTER some orders were placed still carries the same nonce and could
+/// replay those exact ids — harmless, since those orders are terminal and the
+/// broker rejecting a duplicate is the desired idempotency.)
 async fn ensure_client_id_nonce(pool: &SqlitePool) -> Result<String> {
     if let Some(nonce) = repo::get_setting(pool, CLIENT_ID_NONCE_SETTING).await? {
         return Ok(nonce);
@@ -416,10 +419,11 @@ pub async fn apply_event(state: &AppState, event: BrokerEvent) -> Result<()> {
             let bo = order.into_broker_order();
             tracing::info!(client_order_id = %bo.client_order_id, event = %event, "order update");
 
-            let outcome = {
+            let (outcome, filled) = {
                 // Serialize with manual mutations: fill ingestion writes the
                 // transaction log too.
                 let _guard = state.mutations.lock().await;
+                let mut filled = false;
                 let outcome = apply_broker_order(&state.db, &bo).await?;
                 if outcome != ApplyOutcome::Unknown {
                     if let Some(stream_execution) = &execution {
@@ -453,15 +457,21 @@ pub async fn apply_event(state: &AppState, event: BrokerEvent) -> Result<()> {
                             .await?;
                             if ingested {
                                 state.live.bump_tx_revision();
-                                // A fill changed paper cash/positions — refresh
-                                // the cached account so the ticket sizes correctly.
-                                refresh_account_cache(state).await;
+                                filled = true;
                             }
                         }
                     }
                 }
-                outcome
+                (outcome, filled)
             };
+            // A fill changed paper cash/positions — refresh the cached account
+            // OUTSIDE the mutations lock: a slow/hung broker account endpoint
+            // must never block writers (submit_order, reconcile, other fills).
+            // The positions cache self-heals via tx_revision on the next
+            // snapshot regardless; this only keeps the ticket's BP fresh.
+            if filled {
+                refresh_account_cache(state).await;
+            }
             if outcome == ApplyOutcome::Unknown {
                 tracing::warn!(client_order_id = %bo.client_order_id,
                     "update for unknown order — reconciling");
@@ -880,7 +890,7 @@ pub async fn snapshot_block(state: &AppState) -> serde_json::Value {
             cache.1.clone()
         } else {
             drop(cache);
-            let pos = paper_positions_json(state, broker.mode().as_str()).await;
+            let pos = active_positions_json(state, broker.mode().as_str()).await;
             *state.trading.paper_positions_cache.write().await = (tx_rev, pos.clone());
             pos
         }
@@ -903,10 +913,12 @@ pub async fn snapshot_block(state: &AppState) -> serde_json::Value {
     })
 }
 
-/// Paper holdings as a `{symbol: qty}` JSON object (zero-qty filtered out),
-/// from the paper-mode transaction log. Used only off-tick (gated by the
-/// caller on tx_revision).
-async fn paper_positions_json(state: &AppState, mode: &str) -> serde_json::Value {
+/// Holdings for the currently-active broker mode as a `{symbol: qty}` JSON
+/// object (zero-qty filtered out), from that mode's transaction log. Today
+/// the broker is always paper, but this reads `mode` so it stays correct if a
+/// live broker is ever wired. Used only off-tick (gated by the caller on
+/// tx_revision).
+async fn active_positions_json(state: &AppState, mode: &str) -> serde_json::Value {
     let txs = match repo::fetch_mode_txs(&state.db, mode).await {
         Ok(t) => t,
         Err(e) => {

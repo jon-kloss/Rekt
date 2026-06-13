@@ -895,13 +895,17 @@ pub async fn list_recommendations(
 pub async fn set_recommendation_status(pool: &SqlitePool, id: i64, status: &str) -> Result<bool> {
     // The expiry clause pairs with list_recommendations' computed status:
     // a lapsed recommendation presents as 'expired' and cannot be moved.
+    // Idempotent on the target status: the UI keeps a STAGE/DROP button on
+    // already-accepted/dismissed recs, so re-issuing the same transition must
+    // succeed (no 409) rather than fail because the row left 'open'.
     let result = sqlx::query(
         r#"UPDATE recommendations SET status = ?
-           WHERE id = ? AND status = 'open'
+           WHERE id = ? AND (status = 'open' OR status = ?)
              AND (expires_ts IS NULL OR expires_ts >= ?)"#,
     )
     .bind(status)
     .bind(id)
+    .bind(status)
     .bind(Utc::now().to_rfc3339())
     .execute(pool)
     .await?;

@@ -56,11 +56,28 @@ pub async fn backfill_candles(state: &AppState) -> anyhow::Result<()> {
         let _guard = state.backfill_lock.lock().await;
         let last_cached = repo::last_candle_date(&state.db, &symbol).await?;
         let first_cached = repo::first_candle_date(&state.db, &symbol).await?;
+        // How far back we've already TRIED to reach (persisted floor): a
+        // provider with no data before `first_cached` would otherwise have the
+        // backward gap re-requested every run forever.
+        let floor_key = format!("candle_floor:{symbol}");
+        let earliest_attempted = repo::get_setting(&state.db, &floor_key)
+            .await?
+            .and_then(|s| s.parse::<NaiveDate>().ok());
+        // Mirror backfill_ranges' backward condition so we can record the floor.
+        let attempting_backward = last_cached.is_some()
+            && first_cached.is_some_and(|f| default_from < f)
+            && earliest_attempted.is_none_or(|e| default_from < e);
         // Forward tail (resume after the last bar) AND, when older
         // transactions now need earlier data than was first cached, the
         // backward head — so the equity curve + SPY benchmark reach back to
         // the first transaction instead of stalling at the startup window.
-        for (from, to) in backfill_ranges(default_from, last_cached, first_cached, today) {
+        for (from, to) in backfill_ranges(
+            default_from,
+            last_cached,
+            first_cached,
+            today,
+            earliest_attempted,
+        ) {
             match bars.daily_candles(&symbol, from, to).await {
                 Ok(candles) if !candles.is_empty() => {
                     let written = repo::upsert_candles(&state.db, &symbol, &candles).await?;
@@ -72,6 +89,11 @@ pub async fn backfill_candles(state: &AppState) -> anyhow::Result<()> {
                 Ok(_) => {}
                 Err(e) => tracing::warn!(symbol, error = %e, "candle backfill failed"),
             }
+        }
+        // Record that we've reached back to default_from (even if the provider
+        // returned nothing earlier than first_cached) so we don't re-request it.
+        if attempting_backward {
+            repo::set_setting(&state.db, &floor_key, &default_from.to_string()).await?;
         }
     }
     if fetched_any {
@@ -94,14 +116,17 @@ pub fn spawn_backfill(state: &AppState) {
 }
 
 /// The (from, to) ranges to fetch for one symbol given the default window,
-/// the symbol's currently-cached bounds, and today. Returns 0–2 ranges: the
-/// forward tail (newest bars) and/or the backward head (older bars a
-/// later-added transaction now needs). Pure so the gap logic is unit-tested.
+/// the symbol's currently-cached bounds, today, and the earliest date we've
+/// already ATTEMPTED to backfill (the floor — so a symbol whose provider has
+/// no data before `first_cached` isn't re-requested every run). Returns 0–2
+/// ranges: the forward tail (newest bars) and/or the backward head (older bars
+/// a later-added transaction now needs). Pure so the gap logic is unit-tested.
 fn backfill_ranges(
     default_from: NaiveDate,
     last_cached: Option<NaiveDate>,
     first_cached: Option<NaiveDate>,
     today: NaiveDate,
+    earliest_attempted: Option<NaiveDate>,
 ) -> Vec<(NaiveDate, NaiveDate)> {
     let mut ranges = Vec::new();
     match last_cached {
@@ -120,10 +145,14 @@ fn backfill_ranges(
             }
             // Backward head: the cached window starts later than now needed
             // (older tx added after the symbol was first cached) — fill the
-            // earlier gap, overlapping the existing start by a few days.
+            // earlier gap, overlapping the existing start by a few days but
+            // never past today. Skip if we've already tried this far back and
+            // the provider returned nothing (floor), so we don't re-request a
+            // dead range every run.
             if let Some(first) = first_cached {
-                if default_from < first {
-                    ranges.push((default_from, first + Duration::days(3)));
+                let below_floor = earliest_attempted.is_none_or(|e| default_from < e);
+                if default_from < first && below_floor {
+                    ranges.push((default_from, (first + Duration::days(3)).min(today)));
                 }
             }
         }
@@ -407,7 +436,7 @@ mod tests {
 
     #[test]
     fn nothing_cached_fetches_whole_window() {
-        let r = backfill_ranges(d("2024-01-01"), None, None, d("2026-06-13"));
+        let r = backfill_ranges(d("2024-01-01"), None, None, d("2026-06-13"), None);
         assert_eq!(r, vec![(d("2024-01-01"), d("2026-06-13"))]);
     }
 
@@ -419,6 +448,7 @@ mod tests {
             Some(d("2026-06-11")),
             Some(d("2024-01-01")),
             d("2026-06-13"),
+            None,
         );
         assert_eq!(r, vec![(d("2026-06-08"), d("2026-06-13"))]);
     }
@@ -434,6 +464,7 @@ mod tests {
             Some(d("2026-06-12")),
             Some(d("2025-05-29")),
             d("2026-06-13"),
+            None,
         );
         assert_eq!(
             r,
@@ -452,12 +483,13 @@ mod tests {
             Some(d("2026-06-12")),
             Some(d("2023-12-25")),
             d("2026-06-13"),
+            None,
         );
         assert_eq!(r, vec![(d("2026-06-09"), d("2026-06-13"))]);
     }
 
     #[test]
-    fn fully_current_symbol_yields_no_ranges() {
+    fn fully_current_symbol_yields_overlap_tail_only() {
         // last cached today; forward tail (today-3) is still < today so a
         // tiny overlap fetch is expected, but no backward gap.
         let r = backfill_ranges(
@@ -465,7 +497,61 @@ mod tests {
             Some(d("2026-06-13")),
             Some(d("2024-01-01")),
             d("2026-06-13"),
+            None,
         );
         assert_eq!(r, vec![(d("2026-06-10"), d("2026-06-13"))]);
+    }
+
+    #[test]
+    fn backward_head_never_exceeds_today() {
+        // first_cached set yesterday: first+3d would be in the future; cap at today.
+        let r = backfill_ranges(
+            d("2024-01-01"),
+            Some(d("2026-06-12")),
+            Some(d("2026-06-12")),
+            d("2026-06-13"),
+            None,
+        );
+        // forward tail + backward head capped at today (not 2026-06-15).
+        assert_eq!(
+            r,
+            vec![
+                (d("2026-06-09"), d("2026-06-13")),
+                (d("2024-01-01"), d("2026-06-13")),
+            ]
+        );
+    }
+
+    #[test]
+    fn floor_suppresses_repeat_backward_fetch() {
+        // Already attempted back to default_from (provider had nothing earlier):
+        // no backward range this run, just the forward tail.
+        let r = backfill_ranges(
+            d("2024-01-01"),
+            Some(d("2026-06-12")),
+            Some(d("2025-05-29")),
+            d("2026-06-13"),
+            Some(d("2024-01-01")),
+        );
+        assert_eq!(r, vec![(d("2026-06-09"), d("2026-06-13"))]);
+    }
+
+    #[test]
+    fn deeper_tx_added_reattempts_below_floor() {
+        // A still-earlier tx moves default_from below the floor — retry backward.
+        let r = backfill_ranges(
+            d("2023-06-01"),
+            Some(d("2026-06-12")),
+            Some(d("2025-05-29")),
+            d("2026-06-13"),
+            Some(d("2024-01-01")),
+        );
+        assert_eq!(
+            r,
+            vec![
+                (d("2026-06-09"), d("2026-06-13")),
+                (d("2023-06-01"), d("2025-06-01")),
+            ]
+        );
     }
 }
