@@ -940,10 +940,9 @@ function manageModal(){
   const rows = list.map(p=>{
     const isActive = p.active || p.name===M.activePortfolio;
     const armed = S.confirmDelPf===p.name;
-    const badges = (isActive?'<span style="font-size:9px;letter-spacing:0.5px;color:'+C.amber+';border:1px solid #3A2F18;border-radius:3px;padding:2px 6px;">ACTIVE</span>':'')
-      + (p.isolated_broker?'<span style="font-size:9px;letter-spacing:0.5px;color:'+C.blue+';border:1px solid #1B2A44;border-radius:3px;padding:2px 6px;margin-left:6px;">OWN BROKER</span>':'');
+    const badges = (p.isolated_broker?'<span style="font-size:9px;letter-spacing:0.5px;color:'+C.blue+';border:1px solid #1B2A44;border-radius:3px;padding:2px 6px;">OWN BROKER</span>':'');
     let action;
-    if(isActive){ action='<span style="font-size:10px;color:'+C.faint+';">active · in use</span>'; }
+    if(isActive){ action='<span style="font-size:9px;letter-spacing:0.5px;color:'+C.amber+';border:1px solid #3A2F18;border-radius:3px;padding:2px 6px;">ACTIVE</span>'; }
     else if(only){ action='<span style="font-size:10px;color:'+C.faint+';">—</span>'; }
     else { action='<button data-act="delPortfolio" data-arg="'+esc(p.name)+'" style="font-family:inherit;font-size:'+(armed?'9':'10')+'px;font-weight:'+(armed?'600':'400')+';letter-spacing:'+(armed?'0.5px':'0')+';color:'+DN+';background:'+(armed?'rgba(255,92,87,0.15)':'transparent')+';border:1px solid '+(armed?DN:'#1A212B')+';border-radius:3px;padding:5px 10px;cursor:pointer;white-space:nowrap;">'+(armed?'CONFIRM DELETE':'DELETE')+'</button>'; }
     return '<div style="display:flex;align-items:center;gap:10px;padding:11px 0;border-top:1px solid '+C.hairline+';"><span style="font-size:13px;color:'+C.bright+';min-width:110px;">'+esc(p.name)+'</span><span style="display:flex;align-items:center;">'+badges+'</span><span style="margin-left:auto;">'+action+'</span></div>';
