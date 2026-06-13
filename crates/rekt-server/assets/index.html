@@ -130,6 +130,7 @@ const S = {
   briefOpen:true, hoverIdx:null, eqHoverIdx:null, toast:'', halted:false, dockOpen:true, confirmDelTx:null, switching:'',
   side:'buy', otype:'market', tSym:'', tQty:'5', tLimit:'', basket:[],
   importOpen:false, importFmt:'generic', importText:'', importPreview:null, importErr:'', importBusy:false,
+  manageOpen:false, confirmDelPf:null,
 };
 // M holds the latest server-derived data the views render from.
 const M = {
@@ -890,12 +891,36 @@ function importModal(){
     '</div></div></div>';
 }
 
+function manageModal(){
+  if(!S.manageOpen) return '';
+  const list = (M.portfolios && M.portfolios.length) ? M.portfolios : [];
+  const only = list.length<=1;
+  const rows = list.map(p=>{
+    const isActive = p.active || p.name===M.activePortfolio;
+    const armed = S.confirmDelPf===p.name;
+    const badges = (isActive?'<span style="font-size:9px;letter-spacing:0.5px;color:'+C.amber+';border:1px solid #3A2F18;border-radius:3px;padding:2px 6px;">ACTIVE</span>':'')
+      + (p.isolated_broker?'<span style="font-size:9px;letter-spacing:0.5px;color:'+C.blue+';border:1px solid #1B2A44;border-radius:3px;padding:2px 6px;margin-left:6px;">OWN BROKER</span>':'');
+    let action;
+    if(isActive){ action='<span style="font-size:10px;color:'+C.faint+';">in use — switch away to delete</span>'; }
+    else if(only){ action='<span style="font-size:10px;color:'+C.faint+';">—</span>'; }
+    else { action='<button data-act="delPortfolio" data-arg="'+esc(p.name)+'" style="font-family:inherit;font-size:'+(armed?'9':'10')+'px;font-weight:'+(armed?'600':'400')+';letter-spacing:'+(armed?'0.5px':'0')+';color:'+DN+';background:'+(armed?'rgba(255,92,87,0.15)':'transparent')+';border:1px solid '+(armed?DN:'#1A212B')+';border-radius:3px;padding:5px 10px;cursor:pointer;white-space:nowrap;">'+(armed?'CONFIRM DELETE':'DELETE')+'</button>'; }
+    return '<div style="display:flex;align-items:center;gap:10px;padding:11px 0;border-top:1px solid '+C.hairline+';"><span style="font-size:13px;color:'+C.bright+';min-width:110px;">'+esc(p.name)+'</span><span style="display:flex;align-items:center;">'+badges+'</span><span style="margin-left:auto;">'+action+'</span></div>';
+  }).join('');
+  const warn = '<div style="margin-top:8px;font-size:10.5px;color:'+C.faint+';line-height:1.5;">Deleting a portfolio permanently removes its dataset — holdings, transactions, orders, analyses — and erases its database file. This cannot be undone.</div>';
+  return '<div data-act="manageClose" style="position:fixed;inset:0;z-index:60;background:rgba(3,5,8,0.84);display:flex;align-items:center;justify-content:center;padding:40px;"><div data-stopbg="1" style="background:'+C.panel+';border:1px solid #1A212B;border-radius:8px;padding:22px 24px;width:520px;max-width:94vw;max-height:88vh;overflow:auto;">'+
+    '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;"><span style="font-size:13px;letter-spacing:1px;color:'+C.amber+';">MANAGE PORTFOLIOS</span><button data-act="manageClose" style="font-family:inherit;font-size:12px;color:'+C.label+';background:transparent;border:1px solid #1A212B;border-radius:3px;padding:4px 12px;cursor:pointer;">✕ ESC</button></div>'+
+    rows + warn +
+    '<div style="display:flex;justify-content:flex-end;margin-top:16px;"><button data-act="newPortfolio" style="font-family:inherit;font-size:11px;font-weight:600;color:'+UP+';background:rgba(47,191,113,0.1);border:1px solid rgba(47,191,113,0.4);border-radius:4px;padding:8px 16px;cursor:pointer;">＋ NEW PORTFOLIO</button></div>'+
+  '</div></div>';
+}
+
 function overlays(){
   let html='';
   if(S.switching){ html += '<div style="position:fixed;inset:0;z-index:80;background:rgba(3,5,8,0.93);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;">'+
     '<div style="font-size:15px;letter-spacing:1px;color:'+C.amber+';">SWITCHING TO '+esc((S.switching||'').toUpperCase())+'…</div>'+
     '<div style="font-size:11px;letter-spacing:0.5px;color:'+C.label+';">restarting · reconnecting</div></div>'; }
   html += importModal();
+  html += manageModal();
   if(S.showHelp){
     const rows=[['Focus command bar','/'],['Stage order from command','b 10 nvda ↵'],['Set ticket side','B / S'],['Toggle order ticket','T'],['Switch view','1 – 8'],['Move position selection','↑ ↓  or  j k'],['Load selected into ticket','↵'],['Toggle this help','?'],['Clear / blur','Esc']];
     html += '<div data-act="closeHelp" style="position:fixed;inset:0;z-index:60;background:rgba(3,5,8,0.8);display:flex;align-items:center;justify-content:center;"><div style="background:'+C.panel+';border:1px solid #1A212B;border-radius:8px;padding:26px 30px;width:460px;max-width:90vw;"><div style="font-size:13px;letter-spacing:1px;color:'+C.amber+';margin-bottom:18px;">KEYBOARD SHORTCUTS</div><div style="display:flex;flex-direction:column;gap:11px;font-size:12.5px;">'+
@@ -948,6 +973,7 @@ function render(){
       '<div style="margin-left:auto;display:flex;align-items:center;gap:14px;flex-shrink:0;">'+
         '<span style="font-size:11px;font-variant-numeric:tabular-nums;color:'+dirColor(M.dayPnl)+';">DAY '+(M.ready?signedMoney(M.dayPnl):'—')+'</span>'+
         portfolioSelect()+
+        '<button data-act="manageOpen" aria-label="Manage portfolios" title="Manage portfolios" style="font-family:inherit;font-size:11px;color:'+C.label+';background:transparent;border:1px solid #1A212B;border-radius:4px;padding:4px 7px;cursor:pointer;">⚙</button>'+
         '<span style="font-size:10px;letter-spacing:0.5px;color:'+C.amber+';">[ PAPER ]</span>'+
         '<span style="font-size:11px;color:'+marketColor+';display:flex;align-items:center;gap:6px;"><span style="width:6px;height:6px;border-radius:50%;background:'+marketColor+';"></span>'+(M.market==='open'?'MKT OPEN':'MKT CLOSED')+'</span>'+
         '<span style="font-size:11px;color:'+UP+';display:flex;align-items:center;gap:6px;"><span style="width:6px;height:6px;border-radius:50%;background:'+UP+';animation:pulse 1.4s ease infinite;"></span>'+clock+'</span>'+
@@ -1088,6 +1114,10 @@ async function act(name, arg){
     case 'dropRec': try{ await japi('POST','/api/recommendations/'+arg+'/dismiss'); M.recs=M.recs.filter(r=>r.id!=arg); render(); }catch(e){ toast(e.message); } break;
     case 'importOpen': S.importOpen=true; S.importPreview=null; S.importErr=''; render(); break;
     case 'importClose': S.importOpen=false; render(); break;
+    case 'manageOpen': S.manageOpen=true; S.confirmDelPf=null; render(); break;
+    case 'manageClose': S.manageOpen=false; S.confirmDelPf=null; render(); break;
+    case 'newPortfolio': newPortfolio(); break;
+    case 'delPortfolio': if(S.confirmDelPf===arg){ deletePortfolio(arg); } else { S.confirmDelPf=arg; render(); } break;
     case 'importPreview': doImportPreview(); break;
     case 'importConfirm': doImportConfirm(); break;
     case 'briefingRun': try{ await japi('POST','/api/analyst/briefing'); toast('BRIEFING REQUESTED…'); setTimeout(reloadAnalyst,1500); }catch(e){ toast(e.message); } break;
@@ -1163,6 +1193,15 @@ async function newPortfolio(){
   toast((created?'CREATED "':'"')+name+'" — switching…');
   await switchPortfolio(name);
 }
+async function deletePortfolio(name){
+  try{
+    await japi('DELETE','/api/portfolios/'+encodeURIComponent(name));
+    S.confirmDelPf=null;
+    await refreshPortfolios();
+    toast('DELETED "'+name+'"');
+    render();
+  }catch(e){ S.confirmDelPf=null; toast(e.message); render(); }
+}
 
 //================================================================ events
 document.addEventListener('click', (e)=>{
@@ -1171,7 +1210,7 @@ document.addEventListener('click', (e)=>{
   // Overlay backdrops (closeExpand/closeHelp) close only when the backdrop
   // itself is clicked or the explicit ✕ button — not when clicking the
   // panel content inside them.
-  if((name==='closeExpand'||name==='closeHelp'||name==='importClose') && e.target!==el && el.tagName!=='BUTTON') return;
+  if((name==='closeExpand'||name==='closeHelp'||name==='importClose'||name==='manageClose') && e.target!==el && el.tagName!=='BUTTON') return;
   act(name, el.getAttribute('data-arg'));
 });
 document.addEventListener('input', (e)=>{
@@ -1199,7 +1238,7 @@ function patchTicket(){ /* full render preserves focus by id; cheap enough */ re
 document.addEventListener('keydown', (e)=>{
   const tag=(e.target.tagName||'').toLowerCase(); const typing=tag==='input'||tag==='textarea'||tag==='select';
   if(e.key==='/' && !typing){ e.preventDefault(); const c=$('cmd'); if(c) c.focus(); return; }
-  if(e.key==='Escape'){ if(S.importOpen){ S.importOpen=false; render(); } else if(S.expanded){ S.expanded=null; render(); } else if(S.showHelp){ S.showHelp=false; render(); } else if(e.target.id==='cmd'){ S.cmd=''; e.target.blur(); render(); } return; }
+  if(e.key==='Escape'){ if(S.manageOpen){ S.manageOpen=false; S.confirmDelPf=null; render(); } else if(S.importOpen){ S.importOpen=false; render(); } else if(S.expanded){ S.expanded=null; render(); } else if(S.showHelp){ S.showHelp=false; render(); } else if(e.target.id==='cmd'){ S.cmd=''; e.target.blur(); render(); } return; }
   if(e.target.id==='cmd' && e.key==='Enter'){ runCmd(S.cmd); render(); return; }
   if(typing) return;
   if(e.key==='?'){ e.preventDefault(); S.showHelp=!S.showHelp; render(); return; }

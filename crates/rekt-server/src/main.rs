@@ -121,6 +121,7 @@ fn app(state: AppState) -> Router {
             get(portfolios::list).post(portfolios::create),
         )
         .route("/api/portfolios/switch", post(portfolios::switch))
+        .route("/api/portfolios/{name}", delete(portfolios::delete))
         .route("/api/ws", get(ws_upgrade))
         .with_state(state)
 }
