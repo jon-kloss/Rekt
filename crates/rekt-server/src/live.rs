@@ -65,6 +65,11 @@ pub struct Live {
     /// watchlist_rev → symbol list (the per-tick watchlist block reads this,
     /// not the database).
     watchlist_cache: RwLock<Option<(u64, Arc<Vec<String>>)>>,
+    /// candles_rev → last-known daily close per symbol, used to value
+    /// positions when the live feed has no quote (market closed, or no
+    /// market-data key). Keyed by candles_revision so it never touches the
+    /// DB on the per-tick broadcaster path.
+    fallback_cache: RwLock<Option<(u64, HashMap<String, PriceView>)>>,
 }
 
 pub struct LiveHandles {
@@ -397,8 +402,71 @@ pub async fn refresh_symbols(state: &AppState) -> anyhow::Result<()> {
 
 /// Full dashboard payload: portfolio view + market status + tx revision +
 /// trading state (mode, open orders, pause flag).
+/// Fill in a last-known daily close (and the prior close, for day P&L) for
+/// any `symbols` the live price cache hasn't quoted. Best-available, honest
+/// pricing: a real close with its trade date as the timestamp, never a
+/// fabricated number. Cached by `candles_rev` so the per-tick broadcaster
+/// never re-queries; the DB is touched only when the candle set changed and
+/// a symbol is genuinely missing a live quote.
+async fn enrich_with_last_close(
+    state: &AppState,
+    prices: &mut HashMap<String, PriceView>,
+    symbols: &[String],
+    candles_rev: u64,
+) -> anyhow::Result<()> {
+    let missing: Vec<String> = symbols
+        .iter()
+        .filter(|s| !prices.contains_key(*s))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    {
+        let cache = state.live.fallback_cache.read().await;
+        if let Some((rev, map)) = &*cache {
+            if *rev == candles_rev && missing.iter().all(|s| map.contains_key(s)) {
+                for s in &missing {
+                    if let Some(pv) = map.get(s) {
+                        prices.insert(s.clone(), pv.clone());
+                    }
+                }
+                return Ok(());
+            }
+        }
+    }
+    let mut built: HashMap<String, PriceView> = HashMap::new();
+    for sym in &missing {
+        let cs = repo::recent_candles(&state.db, sym, 2).await?;
+        if let Some(last) = cs.last() {
+            let prev = if cs.len() >= 2 {
+                Some(cs[cs.len() - 2].close)
+            } else {
+                None
+            };
+            let ts = last
+                .date
+                .and_hms_opt(20, 0, 0)
+                .map(|t| DateTime::<Utc>::from_naive_utc_and_offset(t, Utc));
+            built.insert(
+                sym.clone(),
+                PriceView {
+                    price: last.close,
+                    prev_close: prev,
+                    ts,
+                },
+            );
+        }
+    }
+    for (s, pv) in &built {
+        prices.insert(s.clone(), pv.clone());
+    }
+    *state.live.fallback_cache.write().await = Some((candles_rev, built));
+    Ok(())
+}
+
 pub async fn portfolio_snapshot(state: &AppState) -> anyhow::Result<serde_json::Value> {
-    let prices = state.live.price_views().await;
+    let mut prices = state.live.price_views().await;
     let now = Utc::now();
     let tx_revision = state.live.tx_revision.load(Ordering::Relaxed);
     // Carried in the payload so clients can refresh candle-derived views
@@ -445,6 +513,15 @@ pub async fn portfolio_snapshot(state: &AppState) -> anyhow::Result<serde_json::
 
     let payload = match basis_result {
         Ok(basis) => {
+            // Value positions/watchlist at the last stored close when the
+            // live feed hasn't quoted them (market closed / no feed key).
+            let mut needed: Vec<String> = basis.positions.keys().cloned().collect();
+            needed.extend(watch_symbols.iter().cloned());
+            if let Err(e) =
+                enrich_with_last_close(state, &mut prices, &needed, candles_revision).await
+            {
+                tracing::warn!(error = %e, "last-close fallback pricing failed");
+            }
             let view = value(&basis, &prices);
             let mut signal_symbols: Vec<String> =
                 view.positions.iter().map(|p| p.symbol.clone()).collect();

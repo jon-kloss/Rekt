@@ -55,6 +55,10 @@ pub struct AppState {
     /// Claude API transport (ANTHROPIC_API_KEY) — None disables the analyst
     /// honestly. NOTE: the analyst layer never touches `broker` (PLAN.md §5).
     pub analyst: Option<Arc<dyn rekt_analyst::Transport>>,
+    /// True when the analyst transport is the Claude Code CLI (`claude -p`):
+    /// every kind runs tool-lessly with injected context, since the CLI is
+    /// launched with no tools and drives no in-process tool loop.
+    pub analyst_cli: bool,
     /// Daily AI spend ceiling (REKT_AI_DAILY_BUDGET, USD).
     pub ai_budget: rust_decimal::Decimal,
     /// Single-flight latch: one analysis at a time.
@@ -71,6 +75,7 @@ fn app(state: AppState) -> Router {
         .route("/api/transactions/{id}", delete(api::delete_tx))
         .route("/api/import/csv", post(api::import_csv))
         .route("/api/history", get(history::history))
+        .route("/api/candles", get(history::candles))
         .route("/api/taxes", get(taxes::taxes))
         .route("/api/taxes/csv", get(taxes::taxes_csv))
         .route(
@@ -309,17 +314,52 @@ async fn main() -> anyhow::Result<()> {
             }),
     };
 
-    // AI analyst (PLAN.md §5): env-only key, honest 503 without it.
-    let analyst: Option<Arc<dyn rekt_analyst::Transport>> = std::env::var("ANTHROPIC_API_KEY")
-        .ok()
-        .filter(|k| !k.is_empty())
-        .map(|key| {
-            tracing::info!("AI analyst enabled (advisory only — it can never execute orders)");
-            Arc::new(rekt_analyst::HttpTransport::new(key)) as Arc<dyn rekt_analyst::Transport>
-        });
-    if analyst.is_none() {
-        tracing::warn!("no ANTHROPIC_API_KEY — AI analyst disabled");
-    }
+    // AI analyst (PLAN.md §5): two backends, both advisory only.
+    //   default (or REKT_ANALYST_BACKEND=cli) → drive the local Claude Code
+    //     CLI (`claude -p`), reusing its auth; no ANTHROPIC_API_KEY needed.
+    //     Runs tool-less with injected context (no orders — empty allowlist).
+    //   REKT_ANALYST_BACKEND=http (or =api)   → the HTTP API client
+    //     (ANTHROPIC_API_KEY), which also produces structured recs.
+    // The CLI is the default because REKT is self-hosted alongside Claude
+    // Code; opt into the API explicitly when you'd rather spend a key.
+    let analyst_cli = match std::env::var("REKT_ANALYST_BACKEND") {
+        Ok(v) if v.trim().eq_ignore_ascii_case("http") || v.trim().eq_ignore_ascii_case("api") => {
+            false
+        }
+        _ => true, // default: local Claude Code CLI
+    };
+    let analyst: Option<Arc<dyn rekt_analyst::Transport>> = if analyst_cli {
+        // Probe the binary so a host without Claude Code degrades honestly
+        // (disabled) rather than advertising a backend that fails every run.
+        let cli = rekt_analyst::CliTransport::new();
+        if cli.is_available().await {
+            tracing::info!(
+                "AI analyst enabled via Claude Code CLI (claude -p; advisory only, no tools)"
+            );
+            Some(Arc::new(cli) as Arc<dyn rekt_analyst::Transport>)
+        } else {
+            tracing::warn!(
+                "REKT_ANALYST_BACKEND=cli (the default) but `claude` is not runnable on PATH \
+                 — AI analyst disabled. Install Claude Code, or set REKT_ANALYST_BACKEND=http \
+                 with ANTHROPIC_API_KEY."
+            );
+            None
+        }
+    } else {
+        let t = std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
+            .map(|key| {
+                tracing::info!("AI analyst enabled (advisory only — it can never execute orders)");
+                Arc::new(rekt_analyst::HttpTransport::new(key)) as Arc<dyn rekt_analyst::Transport>
+            });
+        if t.is_none() {
+            tracing::warn!(
+                "REKT_ANALYST_BACKEND=http but no ANTHROPIC_API_KEY — AI analyst disabled"
+            );
+        }
+        t
+    };
     let ai_budget = std::env::var("REKT_AI_DAILY_BUDGET")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -340,6 +380,7 @@ async fn main() -> anyhow::Result<()> {
         notify_url,
         backfill_lock: Arc::new(Mutex::new(())),
         analyst,
+        analyst_cli,
         ai_budget,
         analyst_running: Arc::new(AtomicBool::new(false)),
     });
@@ -480,6 +521,7 @@ mod tests {
             notify_url: None,
             backfill_lock: Arc::new(Mutex::new(())),
             analyst: None,
+            analyst_cli: false,
             ai_budget: rust_decimal::Decimal::new(250, 2),
             analyst_running: Arc::new(AtomicBool::new(false)),
         }
@@ -1770,6 +1812,48 @@ Trades,Data,Order,Equity and Index Options,USD,AAPL 240920C,\"2026-06-10, 10:30:
         assert_eq!(json["short"]["reportable"], "0");
         // With no transactions, the only offered year is the current one.
         assert_eq!(json["years"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn candles_endpoint_serves_ohlcv_oldest_first() {
+        let state = test_state().await;
+        let dec = |s: &str| s.parse::<rust_decimal::Decimal>().unwrap();
+        let candle = |y, mo, d, o: &str, h: &str, l: &str, c: &str, v| rekt_core::Candle {
+            date: chrono::NaiveDate::from_ymd_opt(y, mo, d).unwrap(),
+            open: dec(o),
+            high: dec(h),
+            low: dec(l),
+            close: dec(c),
+            volume: v,
+        };
+        repo::upsert_candles(
+            &state.db,
+            "AAPL",
+            &[
+                candle(2026, 6, 10, "150", "152", "149", "151", 1000),
+                candle(2026, 6, 11, "151", "155", "151", "154", 1200),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let (status, json) = request(state.clone(), "GET", "/api/candles?symbol=aapl", None).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["symbol"], "AAPL");
+        assert_eq!(json["timeframe"], "daily");
+        let rows = json["candles"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        // Oldest first; compact o/h/l/c/v keys.
+        assert_eq!(rows[0]["date"], "2026-06-10");
+        assert_eq!(rows[0]["o"], "150");
+        assert_eq!(rows[0]["c"], "151");
+        assert_eq!(rows[1]["c"], "154");
+        assert_eq!(rows[1]["v"], 1200);
+
+        // A symbol with no stored candles is an empty (not error) series.
+        let (status, json) = request(state, "GET", "/api/candles?symbol=ZZZZ", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["candles"].as_array().unwrap().is_empty());
     }
 
     /// Post a transaction and assert it was created. The end-to-end tests

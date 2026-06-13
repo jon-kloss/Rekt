@@ -128,6 +128,48 @@ pub struct HistoryQuery {
     pub range: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct CandlesQuery {
+    pub symbol: String,
+    /// Bars to return, oldest first (default 252 ≈ one trading year).
+    #[serde(default)]
+    pub days: Option<i64>,
+}
+
+/// GET /api/candles?symbol=AAPL&days=252 — daily OHLCV for one symbol, for
+/// the Terminal candlestick chart. We only store DAILY bars (Alpaca), so
+/// intraday timeframes degrade to daily honestly. Fill markers are derived
+/// client-side from the transaction log.
+pub async fn candles(
+    State(state): State<AppState>,
+    Query(query): Query<CandlesQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let symbol = crate::api::validate_symbol(&query.symbol)?;
+    let days = query.days.unwrap_or(252).clamp(2, 2000);
+    let bars = repo::recent_candles(&state.db, &symbol, days)
+        .await
+        .map_err(internal)?;
+    // Compact keys (o/h/l/c/v/date) match the design's candle shape.
+    let candles: Vec<serde_json::Value> = bars
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "date": c.date,
+                "o": c.open,
+                "h": c.high,
+                "l": c.low,
+                "c": c.close,
+                "v": c.volume,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "symbol": symbol,
+        "timeframe": "daily",
+        "candles": candles,
+    })))
+}
+
 /// Turn stored EOD snapshots into chartable day points (the fallback when
 /// no candles exist yet — e.g. Alpaca keys were configured late). Flows are
 /// recovered from the day-over-day change in net deposits.
