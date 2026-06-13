@@ -20,6 +20,7 @@ use chrono::{DateTime, Duration, Utc};
 use chrono_tz::America::New_York;
 use rekt_analyst::runner::{run, RunConfig, RunOutcome};
 use rekt_analyst::{pricing, ToolExecutor, UsageTotals, ANALYST_MODEL, BRIEFING_MODEL};
+use rust_decimal::Decimal;
 use serde_json::{json, Value};
 
 use crate::api::{err, internal, validate_symbol, ApiError};
@@ -28,6 +29,9 @@ use crate::{repo, AppState};
 
 /// Recommendations lapse after a week — stale advice must expire honestly.
 const RECOMMENDATION_TTL_DAYS: i64 = 7;
+/// One window for BOTH hit-rate computations (the model's prompt and the
+/// UI header) — the feedback loop breaks if they quietly diverge.
+const TRACK_RECORD_RECS: i64 = 20;
 /// Generous cap on loop iterations (each is one API call).
 const MAX_ITERATIONS: usize = 12;
 
@@ -238,7 +242,15 @@ async fn recommendation_outcomes(
     let mut symbols: Vec<String> = recommendations.iter().map(|r| r.symbol.clone()).collect();
     symbols.sort();
     symbols.dedup();
-    let closes = repo::closes_map(&state.db, &symbols).await?;
+    // Bound the fetch to the oldest listed recommendation: this helper is
+    // on the UI's 3-second poll path during runs, and outcomes never look
+    // at closes before a rec date.
+    let oldest = recommendations
+        .iter()
+        .filter_map(|rec| DateTime::parse_from_rfc3339(&rec.created_ts).ok())
+        .map(|created| rekt_core::taxes::ny_date(created.to_utc()))
+        .min();
+    let closes = repo::closes_map_since(&state.db, &symbols, oldest).await?;
     Ok(recommendations
         .iter()
         .filter_map(|rec| {
@@ -258,7 +270,7 @@ async fn recommendation_outcomes(
 /// previous calls aged before making new ones. Failures degrade to an
 /// honest one-liner — a broken track record must not block an analysis.
 async fn track_record(state: &AppState) -> String {
-    let recommendations = match repo::list_recommendations(&state.db, 10).await {
+    let recommendations = match repo::list_recommendations(&state.db, TRACK_RECORD_RECS).await {
         Ok(recommendations) if !recommendations.is_empty() => recommendations,
         Ok(_) => return "No prior recommendations on record.".to_string(),
         Err(e) => return format!("Track record unavailable: {e}"),
@@ -284,7 +296,9 @@ async fn track_record(state: &AppState) -> String {
                     }
                     None => " — no testable direction",
                 };
-                let sign = if o.return_pct.is_sign_positive() {
+                // Strictly positive only: "+0%" next to "unfavorable"
+                // would hand the model a contradictory signal.
+                let sign = if o.return_pct > Decimal::ZERO {
                     "+"
                 } else {
                     ""
@@ -655,7 +669,7 @@ pub async fn summary(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
             .map_err(internal)?,
         None => None,
     };
-    let recommendations = repo::list_recommendations(&state.db, 20)
+    let recommendations = repo::list_recommendations(&state.db, TRACK_RECORD_RECS)
         .await
         .map_err(internal)?;
     let outcomes = recommendation_outcomes(&state, &recommendations)

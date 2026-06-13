@@ -29,12 +29,20 @@ pub fn recommendation_outcome(
     rec_date: NaiveDate,
     closes: &Closes,
 ) -> Option<RecOutcome> {
-    let (_, baseline) = closes.range(rec_date..).next()?;
-    let (_, latest) = closes.iter().next_back()?;
+    let (baseline_date, baseline) = closes.range(rec_date..).next()?;
+    let (latest_date, latest) = closes.iter().next_back()?;
+    // One close is no window: a call can't be judged on zero elapsed
+    // trading days, and Some(false) here would systematically deflate the
+    // hit rate for every fresh recommendation.
+    if baseline_date == latest_date {
+        return None;
+    }
     if *baseline <= Decimal::ZERO {
         return None; // corrupt candle — no verdict beats a wrong one
     }
     let return_pct = ((latest - baseline) / baseline * Decimal::ONE_HUNDRED).round_dp(2);
+    // A genuine multi-day flat stays Some(false): a directional call that
+    // produced no move gave no edge.
     let favorable = match action {
         "buy" | "add" => Some(return_pct > Decimal::ZERO),
         "sell" | "trim" => Some(return_pct < Decimal::ZERO),
@@ -96,10 +104,21 @@ mod tests {
     }
 
     #[test]
-    fn flat_since_recommendation_is_not_favorable_either_way() {
+    fn a_single_close_is_no_window_to_judge() {
+        // Recommended today, one close so far: zero elapsed trading days
+        // is "not judged yet", never an unfavorable mark.
         let series = closes(&[("2026-05-01", "100")]);
+        assert!(recommendation_outcome("buy", day("2026-05-01"), &series).is_none());
+        assert!(recommendation_outcome("sell", day("2026-05-01"), &series).is_none());
+    }
+
+    #[test]
+    fn a_genuine_multi_day_flat_is_not_favorable_either_way() {
+        let series = closes(&[("2026-05-01", "100"), ("2026-05-08", "100")]);
         let outcome = recommendation_outcome("buy", day("2026-05-01"), &series).unwrap();
         assert_eq!(outcome.return_pct, dec("0"));
         assert_eq!(outcome.favorable, Some(false));
+        let sell = recommendation_outcome("sell", day("2026-05-01"), &series).unwrap();
+        assert_eq!(sell.favorable, Some(false));
     }
 }

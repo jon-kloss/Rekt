@@ -1573,9 +1573,13 @@ mod tests {
         .await
         .unwrap();
         // Closes: baseline on the recommendation's NY date at 100, then a
-        // later close at 110 → +10%, favorable for a buy call.
+        // later close at 110 → +10%, favorable for a buy call. The base
+        // date comes from the STORED row, not a second Utc::now() — the
+        // two could land on opposite sides of NY midnight.
+        let stored = repo::list_recommendations(&state.db, 1).await.unwrap();
+        let created = chrono::DateTime::parse_from_rfc3339(&stored[0].created_ts).unwrap();
+        let base = rekt_core::taxes::ny_date(created.to_utc());
         let dec = |s: &str| s.parse::<rust_decimal::Decimal>().unwrap();
-        let today = rekt_core::taxes::ny_date(chrono::Utc::now());
         let candle = |date, close: &str| rekt_core::Candle {
             date,
             open: dec(close),
@@ -1588,8 +1592,8 @@ mod tests {
             &state.db,
             "NVDA",
             &[
-                candle(today, "100"),
-                candle(today + chrono::Duration::days(1), "110"),
+                candle(base, "100"),
+                candle(base + chrono::Duration::days(1), "110"),
             ],
         )
         .await
