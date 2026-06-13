@@ -375,6 +375,38 @@ async fn track_record(state: &AppState) -> String {
 /// Full portfolio context injected into the BRIEFING user turn (the
 /// briefing is the tool-less, single-call kind — review/ask fetch fresh
 /// data through get_portfolio instead of carrying a pre-baked copy).
+/// Compact, locally-computed performance + SPY benchmark figures so the
+/// (tool-less CLI) review can speak to vs-benchmark and return instead of
+/// claiming it lacks the data.
+async fn performance_context(state: &AppState) -> String {
+    let Ok(p) = crate::history::history_payload(state, "all").await else {
+        return String::new();
+    };
+    let m = &p["metrics"];
+    let s = |v: &serde_json::Value| v.as_str().map(str::to_string);
+    let mut out = String::from(
+        "Performance (computed locally from your transaction log — these are facts, not estimates):\n",
+    );
+    if let Some(twr) = s(&m["twr_pct"]) {
+        out.push_str(&format!("- Time-weighted return, all-time: {twr}%\n"));
+    }
+    if let Some(irr) = s(&m["irr_pct"]) {
+        out.push_str(&format!(
+            "- Money-weighted return (IRR, annualized): {irr}%\n"
+        ));
+    }
+    match s(&m["benchmark_twr_pct"]) {
+        Some(b) => out.push_str(&format!(
+            "- Cash-flow-matched SPY benchmark TWR over the same period: {b}%. The SPY series IS \
+             available to you here — give a concrete vs-SPY read; do NOT say you lack benchmark data.\n"
+        )),
+        None => out.push_str(
+            "- SPY benchmark: insufficient overlapping history for a clean figure this period.\n",
+        ),
+    }
+    out
+}
+
 async fn portfolio_context(state: &AppState) -> String {
     match crate::live::portfolio_snapshot(state).await {
         // Honesty over nulls: the inconsistent-log payload must read as an
@@ -517,12 +549,24 @@ async fn run_analysis_inner(
         ),
         "weekly_review" => (
             format!(
-                "{date}\n\n{track}\n\nDo the weekly deep review: performance vs the SPY \
-                 benchmark, position-by-position assessment using signals and recent price \
-                 action, concentration and cash posture, and what changed this week in the \
-                 market that affects these holdings (use web_search). Weigh your track record \
-                 above: revisit calls that aged badly before repeating them. End with concrete \
-                 recommendations."
+                "{date}\n\n{track}\n\nWrite this week's portfolio review as a SCANNABLE markdown \
+                 brief — short paragraphs and tight bullets, never essays. Lead with what to DO. \
+                 Your per-name buy/sell/trim/hold calls go in the structured `recommendations` \
+                 you return separately, so do NOT re-narrate every holding in prose here. Use \
+                 these exact section headings, in this order:\n\n\
+                 ## Bottom line\nThe single most important fact and the one decision that matters \
+                 most (2–3 sentences).\n\n\
+                 ## Do now\nA short bullet list of concrete actions, highest-leverage first — or \
+                 'Nothing to trade — hold the book.'\n\n\
+                 ## Performance\nAccount value, total return, and your return VS the SPY benchmark \
+                 as a number (benchmark figures are provided below — use them). Call out cash drag \
+                 if it is material.\n\n\
+                 ## Posture & risk\nCash deployment and concentration as tight bullets; name the \
+                 single biggest structural risk.\n\n\
+                 ## Watch next\nForward-looking only: catalysts, price levels, or signals to watch \
+                 this week (a short list). Use web_search for anything time-sensitive.\n\n\
+                 Weigh your track record above — revisit calls that aged badly before repeating \
+                 them. Keep the whole brief tight and concrete."
             ),
             true,
             vec![json!({"type": "web_search_20260209", "name": "web_search", "max_uses": 6})],
@@ -549,8 +593,9 @@ async fn run_analysis_inner(
         output_schema = None;
         if kind != "briefing" {
             user_content = format!(
-                "{user_content}\n\nCurrent portfolio state:\n{}",
-                portfolio_context(state).await
+                "{user_content}\n\nCurrent portfolio state:\n{}\n\n{}",
+                portfolio_context(state).await,
+                performance_context(state).await
             );
         }
         // The HTTP backend gets structured recommendations from the API's
