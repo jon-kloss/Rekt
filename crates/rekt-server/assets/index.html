@@ -67,6 +67,7 @@ const S = {
   view:'positions', selSym:null, cmd:'', showHelp:false, expanded:null, candleRange:'6m',
   briefOpen:true, hoverIdx:null, eqHoverIdx:null, toast:'', halted:false,
   side:'buy', otype:'market', tSym:'', tQty:'5', tLimit:'',
+  importOpen:false, importFmt:'generic', importText:'', importPreview:null, importErr:'', importBusy:false,
 };
 // M holds the latest server-derived data the views render from.
 const M = {
@@ -550,7 +551,8 @@ function alertsView(){
 function blotterView(){
   const cols='0.9fr 0.9fr 0.6fr 0.8fr 0.6fr 0.9fr 1fr 0.8fr';
   const OC={ filled:UP, accepted:C.blue, partially_filled:AM, canceled:'#8A93A6', rejected:DN, pending_submit:'#8A93A6', failed:DN };
-  let html='<div style="padding:11px 16px 9px;font-size:11px;letter-spacing:1px;color:'+C.body+';border-bottom:1px solid '+C.border+';">ORDER BLOTTER <span style="color:'+C.faint+';">· FILLS AUTO-INGEST AS TRANSACTIONS</span></div>'+
+  let html='<div style="padding:11px 16px 9px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid '+C.border+';"><span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">ORDER BLOTTER <span style="color:'+C.faint+';">· FILLS AUTO-INGEST AS TRANSACTIONS</span></span>'+
+    '<button data-act="importOpen" style="font-size:10px;color:'+C.text+';background:transparent;border:1px solid '+C.border+';border-radius:3px;padding:6px 10px;cursor:pointer;font-family:inherit;">⬆ IMPORT CSV</button></div>'+
     '<div style="display:grid;grid-template-columns:'+cols+';gap:8px;padding:8px 16px;font-size:9.5px;letter-spacing:0.5px;color:'+C.label+';border-bottom:1px solid '+C.border+';"><div>WHEN</div><div>SYM</div><div>SIDE</div><div>TYPE</div><div style="text-align:right;">QTY</div><div style="text-align:right;">LIMIT</div><div>STATUS</div><div style="text-align:right;">FILLED</div></div>';
   if(!M.orders.length){ html+='<div style="padding:22px 16px;text-align:center;color:'+C.faint+';font-size:11px;">no orders yet</div>'; return html; }
   html += M.orders.map(o=>'<div style="display:grid;grid-template-columns:'+cols+';gap:8px;padding:10px 16px;border-bottom:1px solid '+C.hairline+';font-size:11.5px;align-items:center;font-variant-numeric:tabular-nums;">'+
@@ -631,8 +633,42 @@ function dock(){
   return '<aside aria-label="Order ticket and working orders" style="display:flex;flex-direction:column;background:'+C.panel2+';min-height:0;">'+ticketHtml+workingHtml+'</aside>';
 }
 
+function importModal(){
+  if(!S.importOpen) return '';
+  const fmts=[['generic','Generic (REKT native)'],['fidelity','Fidelity'],['schwab','Schwab'],['robinhood','Robinhood'],['ibkr','Interactive Brokers']];
+  const fmtOpts=fmts.map(f=>'<option value="'+f[0]+'"'+(f[0]===S.importFmt?' selected':'')+'>'+esc(f[1])+'</option>').join('');
+  const pv=S.importPreview, busy=S.importBusy;
+  let result='';
+  if(S.importErr){ result+='<div style="margin-top:12px;font-size:11.5px;color:'+DN+';white-space:pre-wrap;">'+esc(S.importErr)+'</div>'; }
+  if(pv){
+    const sample=pv.sample||[], skips=pv.skipped||[];
+    const rows=sample.map(r=>'<div style="display:grid;grid-template-columns:0.8fr 0.6fr 0.6fr 0.7fr 0.9fr;gap:8px;padding:5px 0;border-top:1px solid '+C.hairline+';font-size:11px;font-variant-numeric:tabular-nums;"><span style="color:'+C.body+';">'+esc(r.kind)+'</span><span style="color:'+C.bright+';">'+esc(r.symbol||'—')+'</span><span style="text-align:right;color:'+C.body+';">'+esc(String(r.qty??''))+'</span><span style="text-align:right;color:'+C.body+';">'+esc(String(r.price??''))+'</span><span style="color:'+C.label+';">'+esc(String(r.ts||'').slice(0,10))+'</span></div>').join('');
+    const skipBlock = skips.length ? '<div style="margin-top:10px;font-size:11px;color:'+C.amber+';">Skipping '+skips.length+' row'+(skips.length===1?'':'s')+' (not portfolio transactions):</div><div style="max-height:90px;overflow:auto;font-size:10.5px;color:'+C.label+';margin-top:4px;">'+skips.slice(0,50).map(s=>'<div>'+esc(s)+'</div>').join('')+(skips.length>50?'<div>… +'+(skips.length-50)+' more</div>':'')+'</div>' : '';
+    result+='<div style="margin-top:14px;padding-top:10px;border-top:1px solid '+C.border+';">'+
+      '<div style="font-size:12.5px;color:'+C.bright+';">Will import <b style="color:'+UP+';">'+pv.would_import+'</b> transaction'+(pv.would_import===1?'':'s')+'.</div>'+
+      skipBlock+
+      (rows?'<div style="margin-top:10px;font-size:9.5px;letter-spacing:0.5px;color:'+C.label+';">PREVIEW (first '+sample.length+')</div>'+rows:'')+
+      '</div>';
+  }
+  return '<div data-act="importClose" style="position:fixed;inset:0;z-index:60;background:rgba(3,5,8,0.84);display:flex;align-items:center;justify-content:center;padding:40px;"><div data-stopbg="1" style="background:'+C.panel+';border:1px solid #1A212B;border-radius:8px;padding:22px 24px;width:600px;max-width:94vw;max-height:88vh;overflow:auto;">'+
+    '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;"><span style="font-size:13px;letter-spacing:1px;color:'+C.amber+';">IMPORT TRANSACTIONS</span><button data-act="importClose" style="font-family:inherit;font-size:12px;color:'+C.label+';background:transparent;border:1px solid #1A212B;border-radius:3px;padding:4px 12px;cursor:pointer;">✕ ESC</button></div>'+
+    '<div style="font-size:9.5px;letter-spacing:1px;color:'+C.label+';margin-bottom:5px;">BROKER FORMAT</div>'+
+    '<select id="importfmt" style="width:100%;background:'+C.bg+';border:1px solid '+C.border+';border-radius:4px;color:'+C.bright+';font-family:inherit;font-size:13px;padding:8px 10px;outline:none;margin-bottom:12px;">'+fmtOpts+'</select>'+
+    '<div style="font-size:9.5px;letter-spacing:1px;color:'+C.label+';margin-bottom:5px;">CSV FILE</div>'+
+    '<input id="importfile" type="file" accept=".csv,text/csv,text/plain" style="width:100%;color:'+C.body+';font-family:inherit;font-size:11.5px;margin-bottom:10px;">'+
+    '<div style="font-size:9.5px;letter-spacing:1px;color:'+C.label+';margin-bottom:5px;">OR PASTE CSV</div>'+
+    '<textarea id="importtext" placeholder="paste rows here — broker exports can be pasted raw, preamble and all" style="width:100%;height:120px;resize:vertical;background:'+C.bg+';border:1px solid '+C.border+';border-radius:4px;color:'+C.bright+';font-family:inherit;font-size:11.5px;padding:9px 10px;outline:none;box-sizing:border-box;">'+esc(S.importText)+'</textarea>'+
+    '<div style="margin-top:8px;font-size:10.5px;color:'+C.faint+';line-height:1.5;">Generic header: <span style="color:'+C.label+';">kind,symbol,qty,price,fees,taxes,ts,note</span> · kinds: deposit/withdrawal/buy/sell/dividend/split. Nothing is written until you confirm.</div>'+
+    result+
+    '<div style="display:flex;gap:8px;margin-top:16px;justify-content:flex-end;">'+
+      '<button data-act="importPreview"'+(busy?' disabled':'')+' style="font-family:inherit;font-size:11px;color:'+C.text+';background:transparent;border:1px solid '+C.border+';border-radius:4px;padding:8px 16px;cursor:'+(busy?'default':'pointer')+';opacity:'+(busy?'0.5':'1')+';">'+(busy?'WORKING…':'PREVIEW')+'</button>'+
+      (pv?'<button data-act="importConfirm"'+(busy?' disabled':'')+' style="font-family:inherit;font-size:11px;font-weight:600;color:'+UP+';background:rgba(47,191,113,0.1);border:1px solid rgba(47,191,113,0.4);border-radius:4px;padding:8px 16px;cursor:'+(busy?'default':'pointer')+';">CONFIRM IMPORT ('+pv.would_import+')</button>':'')+
+    '</div></div></div>';
+}
+
 function overlays(){
   let html='';
+  html += importModal();
   if(S.showHelp){
     const rows=[['Focus command bar','/'],['Stage order from command','b 10 nvda ↵'],['Set ticket side','B / S'],['Switch view','1 – 7'],['Move position selection','↑ ↓  or  j k'],['Load selected into ticket','↵'],['Toggle this help','?'],['Clear / blur','Esc']];
     html += '<div data-act="closeHelp" style="position:fixed;inset:0;z-index:60;background:rgba(3,5,8,0.8);display:flex;align-items:center;justify-content:center;"><div style="background:'+C.panel+';border:1px solid #1A212B;border-radius:8px;padding:26px 30px;width:460px;max-width:90vw;"><div style="font-size:13px;letter-spacing:1px;color:'+C.amber+';margin-bottom:18px;">KEYBOARD SHORTCUTS</div><div style="display:flex;flex-direction:column;gap:11px;font-size:12.5px;">'+
@@ -773,9 +809,38 @@ async function act(name, arg){
     case 'reviewAlert': { const a=M.alerts.find(x=>x.id==arg); if(a&&a.draft){ stage(a.draft.side,a.sym,a.draft.qty,a.draft.order_type,a.draft.limit_price); toast('STAGED '+a.sym+' FROM ALERT — REVIEW & PLACE'); } break; }
     case 'stageRec': { const r=M.recs.find(x=>x.id==arg); if(r){ const side=r.action==='BUY'?'buy':'sell'; stage(side,r.sym,r.action==='TRIM'?10:5,'market'); toast('STAGED '+r.sym+' FROM ANALYST — REVIEW & PLACE'); try{ await japi('POST','/api/recommendations/'+arg+'/accept'); }catch(e){} } break; }
     case 'dropRec': try{ await japi('POST','/api/recommendations/'+arg+'/dismiss'); M.recs=M.recs.filter(r=>r.id!=arg); render(); }catch(e){ toast(e.message); } break;
+    case 'importOpen': S.importOpen=true; S.importPreview=null; S.importErr=''; render(); break;
+    case 'importClose': S.importOpen=false; render(); break;
+    case 'importPreview': doImportPreview(); break;
+    case 'importConfirm': doImportConfirm(); break;
     case 'briefingRun': try{ await japi('POST','/api/analyst/briefing'); toast('BRIEFING REQUESTED…'); setTimeout(reloadAnalyst,1500); }catch(e){ toast(e.message); } break;
     case 'reviewRun': try{ await japi('POST','/api/analyst/review'); toast('WEEKLY REVIEW REQUESTED…'); setTimeout(reloadAnalyst,2000); }catch(e){ toast(e.message); } break;
   }
+}
+// Raw-CSV POST (japi is JSON-only). dry=true previews without writing.
+async function jcsv(fmt, text, dry){
+  const r = await fetch('/api/import/csv?format='+encodeURIComponent(fmt)+(dry?'&dry_run=true':''), { method:'POST', headers:{'content-type':'text/csv'}, body:text });
+  const j = r.status===204 ? {} : await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(j.error || ('import '+r.status));
+  return j;
+}
+async function doImportPreview(){
+  const text=(S.importText||'').trim();
+  if(!text){ S.importErr='Choose a file or paste CSV first.'; S.importPreview=null; render(); return; }
+  S.importBusy=true; S.importErr=''; render();
+  try{ S.importPreview=await jcsv(S.importFmt, text, true); S.importErr=''; }
+  catch(e){ S.importPreview=null; S.importErr=e.message; }
+  S.importBusy=false; render();
+}
+async function doImportConfirm(){
+  const text=(S.importText||'').trim(); if(!text || !S.importPreview) return;
+  S.importBusy=true; S.importErr=''; render();
+  try{
+    const r=await jcsv(S.importFmt, text, false);
+    toast('IMPORTED '+r.imported+' TRANSACTION'+(r.imported===1?'':'S'));
+    S.importOpen=false; S.importPreview=null; S.importText=''; S.importBusy=false;
+    await loadAll(); // import flows into positions, performance, taxes
+  }catch(e){ S.importErr=e.message; S.importBusy=false; render(); }
 }
 async function reloadAnalyst(){ try{ applyAnalyst(await jget('/api/analyst')); render(); }catch(e){} }
 async function reloadTax(){ try{ applyTax(await jget('/api/taxes?year='+M.taxYear)); render(); }catch(e){} }
@@ -787,7 +852,7 @@ document.addEventListener('click', (e)=>{
   // Overlay backdrops (closeExpand/closeHelp) close only when the backdrop
   // itself is clicked or the explicit ✕ button — not when clicking the
   // panel content inside them.
-  if((name==='closeExpand'||name==='closeHelp') && e.target!==el && el.tagName!=='BUTTON') return;
+  if((name==='closeExpand'||name==='closeHelp'||name==='importClose') && e.target!==el && el.tagName!=='BUTTON') return;
   act(name, el.getAttribute('data-arg'));
 });
 document.addEventListener('input', (e)=>{
@@ -796,10 +861,17 @@ document.addEventListener('input', (e)=>{
   if(id==='tSym'){ S.tSym=e.target.value.toUpperCase(); patchTicket(); return; }
   if(id==='tQty'){ S.tQty=e.target.value; patchTicket(); return; }
   if(id==='tLimit'){ S.tLimit=e.target.value; patchTicket(); return; }
+  if(id==='importtext'){ S.importText=e.target.value; return; } // stored; no render (keeps caret)
   if(id==='__taxyear'){ }
 });
 document.addEventListener('change', (e)=>{
-  if(e.target.getAttribute && e.target.getAttribute('data-act')==='taxYear'){ M.taxYear=Number(e.target.value); reloadTax(); }
+  if(e.target.getAttribute && e.target.getAttribute('data-act')==='taxYear'){ M.taxYear=Number(e.target.value); reloadTax(); return; }
+  if(e.target.id==='importfmt'){ S.importFmt=e.target.value; S.importPreview=null; S.importErr=''; render(); return; }
+  if(e.target.id==='importfile'){
+    const f=e.target.files && e.target.files[0];
+    if(f){ f.text().then(t=>{ S.importText=t; S.importPreview=null; S.importErr=''; render(); }).catch(()=>{ S.importErr='Could not read that file.'; render(); }); }
+    return;
+  }
 });
 // lightweight ticket re-render on input (avoids losing focus via full render)
 function patchTicket(){ /* full render preserves focus by id; cheap enough */ render(); }
@@ -807,7 +879,7 @@ function patchTicket(){ /* full render preserves focus by id; cheap enough */ re
 document.addEventListener('keydown', (e)=>{
   const tag=(e.target.tagName||'').toLowerCase(); const typing=tag==='input'||tag==='textarea'||tag==='select';
   if(e.key==='/' && !typing){ e.preventDefault(); const c=$('cmd'); if(c) c.focus(); return; }
-  if(e.key==='Escape'){ if(S.expanded){ S.expanded=null; render(); } else if(S.showHelp){ S.showHelp=false; render(); } else if(e.target.id==='cmd'){ S.cmd=''; e.target.blur(); render(); } return; }
+  if(e.key==='Escape'){ if(S.importOpen){ S.importOpen=false; render(); } else if(S.expanded){ S.expanded=null; render(); } else if(S.showHelp){ S.showHelp=false; render(); } else if(e.target.id==='cmd'){ S.cmd=''; e.target.blur(); render(); } return; }
   if(e.target.id==='cmd' && e.key==='Enter'){ runCmd(S.cmd); render(); return; }
   if(typing) return;
   if(e.key==='?'){ e.preventDefault(); S.showHelp=!S.showHelp; render(); return; }

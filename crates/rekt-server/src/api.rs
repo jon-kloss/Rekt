@@ -205,6 +205,10 @@ pub async fn delete_tx(
 pub struct ImportQuery {
     #[serde(default)]
     pub format: Option<String>,
+    /// When true, parse + validate the full ledger replay but insert nothing,
+    /// returning what WOULD be imported. Powers the UI's preview-then-confirm.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
 }
 
 /// CSV import. `?format=generic` (default) takes the native header
@@ -273,6 +277,31 @@ pub async fn import_csv(
 
     let _guard = state.mutations.lock().await;
     validate_with(&state, &new_txs, Some(&new_tx_lines)).await?;
+
+    // Preview: everything is parsed and the full ledger replay validated, but
+    // nothing is written. Return a sample so the UI can show what will land.
+    if query.dry_run.unwrap_or(false) {
+        let sample: Vec<serde_json::Value> = new_txs
+            .iter()
+            .take(20)
+            .map(|tx| {
+                serde_json::json!({
+                    "kind": tx.kind.as_str(),
+                    "symbol": tx.symbol,
+                    "qty": tx.qty,
+                    "price": tx.price,
+                    "ts": tx.ts,
+                })
+            })
+            .collect();
+        return Ok(Json(serde_json::json!({
+            "dry_run": true,
+            "would_import": new_txs.len(),
+            "skipped": skipped,
+            "sample": sample,
+        })));
+    }
+
     repo::insert_txs(&state.db, &new_txs)
         .await
         .map_err(internal)?;

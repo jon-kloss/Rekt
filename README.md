@@ -67,6 +67,29 @@ scheduled briefing/review), and guardrails:
 `REKT_MAX_DAILY_LOSS` (circuit breaker on new buys, default 1000;
 ≤0 disables).
 
+## Bringing over your portfolio
+
+REKT is a transaction ledger: you import your **activity history** (deposits,
+buys, sells, dividends) and it replays them into positions, cost basis, P&L,
+and tax lots. Import the full history for accurate realized gains and
+wash-sale handling — a snapshot of current holdings alone won't reconstruct
+those.
+
+Use the **⬆ IMPORT CSV** button on the Blotter tab. Pick a format — **Generic**
+(REKT's native `kind,symbol,qty,price,fees,taxes,ts,note`) or a broker export
+(**Fidelity**, **Schwab**, **Robinhood**, **Interactive Brokers**) — drop in a
+file or paste the CSV, then **Preview** to see exactly what will import and what
+gets skipped (and why) before you **Confirm**. Broker exports can be pasted raw,
+preamble and all; rows that aren't portfolio transactions (interest, fees,
+options, journal entries) are reported as skips, never silently dropped. The
+same thing is scriptable: `POST /api/import/csv?format=robinhood`
+(add `&dry_run=true` for the preview).
+
+Two broker-specific notes: **splits** are reported but not auto-applied (broker
+exports give a share delta, not a clean ratio — enter them manually), and
+**Robinhood crypto** trades use the same buy/sell codes as equities and would
+import as if they were stocks, so review the preview before confirming.
+
 ## Running it for real
 
 Deployment (systemd), reverse-proxy + TLS, the SQLite backup/restore
