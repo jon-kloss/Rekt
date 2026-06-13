@@ -566,6 +566,7 @@ async fn start_run(
     kind: &str,
     question: Option<String>,
 ) -> Result<i64, ApiError> {
+    tracing::debug!(kind, "analyst run requested");
     if state.analyst.is_none() {
         return Err(err(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -611,6 +612,14 @@ async fn start_run(
             return Err(internal(e));
         }
     };
+    tracing::debug!(
+        analysis = id,
+        kind,
+        model,
+        spent = %spent,
+        budget = %state.ai_budget,
+        "analyst run spawned"
+    );
     let job_state = state.clone();
     let job_kind = kind.to_string();
     tokio::spawn(async move {

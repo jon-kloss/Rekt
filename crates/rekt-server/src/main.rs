@@ -118,16 +118,39 @@ async fn ws_upgrade(State(state): State<AppState>, upgrade: WebSocketUpgrade) ->
     upgrade.on_upgrade(move |socket| live::client_ws(socket, state))
 }
 
+/// Seconds since the process anchored its start clock. Uses a process-wide
+/// `OnceLock` so it survives without threading a field through `AppState`;
+/// `main` touches it at boot so real uptime starts there (a test that only
+/// hits `/health` anchors on first call, which is fine).
+fn uptime_seconds() -> u64 {
+    static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    STARTED
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs()
+}
+
+/// Liveness + readiness probe. `status` is the liveness signal (`degraded`
+/// when the DB is unreachable); `components` is an honest readiness map so
+/// an operator can confirm exactly which optional features their env wired
+/// up — no secrets, just present/absent.
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let db_ok = sqlx::query("SELECT 1").execute(&state.db).await.is_ok();
-    let market = match &state.market {
-        Some(provider) => provider.name(),
-        None => "unconfigured",
-    };
     Json(serde_json::json!({
         "status": if db_ok { "ok" } else { "degraded" },
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_seconds": uptime_seconds(),
         "db": db_ok,
-        "market_data": market,
+        "components": {
+            "market_data": match &state.market {
+                Some(provider) => provider.name(),
+                None => "unconfigured",
+            },
+            "daily_bars": state.bars.is_some(),
+            "trading_paper": state.broker.is_some(),
+            "ai_analyst": state.analyst.is_some(),
+            "alert_push": state.notify_url.is_some(),
+        },
     }))
 }
 
@@ -210,6 +233,8 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    uptime_seconds(); // anchor the uptime clock at process start
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "REKT starting");
 
     let db_path = std::env::var("REKT_DB").unwrap_or_else(|_| "rekt.db".into());
     let listen = std::env::var("REKT_LISTEN").unwrap_or_else(|_| "127.0.0.1:7777".into());
@@ -350,6 +375,7 @@ async fn main() -> anyhow::Result<()> {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
             loop {
                 tick.tick().await; // first tick is immediate
+                tracing::trace!("scheduler tick: reconciliation");
                 if let Err(e) = trading::reconcile(&recon_state).await {
                     tracing::error!(error = %e, "periodic reconciliation failed");
                 }
@@ -366,6 +392,7 @@ async fn main() -> anyhow::Result<()> {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(1800));
             loop {
                 tick.tick().await;
+                tracing::trace!("scheduler tick: candle backfill + EOD snapshot");
                 if let Err(e) = history::backfill_candles(&hist_state).await {
                     tracing::error!(error = %e, "candle backfill failed");
                 }
@@ -388,6 +415,7 @@ async fn main() -> anyhow::Result<()> {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(900));
             loop {
                 tick.tick().await;
+                tracing::trace!("scheduler tick: analyst auto-run check");
                 if let Err(e) = analyst::maybe_scheduled_runs(&ai_state).await {
                     tracing::error!(error = %e, "scheduled analyst run failed");
                 }
@@ -405,6 +433,7 @@ async fn main() -> anyhow::Result<()> {
             let mut drawdowns = alerts::DrawdownCache::default();
             loop {
                 tick.tick().await;
+                tracing::trace!("scheduler tick: alert evaluation");
                 if let Err(e) = alerts::evaluate_alerts(&alert_state, &mut drawdowns).await {
                     tracing::error!(error = %e, "alert evaluation failed");
                 }
@@ -486,7 +515,14 @@ mod tests {
         let (status, json) = request(test_state().await, "GET", "/api/health", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["status"], "ok");
-        assert_eq!(json["market_data"], "unconfigured");
+        assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+        assert!(json["uptime_seconds"].is_u64());
+        // Readiness map: the bare test_state wires no optional components.
+        assert_eq!(json["components"]["market_data"], "unconfigured");
+        assert_eq!(json["components"]["daily_bars"], false);
+        assert_eq!(json["components"]["trading_paper"], false);
+        assert_eq!(json["components"]["ai_analyst"], false);
+        assert_eq!(json["components"]["alert_push"], false);
     }
 
     #[tokio::test]

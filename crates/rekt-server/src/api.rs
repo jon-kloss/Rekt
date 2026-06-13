@@ -161,6 +161,7 @@ pub async fn create_tx(
     State(state): State<AppState>,
     Json(input): Json<TxInput>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    tracing::debug!(kind = %input.kind, symbol = ?input.symbol, "POST /api/transactions");
     let new_tx = input
         .into_new_tx(repo::TxSource::Manual)
         .map_err(|m| err(StatusCode::UNPROCESSABLE_ENTITY, m))?;
@@ -220,6 +221,7 @@ pub async fn import_csv(
     body: String,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let format = query.format.as_deref().unwrap_or("generic");
+    tracing::debug!(format, bytes = body.len(), "POST /api/import/csv");
     // Every input carries its 1-based line number in the ORIGINAL file so
     // both parse and validation errors point at the same line the user
     // sees in their editor (header = line 1 for generic; presets track
@@ -276,6 +278,12 @@ pub async fn import_csv(
         .map_err(internal)?;
     state.live.bump_tx_revision();
     live::refresh_symbols(&state).await.map_err(internal)?;
+    tracing::debug!(
+        format,
+        imported = new_txs.len(),
+        skipped = skipped.len(),
+        "csv import complete"
+    );
     Ok(Json(
         serde_json::json!({ "imported": new_txs.len(), "skipped": skipped }),
     ))
@@ -347,6 +355,8 @@ pub async fn watchlist_list(State(state): State<AppState>) -> Result<Json<Vec<St
 /// Seeds REST quotes for any unpriced held symbols so the dashboard isn't
 /// blank before (or without) the live stream.
 pub async fn portfolio(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    // trace (not debug): the dashboard polls this on a short interval.
+    tracing::trace!("GET /api/portfolio");
     live::refresh_symbols(&state).await.map_err(internal)?;
     let symbols: Vec<String> = state.symbols.borrow().clone();
     live::seed_missing_quotes(&state, &symbols).await;

@@ -156,7 +156,9 @@ pub async fn watchlist_add(pool: &SqlitePool, symbol: &str) -> Result<bool> {
             .execute(&mut *dbtx)
             .await?;
     dbtx.commit().await?;
-    Ok(result.rows_affected() > 0)
+    let added = result.rows_affected() > 0;
+    tracing::debug!(symbol, added, "watchlist_add");
+    Ok(added)
 }
 
 /// Remove a symbol from the watchlist. Returns false if it wasn't there.
@@ -168,7 +170,9 @@ pub async fn watchlist_remove(pool: &SqlitePool, symbol: &str) -> Result<bool> {
     .bind(symbol.to_uppercase())
     .execute(pool)
     .await?;
-    Ok(result.rows_affected() > 0)
+    let removed = result.rows_affected() > 0;
+    tracing::debug!(symbol, removed, "watchlist_remove");
+    Ok(removed)
 }
 
 /// Find-or-create an instrument row for a symbol; returns its id.
@@ -224,7 +228,16 @@ pub async fn insert_one(conn: &mut SqliteConnection, tx: &NewTx) -> Result<i64> 
     .bind(tx.mode)
     .execute(&mut *conn)
     .await?;
-    Ok(result.last_insert_rowid())
+    let id = result.last_insert_rowid();
+    tracing::debug!(
+        id,
+        kind = tx.kind.as_str(),
+        symbol = tx.symbol.as_deref().unwrap_or("-"),
+        mode = tx.mode,
+        source = tx.source.as_str(),
+        "tx inserted"
+    );
+    Ok(id)
 }
 
 /// Insert a batch atomically: one SQL transaction, all rows or none.
@@ -277,6 +290,7 @@ pub async fn upsert_candles(pool: &SqlitePool, symbol: &str, candles: &[Candle])
         .rows_affected();
     }
     dbtx.commit().await?;
+    tracing::debug!(symbol, candles = candles.len(), written, "upsert_candles");
     Ok(written)
 }
 
@@ -415,6 +429,7 @@ pub async fn upsert_snapshot(
     .bind(realized_pnl.to_string())
     .execute(pool)
     .await?;
+    tracing::debug!(%date, mode, total_value = %total_value, "upsert_snapshot");
     Ok(())
 }
 
@@ -513,7 +528,9 @@ pub async fn insert_alert(
     .execute(&mut *dbtx)
     .await?;
     dbtx.commit().await?;
-    Ok(result.last_insert_rowid())
+    let id = result.last_insert_rowid();
+    tracing::debug!(id, symbol, condition, threshold = %threshold, "alert inserted");
+    Ok(id)
 }
 
 /// Returns true if a row was deleted.
@@ -522,7 +539,9 @@ pub async fn delete_alert(pool: &SqlitePool, id: i64) -> Result<bool> {
         .bind(id)
         .execute(pool)
         .await?;
-    Ok(result.rows_affected() > 0)
+    let deleted = result.rows_affected() > 0;
+    tracing::debug!(id, deleted, "delete_alert");
+    Ok(deleted)
 }
 
 /// active → triggered, recording when and at what value. The status guard
@@ -537,7 +556,9 @@ pub async fn trigger_alert(pool: &SqlitePool, id: i64, observed: Decimal) -> Res
     .bind(id)
     .execute(pool)
     .await?;
-    Ok(result.rows_affected() > 0)
+    let triggered = result.rows_affected() > 0;
+    tracing::debug!(id, observed = %observed, triggered, "trigger_alert");
+    Ok(triggered)
 }
 
 /// triggered → dismissed. Returns false if the alert wasn't triggered.
@@ -547,7 +568,9 @@ pub async fn dismiss_alert(pool: &SqlitePool, id: i64) -> Result<bool> {
             .bind(id)
             .execute(pool)
             .await?;
-    Ok(result.rows_affected() > 0)
+    let dismissed = result.rows_affected() > 0;
+    tracing::debug!(id, dismissed, "dismiss_alert");
+    Ok(dismissed)
 }
 
 /// Any status → active again, clearing the trigger record.
@@ -559,7 +582,9 @@ pub async fn rearm_alert(pool: &SqlitePool, id: i64) -> Result<bool> {
     .bind(id)
     .execute(pool)
     .await?;
-    Ok(result.rows_affected() > 0)
+    let rearmed = result.rows_affected() > 0;
+    tracing::debug!(id, rearmed, "rearm_alert");
+    Ok(rearmed)
 }
 
 /// One AI analysis run, with full cost accounting.
@@ -618,7 +643,9 @@ pub async fn insert_analysis(
             .bind(question)
             .execute(pool)
             .await?;
-    Ok(result.last_insert_rowid())
+    let id = result.last_insert_rowid();
+    tracing::debug!(id, kind, model, "analysis row inserted (running)");
+    Ok(id)
 }
 
 pub struct AnalysisOutcome<'a> {
@@ -661,6 +688,12 @@ pub async fn finish_analysis(
     .bind(id)
     .execute(pool)
     .await?;
+    tracing::debug!(
+        id,
+        status = if outcome.error.is_some() { "error" } else { "done" },
+        cost_usd = %outcome.cost_usd,
+        "analysis finished"
+    );
     Ok(())
 }
 
@@ -762,7 +795,15 @@ pub async fn insert_recommendation(pool: &SqlitePool, rec: NewRecommendation<'_>
     .execute(&mut *dbtx)
     .await?;
     dbtx.commit().await?;
-    Ok(result.last_insert_rowid())
+    let id = result.last_insert_rowid();
+    tracing::debug!(
+        id,
+        analysis_id = rec.analysis_id,
+        symbol = rec.symbol,
+        action = rec.action,
+        "recommendation inserted"
+    );
+    Ok(id)
 }
 
 /// Recommendations, newest first. Expiry is COMPUTED at read time (a pure
@@ -816,7 +857,9 @@ pub async fn set_recommendation_status(pool: &SqlitePool, id: i64, status: &str)
     .bind(Utc::now().to_rfc3339())
     .execute(pool)
     .await?;
-    Ok(result.rows_affected() > 0)
+    let changed = result.rows_affected() > 0;
+    tracing::debug!(id, status, changed, "set_recommendation_status");
+    Ok(changed)
 }
 
 /// Durable key/value settings (e.g. the trading pause switch).
@@ -834,6 +877,7 @@ pub async fn set_setting(pool: &SqlitePool, key: &str, value: &str) -> Result<()
         .bind(value)
         .execute(pool)
         .await?;
+    tracing::debug!(key, value, "set_setting");
     Ok(())
 }
 
@@ -843,5 +887,7 @@ pub async fn delete_tx(pool: &SqlitePool, id: i64) -> Result<bool> {
         .bind(id)
         .execute(pool)
         .await?;
-    Ok(result.rows_affected() > 0)
+    let deleted = result.rows_affected() > 0;
+    tracing::debug!(id, deleted, "delete_tx");
+    Ok(deleted)
 }

@@ -457,11 +457,23 @@ watchlist     (instrument_id, added_ts)
   stocks/ETFs only. Rounds out the broker preset set (Fidelity, Schwab,
   IBKR).
 
+### Phase 10 — Hardening toward v1.0
+- `/api/health` enriched into a liveness + readiness probe (version,
+  uptime, per-component readiness map) for monitoring; version logged at
+  boot. Consolidate, not expand.
+- `docs/OPERATIONS.md`: systemd deployment, reverse-proxy + TLS, the
+  SQLite WAL backup/restore procedure (`VACUUM INTO`, safe while live),
+  upgrades, monitoring, security posture, and the **live-trading
+  enablement design** (separate creds, explicit opt-in, kill-switch + real
+  fee ingestion, soak-first) — wiring deferred by design, not unfinished.
+
 ### Backlog (post-v1, demand-validated by research)
 - Options tracking (expands the locked stocks-&-ETFs scope — needs its own
   planning pass: data sources, OCC symbology, exercise/assignment flows).
 - Full net-worth aggregation (other accounts, cash, real estate).
 - Additional cost-basis strategies (average, specific-lot, ACB).
+- Live-trading toggle + live fee ingestion (per OPERATIONS.md design, after
+  a paper soak).
 
 ## 9. Risks & open questions
 

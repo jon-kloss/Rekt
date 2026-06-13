@@ -168,6 +168,14 @@ impl HttpTransport {
         &self,
         request: &serde_json::Value,
     ) -> Result<MessageResponse, AnalystError> {
+        // The API key is an `x-api-key` header; neither it nor the prompt
+        // body is logged — only the non-sensitive request shape.
+        tracing::debug!(
+            model = request["model"].as_str().unwrap_or("?"),
+            max_tokens = request["max_tokens"].as_u64().unwrap_or(0),
+            tools = request["tools"].as_array().map(|t| t.len()).unwrap_or(0),
+            "POST /v1/messages"
+        );
         let response = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
@@ -180,6 +188,7 @@ impl HttpTransport {
             .map_err(|e| AnalystError::Network(e.to_string()))?;
 
         let status = response.status();
+        tracing::debug!(status = %status, "messages response");
         match status.as_u16() {
             401 => Err(AnalystError::Auth),
             429 => Err(AnalystError::RateLimited),
@@ -195,10 +204,19 @@ impl HttpTransport {
                     .unwrap_or(body);
                 Err(AnalystError::Api { status: s, message })
             }
-            _ => response
-                .json()
-                .await
-                .map_err(|e| AnalystError::BadResponse(e.to_string())),
+            _ => {
+                let parsed: MessageResponse = response
+                    .json()
+                    .await
+                    .map_err(|e| AnalystError::BadResponse(e.to_string()))?;
+                tracing::debug!(
+                    stop_reason = parsed.stop_reason.as_deref().unwrap_or("?"),
+                    input_tokens = parsed.usage.input_tokens,
+                    output_tokens = parsed.usage.output_tokens,
+                    "messages parsed"
+                );
+                Ok(parsed)
+            }
         }
     }
 }

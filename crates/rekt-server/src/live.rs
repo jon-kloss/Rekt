@@ -133,6 +133,8 @@ impl Live {
     /// Test hook: inject a price as if a tick had arrived.
     #[cfg(test)]
     pub async fn set_price(&self, symbol: &str, price: Decimal) {
+        // trace, not debug: one per inbound trade tick.
+        tracing::trace!(symbol, price = %price, "price tick");
         self.prices.write().await.insert(
             symbol.to_uppercase(),
             CacheEntry {
@@ -302,6 +304,9 @@ pub fn start(state_factory: impl FnOnce(LiveHandles) -> AppState) -> AppState {
             }
             match portfolio_snapshot(&bcast_state).await {
                 Ok(snapshot) => {
+                    let receivers = bcast_state.snapshots.receiver_count();
+                    // trace, not debug: this fires up to once a second.
+                    tracing::trace!(receivers, "broadcasting portfolio snapshot");
                     let _ = bcast_state.snapshots.send(snapshot.to_string());
                 }
                 Err(e) => tracing::error!(error = %e, "snapshot recompute failed"),
@@ -505,6 +510,7 @@ pub async fn portfolio_snapshot(state: &AppState) -> anyhow::Result<serde_json::
 
 /// Browser websocket: send one snapshot immediately, then forward broadcasts.
 pub async fn client_ws(socket: WebSocket, state: AppState) {
+    tracing::debug!("websocket client connected");
     let mut socket = socket;
     if let Ok(snapshot) = portfolio_snapshot(&state).await {
         if socket
