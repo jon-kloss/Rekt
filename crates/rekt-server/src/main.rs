@@ -71,6 +71,7 @@ fn app(state: AppState) -> Router {
         .route("/api/transactions/{id}", delete(api::delete_tx))
         .route("/api/import/csv", post(api::import_csv))
         .route("/api/history", get(history::history))
+        .route("/api/candles", get(history::candles))
         .route("/api/taxes", get(taxes::taxes))
         .route("/api/taxes/csv", get(taxes::taxes_csv))
         .route(
@@ -1770,6 +1771,48 @@ Trades,Data,Order,Equity and Index Options,USD,AAPL 240920C,\"2026-06-10, 10:30:
         assert_eq!(json["short"]["reportable"], "0");
         // With no transactions, the only offered year is the current one.
         assert_eq!(json["years"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn candles_endpoint_serves_ohlcv_oldest_first() {
+        let state = test_state().await;
+        let dec = |s: &str| s.parse::<rust_decimal::Decimal>().unwrap();
+        let candle = |y, mo, d, o: &str, h: &str, l: &str, c: &str, v| rekt_core::Candle {
+            date: chrono::NaiveDate::from_ymd_opt(y, mo, d).unwrap(),
+            open: dec(o),
+            high: dec(h),
+            low: dec(l),
+            close: dec(c),
+            volume: v,
+        };
+        repo::upsert_candles(
+            &state.db,
+            "AAPL",
+            &[
+                candle(2026, 6, 10, "150", "152", "149", "151", 1000),
+                candle(2026, 6, 11, "151", "155", "151", "154", 1200),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let (status, json) = request(state.clone(), "GET", "/api/candles?symbol=aapl", None).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["symbol"], "AAPL");
+        assert_eq!(json["timeframe"], "daily");
+        let rows = json["candles"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        // Oldest first; compact o/h/l/c/v keys.
+        assert_eq!(rows[0]["date"], "2026-06-10");
+        assert_eq!(rows[0]["o"], "150");
+        assert_eq!(rows[0]["c"], "151");
+        assert_eq!(rows[1]["c"], "154");
+        assert_eq!(rows[1]["v"], 1200);
+
+        // A symbol with no stored candles is an empty (not error) series.
+        let (status, json) = request(state, "GET", "/api/candles?symbol=ZZZZ", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["candles"].as_array().unwrap().is_empty());
     }
 
     /// Post a transaction and assert it was created. The end-to-end tests

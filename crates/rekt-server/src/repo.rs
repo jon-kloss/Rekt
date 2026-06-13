@@ -367,6 +367,38 @@ pub async fn recent_closes(pool: &SqlitePool, symbol: &str, limit: i64) -> Resul
     Ok(closes)
 }
 
+/// Most recent `limit` full OHLCV candles for one symbol, oldest first —
+/// powers the Terminal UI's per-symbol candlestick chart.
+pub async fn recent_candles(pool: &SqlitePool, symbol: &str, limit: i64) -> Result<Vec<Candle>> {
+    let rows = sqlx::query(
+        r#"SELECT c.date, c.open, c.high, c.low, c.close, c.volume FROM candles c
+           JOIN instruments i ON i.id = c.instrument_id
+           WHERE i.symbol = ? ORDER BY c.date DESC LIMIT ?"#,
+    )
+    .bind(symbol)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    let mut candles: Vec<Candle> = rows
+        .into_iter()
+        .map(|r| -> Result<Candle> {
+            Ok(Candle {
+                date: r
+                    .get::<String, _>("date")
+                    .parse()
+                    .context("corrupt candle date")?,
+                open: parse_dec(&r.get::<String, _>("open"), "candles.open")?,
+                high: parse_dec(&r.get::<String, _>("high"), "candles.high")?,
+                low: parse_dec(&r.get::<String, _>("low"), "candles.low")?,
+                close: parse_dec(&r.get::<String, _>("close"), "candles.close")?,
+                volume: r.get::<i64, _>("volume"),
+            })
+        })
+        .collect::<Result<_>>()?;
+    candles.reverse(); // oldest first for charting
+    Ok(candles)
+}
+
 /// True if an EOD snapshot exists for the given date+mode.
 pub async fn has_snapshot(pool: &SqlitePool, date: NaiveDate, mode: &str) -> Result<bool> {
     let row = sqlx::query("SELECT 1 FROM snapshots WHERE date = ? AND mode = ?")
