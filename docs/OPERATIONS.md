@@ -27,7 +27,8 @@ errors or `None`, never fabricated data.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `REKT_DB` | `rekt.db` | SQLite file path |
+| `REKT_DB` | `rekt.db` | SQLite file path (the default/"real" portfolio — see Multiple portfolios) |
+| `REKT_DATA_DIR` | parent of `REKT_DB` | directory holding the portfolio registry + per-portfolio DB files |
 | `REKT_LISTEN` | `127.0.0.1:7777` | bind address (loopback by default — see Security) |
 | `FINNHUB_API_KEY` | — | live quotes + trade stream; falls back to Alpaca data |
 | `ALPACA_PAPER_KEY` / `ALPACA_PAPER_SECRET` | — | **paper** trading + daily bars |
@@ -41,6 +42,45 @@ errors or `None`, never fabricated data.
 | `REKT_MAX_ORDERS_PER_DAY` | `20` | daily order count cap |
 | `REKT_MAX_DAILY_LOSS` | `1000` | circuit breaker on new buys (`≤0` disables) |
 | `RUST_LOG` | `info` | tracing filter (e.g. `rekt_server=debug,info`) |
+
+## Multiple portfolios
+
+REKT serves **one portfolio at a time**, but you can keep several side by side —
+e.g. a `test` portfolio for experimenting and your `real` data — and switch
+between them from the header dropdown. Each portfolio is its own SQLite file, so
+the isolation of tracked data (holdings, imports, analyses, taxes, alerts,
+orders, candles) is **total** — test activity can never touch real data.
+
+**How it works.** A small registry, `<data_dir>/portfolios.json`, records the
+named portfolios and which is active (`data_dir` = `REKT_DATA_DIR`, else the
+parent of `REKT_DB`). Your existing `REKT_DB` becomes the default portfolio,
+`real`, untouched — and `portfolios.json` isn't even written until you create a
+second portfolio, so single-portfolio installs are unchanged. New portfolios get
+their own file under `<data_dir>/portfolios/<name>.db`, created (with migrations)
+the first time it's opened.
+
+**Switching restarts the process.** Picking a portfolio re-execs the binary onto
+the chosen file (same PID on unix; the page reconnects in ~1s). This reuses the
+entire normal startup path instead of risking a live database swap — the cleanest
+possible isolation. A switch is refused while any order is still working; cancel
+or wait first. (Operators who prefer their supervisor to own restarts can run
+behind systemd; re-exec works there too, no unit change needed.)
+
+**Per-portfolio paper trading (optional).** The Alpaca **paper account is a
+single external account**, so by default every portfolio shares it — a paper
+order under `test` lands on the same broker positions as `real`. To give a
+portfolio its own paper account, set its keys by convention:
+`ALPACA_PAPER_KEY_<NAME>` / `ALPACA_PAPER_SECRET_<NAME>` (name upper-cased,
+dashes → underscores; e.g. `ALPACA_PAPER_KEY_TEST`). Keys are **never written to
+the registry** — they stay env-only. When present, that portfolio uses them;
+otherwise it falls back to the global `ALPACA_PAPER_KEY`/`_SECRET`.
+
+**Still shared across portfolios:** the Finnhub/market-data quota and the Claude
+analyst's auth + daily budget (`REKT_AI_DAILY_BUDGET` is *tracked* per-portfolio,
+but the underlying account/quota is one). Guardrail env limits are global too.
+
+**Backups:** each portfolio is an independent file — apply the backup guidance
+below per file, and back up the tiny `portfolios.json` alongside them.
 
 ## Deployment (systemd)
 

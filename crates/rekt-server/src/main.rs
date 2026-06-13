@@ -12,6 +12,7 @@ mod api;
 mod history;
 mod import;
 mod live;
+mod portfolios;
 mod repo;
 mod taxes;
 mod trading;
@@ -63,6 +64,10 @@ pub struct AppState {
     pub ai_budget: rust_decimal::Decimal,
     /// Single-flight latch: one analysis at a time.
     pub analyst_running: Arc<AtomicBool>,
+    /// The active portfolio's name (for display in health + the snapshot).
+    pub active_portfolio: String,
+    /// Directory holding the portfolio registry + per-portfolio DB files.
+    pub data_dir: std::path::PathBuf,
 }
 
 fn app(state: AppState) -> Router {
@@ -111,6 +116,11 @@ fn app(state: AppState) -> Router {
         .route("/api/orders/cancel_all", post(trading::cancel_all))
         .route("/api/trading/pause", post(trading::set_paused))
         .route("/api/broker/account", get(trading::account))
+        .route(
+            "/api/portfolios",
+            get(portfolios::list).post(portfolios::create),
+        )
+        .route("/api/portfolios/switch", post(portfolios::switch))
         .route("/api/ws", get(ws_upgrade))
         .with_state(state)
 }
@@ -146,6 +156,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_seconds": uptime_seconds(),
         "db": db_ok,
+        "active_portfolio": state.active_portfolio,
         "components": {
             "market_data": match &state.market {
                 Some(provider) => provider.name(),
@@ -241,11 +252,23 @@ async fn main() -> anyhow::Result<()> {
     uptime_seconds(); // anchor the uptime clock at process start
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "REKT starting");
 
-    let db_path = std::env::var("REKT_DB").unwrap_or_else(|_| "rekt.db".into());
     let listen = std::env::var("REKT_LISTEN").unwrap_or_else(|_| "127.0.0.1:7777".into());
 
-    let db = open_db(&db_path).await?;
-    tracing::info!(db = %db_path, "database ready, migrations applied");
+    // Resolve the active portfolio: one SQLite file per portfolio, selected by
+    // a registry outside any single DB. A switch re-execs this process, so this
+    // boot path serves whichever portfolio is active.
+    let data_dir = portfolios::data_dir();
+    let active = portfolios::load(&data_dir).active_entry().clone();
+    let active_portfolio = active.name.clone();
+    let db_path = portfolios::db_path_for(&data_dir, &active).map_err(|m| anyhow::anyhow!(m))?;
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let db_path_str = db_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 db path: {}", db_path.display()))?;
+    let db = open_db(db_path_str).await?;
+    tracing::info!(portfolio = %active_portfolio, db = %db_path.display(), "database ready, migrations applied");
 
     let finnhub_token = std::env::var("FINNHUB_API_KEY")
         .ok()
@@ -253,20 +276,24 @@ async fn main() -> anyhow::Result<()> {
 
     // Phase 2 ships PAPER ONLY (PLAN.md §4): live mode arrives behind an
     // explicit toggle after a paper soak, with separate key config.
-    let alpaca_keys = match (
-        std::env::var("ALPACA_PAPER_KEY")
-            .ok()
-            .filter(|k| !k.is_empty()),
-        std::env::var("ALPACA_PAPER_SECRET")
-            .ok()
-            .filter(|k| !k.is_empty()),
-    ) {
-        (Some(key), Some(secret)) => Some((key, secret)),
-        _ => {
-            tracing::warn!("ALPACA_PAPER_KEY/SECRET not set — trading disabled");
-            None
+    // Per-portfolio paper keys (ALPACA_PAPER_KEY_<NAME>) override the global
+    // pair, so each portfolio can have its own isolated paper-trading account.
+    let alpaca_keys = portfolios::resolve_alpaca_keys(&active_portfolio).or_else(|| {
+        match (
+            std::env::var("ALPACA_PAPER_KEY")
+                .ok()
+                .filter(|k| !k.is_empty()),
+            std::env::var("ALPACA_PAPER_SECRET")
+                .ok()
+                .filter(|k| !k.is_empty()),
+        ) {
+            (Some(key), Some(secret)) => Some((key, secret)),
+            _ => None,
         }
-    };
+    });
+    if alpaca_keys.is_none() {
+        tracing::warn!("ALPACA_PAPER_KEY/SECRET not set — trading disabled");
+    }
 
     // Quotes: Finnhub primary, Alpaca data API as the guaranteed fallback
     // (PLAN.md §3 — the trading account exists anyway).
@@ -383,6 +410,8 @@ async fn main() -> anyhow::Result<()> {
         analyst_cli,
         ai_budget,
         analyst_running: Arc::new(AtomicBool::new(false)),
+        active_portfolio,
+        data_dir,
     });
 
     // Subscribe the stream to currently held symbols from the start.
@@ -524,6 +553,8 @@ mod tests {
             analyst_cli: false,
             ai_budget: rust_decimal::Decimal::new(250, 2),
             analyst_running: Arc::new(AtomicBool::new(false)),
+            active_portfolio: "real".into(),
+            data_dir: std::path::PathBuf::from("."),
         }
     }
 
