@@ -207,7 +207,7 @@ pub struct ImportQuery {
 }
 
 /// CSV import. `?format=generic` (default) takes the native header
-/// `kind,symbol,qty,price,fees,taxes,ts,note`; `?format=fidelity|schwab`
+/// `kind,symbol,qty,price,fees,taxes,ts,note`; `?format=fidelity|schwab|ibkr`
 /// translates those brokers' activity exports (non-transaction rows like
 /// interest and journal entries are skipped and reported back).
 ///

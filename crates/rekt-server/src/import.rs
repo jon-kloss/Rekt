@@ -1,4 +1,4 @@
-//! Broker CSV presets (PLAN.md Phase 4): translate Fidelity and Schwab
+//! Broker CSV presets: translate Fidelity, Schwab, and Interactive Brokers
 //! activity exports into the generic transaction shape, for track-only
 //! accounts held outside Alpaca.
 //!
@@ -6,6 +6,8 @@
 //! import; rows a broker export legitimately contains but that aren't
 //! portfolio transactions (interest, journal entries, disclaimers) are
 //! SKIPPED and reported back — never silently dropped without a trace.
+
+use std::collections::HashMap;
 
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc};
 use chrono_tz::America::New_York;
@@ -26,8 +28,9 @@ pub fn parse_preset(format: &str, body: &str) -> Result<PresetParse, String> {
     match format {
         "fidelity" => parse_broker(body, &FIDELITY),
         "schwab" => parse_broker(body, &SCHWAB),
+        "ibkr" => parse_ibkr(body),
         other => Err(format!(
-            "unknown CSV format {other:?} (use generic, fidelity or schwab)"
+            "unknown CSV format {other:?} (use generic, fidelity, schwab or ibkr)"
         )),
     }
 }
@@ -152,9 +155,11 @@ fn parse_money(raw: &str) -> Result<Option<Decimal>, String> {
     Ok(Some(if negative { -value.abs() } else { value }))
 }
 
-/// "06/12/2026" (optionally "… as of 06/15/2026") → 4pm New York, as UTC.
+/// "06/12/2026" (Fidelity/Schwab, optionally "… as of 06/15/2026") or
+/// "2026-06-10, 10:30:00" (IBKR Date/Time) → 4pm New York, as UTC. The
+/// first space- or comma-delimited token is the date.
 fn parse_broker_date(raw: &str) -> Result<DateTime<Utc>, String> {
-    let first = raw.split_whitespace().next().unwrap_or("");
+    let first = raw.split([' ', ',']).find(|s| !s.is_empty()).unwrap_or("");
     let date = NaiveDate::parse_from_str(first, "%m/%d/%Y")
         .or_else(|_| NaiveDate::parse_from_str(first, "%Y-%m-%d"))
         .map_err(|_| format!("unparseable date {raw:?}"))?;
@@ -265,6 +270,243 @@ fn parse_broker(body: &str, preset: &BrokerPreset) -> Result<PresetParse, String
     Ok(PresetParse { rows, skipped })
 }
 
+/// Leading ticker of an IBKR dividend description, e.g.
+/// "AAPL(US0378331005) Cash Dividend USD 0.24 per Share" → "AAPL".
+fn ticker_prefix(desc: &str) -> Option<String> {
+    let ticker: String = desc
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '.')
+        .collect();
+    (!ticker.is_empty()).then_some(ticker)
+}
+
+/// A currency cell that is actually a section subtotal ("Total",
+/// "Total in USD") rather than a real ISO currency.
+fn is_total_row(currency: &str) -> bool {
+    currency.is_empty() || currency.to_ascii_uppercase().starts_with("TOTAL")
+}
+
+/// Interactive Brokers Activity Statement: a multi-section CSV where every
+/// row is prefixed with its section name and a row type ("Header"/"Data"/
+/// "SubTotal"/"Total"). Each section carries its own Header row, so a
+/// column means different things in different sections.
+///
+/// We translate the three transaction-bearing sections — Trades,
+/// Dividends, Deposits & Withdrawals — into the generic shape. Everything
+/// else (Open Positions, Net Asset Value, Account Information, …) is
+/// structural, not a transaction, and ignored. USD and stocks/ETFs only;
+/// options, forex, and non-USD rows are skipped and reported. Withholding
+/// tax is reported too (dividends import GROSS).
+fn parse_ibkr(body: &str) -> Result<PresetParse, String> {
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(body.as_bytes());
+
+    // Collect rows with their original file line (quoted Date/Time fields
+    // embed commas, so the csv reader — not a naive line split — owns
+    // tokenizing). Drop the leading BOM on the very first section name.
+    let mut records: Vec<(u64, Vec<String>)> = Vec::new();
+    for result in reader.records() {
+        let record = result.map_err(|e| format!("bad IBKR row: {e}"))?;
+        let line = record.position().map(|p| p.line()).unwrap_or(0);
+        let fields: Vec<String> = record
+            .iter()
+            .map(|s| s.trim().trim_start_matches('\u{feff}').to_string())
+            .collect();
+        if fields.len() >= 2 {
+            records.push((line, fields));
+        }
+    }
+
+    // Each section's Header row names its columns (offset by the leading
+    // section + row-type fields, so header column c is data field c + 2).
+    let mut headers: HashMap<String, Vec<String>> = HashMap::new();
+    for (_, f) in &records {
+        if f[1].eq_ignore_ascii_case("header") {
+            headers.insert(f[0].clone(), f[2..].to_vec());
+        }
+    }
+    if !["Trades", "Dividends", "Deposits & Withdrawals"]
+        .iter()
+        .any(|s| headers.contains_key(*s))
+    {
+        return Err(
+            "no IBKR Trades/Dividends/Deposits & Withdrawals sections found \
+             — is this an Interactive Brokers Activity Statement?"
+                .to_string(),
+        );
+    }
+
+    let value = |section: &str, f: &[String], name: &str| -> Option<String> {
+        let cols = headers.get(section)?;
+        let idx = cols.iter().position(|c| c.eq_ignore_ascii_case(name))?;
+        f.get(idx + 2).map(|s| s.trim().to_string())
+    };
+
+    // Trades come as order-level rows AND per-execution / per-lot detail
+    // rows; importing more than one discriminator double-counts. Prefer
+    // "Order" rows; fall back to "Trade" when a statement has no order
+    // grouping. "ClosedLot" detail is never a separate transaction.
+    let has_order = records.iter().any(|(_, f)| {
+        f[0] == "Trades"
+            && f[1] == "Data"
+            && value("Trades", f, "DataDiscriminator").as_deref() == Some("Order")
+    });
+    let preferred_disc = if has_order { "Order" } else { "Trade" };
+
+    let mut rows = Vec::new();
+    let mut skipped = Vec::new();
+    for (line, f) in &records {
+        if f[1] != "Data" {
+            continue; // Header / SubTotal / Total / Notes
+        }
+        let money = |name: &str,
+                     what: &str,
+                     section: &str,
+                     f: &[String]|
+         -> Result<Option<Decimal>, String> {
+            parse_money(value(section, f, name).as_deref().unwrap_or(""))
+                .map_err(|m| format!("line {line}: {what}: {m}"))
+        };
+        match f[0].as_str() {
+            "Trades" => {
+                let disc = value("Trades", f, "DataDiscriminator").unwrap_or_default();
+                if !disc.eq_ignore_ascii_case(preferred_disc) {
+                    continue; // duplicate execution / lot detail
+                }
+                let symbol = value("Trades", f, "Symbol").unwrap_or_default();
+                let asset = value("Trades", f, "Asset Category").unwrap_or_default();
+                if !asset.eq_ignore_ascii_case("Stocks") {
+                    skipped.push(format!(
+                        "line {line}: {symbol} ({asset}) — only stocks & ETFs import"
+                    ));
+                    continue;
+                }
+                let currency = value("Trades", f, "Currency").unwrap_or_default();
+                if !currency.eq_ignore_ascii_case("USD") {
+                    skipped.push(format!(
+                        "line {line}: {symbol} priced in {currency} — only USD imports"
+                    ));
+                    continue;
+                }
+                let Some(qty) = money("Quantity", "quantity", "Trades", f)? else {
+                    continue; // zero/blank quantity is not a trade
+                };
+                let date = value("Trades", f, "Date/Time").unwrap_or_default();
+                let ts = parse_broker_date(&date).map_err(|m| format!("line {line}: {m}"))?;
+                let fees = money("Comm/Fee", "commission", "Trades", f)?
+                    .unwrap_or_default()
+                    .abs();
+                rows.push((
+                    *line as usize,
+                    TxInput {
+                        // IBKR signs quantity: negative is a sale.
+                        kind: if qty.is_sign_negative() {
+                            "sell"
+                        } else {
+                            "buy"
+                        }
+                        .to_string(),
+                        symbol: Some(symbol),
+                        qty: Some(qty.abs()),
+                        price: money("T. Price", "price", "Trades", f)?,
+                        fees: Some(fees),
+                        taxes: None,
+                        ts: Some(ts),
+                        note: Some("ibkr: trade".to_string()),
+                    },
+                ));
+            }
+            "Dividends" => {
+                let currency = value("Dividends", f, "Currency").unwrap_or_default();
+                if is_total_row(&currency) {
+                    continue;
+                }
+                if !currency.eq_ignore_ascii_case("USD") {
+                    skipped.push(format!(
+                        "line {line}: dividend in {currency} — only USD imports"
+                    ));
+                    continue;
+                }
+                let desc = value("Dividends", f, "Description").unwrap_or_default();
+                let Some(amount) = money("Amount", "amount", "Dividends", f)? else {
+                    continue;
+                };
+                let Some(symbol) = ticker_prefix(&desc) else {
+                    skipped.push(format!("line {line}: dividend with no ticker in {desc:?}"));
+                    continue;
+                };
+                let date = value("Dividends", f, "Date").unwrap_or_default();
+                let ts = parse_broker_date(&date).map_err(|m| format!("line {line}: {m}"))?;
+                rows.push((
+                    *line as usize,
+                    TxInput {
+                        kind: "dividend".to_string(),
+                        symbol: Some(symbol),
+                        qty: None,
+                        price: Some(amount), // dividend cash; reversals stay negative
+                        fees: None,
+                        taxes: None,
+                        ts: Some(ts),
+                        note: Some("ibkr: dividend".to_string()),
+                    },
+                ));
+            }
+            "Deposits & Withdrawals" => {
+                let currency = value("Deposits & Withdrawals", f, "Currency").unwrap_or_default();
+                if is_total_row(&currency) {
+                    continue;
+                }
+                if !currency.eq_ignore_ascii_case("USD") {
+                    skipped.push(format!(
+                        "line {line}: cash movement in {currency} — only USD imports"
+                    ));
+                    continue;
+                }
+                let Some(amount) = money("Amount", "amount", "Deposits & Withdrawals", f)? else {
+                    continue;
+                };
+                let date = value("Deposits & Withdrawals", f, "Settle Date").unwrap_or_default();
+                let ts = parse_broker_date(&date).map_err(|m| format!("line {line}: {m}"))?;
+                rows.push((
+                    *line as usize,
+                    TxInput {
+                        kind: if amount.is_sign_negative() {
+                            "withdrawal"
+                        } else {
+                            "deposit"
+                        }
+                        .to_string(),
+                        symbol: None,
+                        qty: None,
+                        price: Some(amount.abs()),
+                        fees: None,
+                        taxes: None,
+                        ts: Some(ts),
+                        note: Some("ibkr: cash".to_string()),
+                    },
+                ));
+            }
+            "Withholding Tax" => {
+                // Dividends import gross; withholding is cash the user can
+                // reconcile separately. Reported, never silently dropped.
+                let currency = value("Withholding Tax", f, "Currency").unwrap_or_default();
+                if is_total_row(&currency) {
+                    continue;
+                }
+                let desc = value("Withholding Tax", f, "Description").unwrap_or_default();
+                skipped.push(format!(
+                    "line {line}: withholding tax {desc:?} (dividends import gross)"
+                ));
+            }
+            _ => {} // structural section — not a transaction
+        }
+    }
+    Ok(PresetParse { rows, skipped })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,6 +533,81 @@ mod tests {
         let ts = parse_broker_date("06/12/2026").unwrap();
         assert_eq!(ts.to_rfc3339(), "2026-06-12T20:00:00+00:00");
         assert!(parse_broker_date("12 Jun 2026").is_err());
+        // IBKR "Date/Time" with a comma between date and time.
+        let ts = parse_broker_date("2026-06-10, 10:30:00").unwrap();
+        assert_eq!(ts.to_rfc3339(), "2026-06-10T20:00:00+00:00");
+    }
+
+    #[test]
+    fn ibkr_activity_statement_maps_three_sections() {
+        let csv = "\
+Statement,Header,Field Name,Field Value\n\
+Statement,Data,BrokerName,Interactive Brokers LLC\n\
+Account Information,Header,Field Name,Field Value\n\
+Account Information,Data,Account,U1234567\n\
+Trades,Header,DataDiscriminator,Asset Category,Currency,Symbol,Date/Time,Quantity,T. Price,C. Price,Proceeds,Comm/Fee,Basis,Realized P/L,Code\n\
+Trades,Data,Order,Stocks,USD,AAPL,\"2026-06-10, 10:30:00\",10,150.25,150.30,-1502.50,-1,1503.50,0,O\n\
+Trades,Data,Order,Stocks,USD,VOO,\"2026-06-11, 14:00:00\",-5,520.10,520.00,2600.47,-1.03,-2550,49.44,C\n\
+Trades,Data,ClosedLot,Stocks,USD,VOO,\"2026-06-11, 14:00:00\",-5,520.10,,,,2550,,C\n\
+Trades,Data,Order,Equity and Index Options,USD,AAPL 240920C,\"2026-06-10, 10:30:00\",1,2.50,,-250,-1,251,0,O\n\
+Trades,Data,Order,Stocks,EUR,ASML,\"2026-06-10, 09:00:00\",2,900.00,,-1800,-2,1802,0,O\n\
+Trades,SubTotal,,Stocks,USD,AAPL,,10,,,,,,,\n\
+Dividends,Header,Currency,Date,Description,Amount\n\
+Dividends,Data,USD,2026-06-09,SCHD(US8085247976) Cash Dividend USD 0.27 per Share (Ordinary Dividend),25.50\n\
+Dividends,Data,Total,,,25.50\n\
+Withholding Tax,Header,Currency,Date,Description,Amount,Code\n\
+Withholding Tax,Data,USD,2026-06-09,SCHD(US8085247976) Cash Dividend - US Tax,-3.83,\n\
+Deposits & Withdrawals,Header,Currency,Settle Date,Description,Amount\n\
+Deposits & Withdrawals,Data,USD,2026-06-08,Electronic Fund Transfer,5000\n\
+Deposits & Withdrawals,Data,USD,2026-06-12,Disbursement,-1000\n\
+Deposits & Withdrawals,Data,Total,,,4000\n";
+        let parse = parse_preset("ibkr", csv).unwrap();
+        assert_eq!(parse.rows.len(), 5, "skipped: {:?}", parse.skipped);
+
+        let (_, buy) = &parse.rows[0];
+        assert_eq!(buy.kind, "buy");
+        assert_eq!(buy.symbol.as_deref(), Some("AAPL"));
+        assert_eq!(buy.qty.unwrap().to_string(), "10");
+        assert_eq!(buy.price.unwrap().to_string(), "150.25");
+        assert_eq!(buy.fees.unwrap().to_string(), "1"); // abs(Comm/Fee)
+
+        let (_, sell) = &parse.rows[1];
+        assert_eq!(sell.kind, "sell");
+        assert_eq!(sell.qty.unwrap().to_string(), "5"); // abs of -5
+        assert_eq!(sell.fees.unwrap().to_string(), "1.03");
+
+        let (_, dividend) = &parse.rows[2];
+        assert_eq!(dividend.kind, "dividend");
+        assert_eq!(dividend.symbol.as_deref(), Some("SCHD")); // ticker prefix
+        assert_eq!(dividend.price.unwrap().to_string(), "25.50");
+
+        assert_eq!(parse.rows[3].1.kind, "deposit");
+        assert_eq!(parse.rows[3].1.price.unwrap().to_string(), "5000");
+        assert!(parse.rows[3].1.symbol.is_none());
+        assert_eq!(parse.rows[4].1.kind, "withdrawal");
+        assert_eq!(parse.rows[4].1.price.unwrap().to_string(), "1000"); // abs
+
+        // The ClosedLot detail and the SubTotal/Total rows are silently
+        // structural; the option, the EUR trade, and the withholding tax
+        // are reported skips.
+        assert_eq!(parse.skipped.len(), 3, "{:?}", parse.skipped);
+        assert!(parse.skipped.iter().any(|s| s.contains("Options")));
+        assert!(parse.skipped.iter().any(|s| s.contains("EUR")));
+        assert!(parse.skipped.iter().any(|s| s.contains("withholding")));
+    }
+
+    #[test]
+    fn ibkr_prefers_order_rows_over_trade_detail() {
+        // A statement grouped by orders also lists per-execution Trade
+        // rows; importing both would double-count the position.
+        let csv = "\
+Trades,Header,DataDiscriminator,Asset Category,Currency,Symbol,Date/Time,Quantity,T. Price,Comm/Fee\n\
+Trades,Data,Order,Stocks,USD,AAPL,\"2026-06-10, 10:30:00\",10,150.25,-1\n\
+Trades,Data,Trade,Stocks,USD,AAPL,\"2026-06-10, 10:30:01\",6,150.25,-0.6\n\
+Trades,Data,Trade,Stocks,USD,AAPL,\"2026-06-10, 10:30:02\",4,150.25,-0.4\n";
+        let parse = parse_preset("ibkr", csv).unwrap();
+        assert_eq!(parse.rows.len(), 1);
+        assert_eq!(parse.rows[0].1.qty.unwrap().to_string(), "10");
     }
 
     #[test]

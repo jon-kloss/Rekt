@@ -6,7 +6,7 @@ A self-hosted, single-user web dashboard for **tracking and trading** a US
 stocks & ETFs portfolio in real time, with an AI analyst watching over your
 shoulder. One Rust binary, one SQLite file, your keys never leave your box.
 
-**Status: Phase 8** — tracking, paper trading, history & insight,
+**Status: Phase 9** — tracking, paper trading, history & insight,
 alerts-to-action, the **AI analyst** (morning briefings, weekly deep
 reviews with web search, on-demand analysis over the Claude API — all
 **advisory only**: no dependency path to the broker, read-only tools,

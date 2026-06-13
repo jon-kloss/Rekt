@@ -446,12 +446,22 @@ watchlist     (instrument_id, added_ts)
   not raw direction) + hit rate in the analyst header; `/api/analyst`
   carries per-recommendation outcomes and the aggregate.
 
+### Phase 9 — Interactive Brokers CSV preset
+- `import::parse_ibkr`: parses the IBKR Activity Statement (multi-section
+  CSV — each row prefixed with its section + row type, each section with
+  its own header) into the generic transaction shape.
+- Translates Trades (order-level, deduped against per-execution/per-lot
+  detail rows), Dividends (ticker pulled from the description), and
+  Deposits & Withdrawals; structural sections are ignored; options, forex,
+  non-USD rows, and withholding tax are skipped and reported. USD +
+  stocks/ETFs only. Rounds out the broker preset set (Fidelity, Schwab,
+  IBKR).
+
 ### Backlog (post-v1, demand-validated by research)
 - Options tracking (expands the locked stocks-&-ETFs scope — needs its own
   planning pass: data sources, OCC symbology, exercise/assignment flows).
 - Full net-worth aggregation (other accounts, cash, real estate).
-- Additional cost-basis strategies (average, specific-lot, ACB) and broker
-  CSV preset plugins.
+- Additional cost-basis strategies (average, specific-lot, ACB).
 
 ## 9. Risks & open questions
 
