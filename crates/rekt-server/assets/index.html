@@ -122,6 +122,12 @@ function aiSummaryCard(){
     '<span style="font-size:9px;font-weight:700;letter-spacing:1px;color:'+C.amber+';padding-top:3px;flex-shrink:0;">TL;DR</span>'+
     '<span style="font-size:12.5px;line-height:1.55;color:'+C.bright+';">'+esc(s)+'</span></div>';
 }
+// Honest analyst badge: which backend actually produced the analysis. The CLI
+// runs whatever model your Claude Code is set to (NOT necessarily Haiku), so we
+// name the backend, not a hardcoded model.
+function analystBadge(){
+  return M.analystBackend==='cli' ? 'CLAUDE CODE · CLI' : M.analystBackend==='http' ? 'CLAUDE API' : 'CLAUDE';
+}
 // The report body with the lead TL;DR/bottom-line section removed — the card
 // above already shows it, so don't repeat it below.
 function mdStripSummary(src){
@@ -614,7 +620,7 @@ function overviewView(){
     '<button data-act="brief" aria-expanded="'+S.briefOpen+'" style="width:100%;display:flex;align-items:center;gap:10px;padding:11px 14px;background:transparent;border:none;cursor:pointer;text-align:left;font-family:inherit;">'+
       '<span style="color:'+C.amber+';font-size:11px;width:10px;">'+(S.briefOpen?'▾':'▸')+'</span>'+
       '<span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">AI BRIEFING</span>'+
-      '<span style="font-size:9px;letter-spacing:0.5px;color:'+C.amber+';border:1px solid #3A2F18;padding:2px 7px;border-radius:3px;">CLAUDE//HAIKU</span>'+head+
+      '<span style="font-size:9px;letter-spacing:0.5px;color:'+C.amber+';border:1px solid #3A2F18;padding:2px 7px;border-radius:3px;">'+esc(analystBadge())+'</span>'+head+
       '<span style="margin-left:auto;font-size:9.5px;color:'+C.faint+';">'+(S.briefOpen?'click to collapse':'click to expand')+'</span></button>'+
     (S.briefOpen?'<div style="padding:2px 16px 14px 35px;font-size:12.5px;line-height:1.6;color:'+C.body+';max-width:940px;">'+aiSummaryCard()+mdToHtml(mdStripSummary(M.briefing))+'</div>':'')+
   '</div>';
@@ -668,7 +674,7 @@ function perfView(){
 
 function analystView(){
   const hit = M.track.tested>0 ? Math.round(M.track.favorable/M.track.tested*100)+'%' : '—';
-  const backendLabel = M.analystBackend==='cli' ? 'CLAUDE CODE · CLI' : M.analystBackend==='http' ? 'CLAUDE API' : 'CLAUDE';
+  const backendLabel = analystBadge();
   let html='<div style="display:flex;border-bottom:1px solid '+C.border+';">'+
     '<div style="flex:1;padding:14px 16px;border-right:1px solid '+C.border+';"><div style="display:flex;align-items:center;gap:10px;margin-bottom:9px;"><span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">LATEST ANALYSIS</span><span style="font-size:9px;letter-spacing:0.5px;color:'+C.amber+';border:1px solid #3A2F18;padding:2px 7px;border-radius:3px;">'+esc(backendLabel)+'</span><span style="font-size:10px;color:'+C.label+';">'+esc(M.briefingHead)+'</span></div>'+
       '<div style="font-size:12.5px;line-height:1.6;color:'+C.body+';">'+aiSummaryCard()+mdToHtml(mdStripSummary(M.briefing))+'</div></div>'+
