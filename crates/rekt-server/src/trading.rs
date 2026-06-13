@@ -26,7 +26,7 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use chrono_tz::America::New_York;
 use rekt_broker::{stream::BrokerEvent, AccountInfo, Broker, BrokerError, BrokerOrder, Execution};
-use rekt_core::orders::{check_ticket, OrderStatus, OrderTicket, Side};
+use rekt_core::orders::{check_ticket, OrderStatus, OrderTicket, OrderType, Side};
 use rekt_core::portfolio::compute_basis;
 use rust_decimal::Decimal;
 use sqlx::{Row, SqlitePool};
@@ -664,6 +664,21 @@ pub async fn submit_order(
         }
     };
 
+    // The live price cache only covers held/watched symbols. A market order on
+    // a symbol we don't yet track — e.g. an analyst pick like SPY — has no
+    // cached price, so the notional guardrail can't size it. Fetch a quote on
+    // demand here, OUTSIDE the mutations lock (no network under the lock).
+    let quoted_price = if matches!(ticket.order_type, OrderType::Market)
+        && !state.live.price_views().await.contains_key(&ticket.symbol)
+    {
+        match &state.market {
+            Some(provider) => provider.quote(&ticket.symbol).await.ok().map(|q| q.price),
+            None => None,
+        }
+    } else {
+        None
+    };
+
     // Guardrails + intent persistence under the lock (consistent view of
     // the log); the broker submit happens after the lock is released.
     let (order_id, client_order_id, notional) = {
@@ -678,7 +693,7 @@ pub async fn submit_order(
             )
         })?;
         let prices = state.live.price_views().await;
-        let last_price = prices.get(&ticket.symbol).map(|p| p.price);
+        let last_price = prices.get(&ticket.symbol).map(|p| p.price).or(quoted_price);
         let equity = account_equity.unwrap_or_else(|| {
             basis.cash
                 + basis
