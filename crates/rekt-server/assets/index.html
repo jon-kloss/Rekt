@@ -268,6 +268,21 @@ function sigBadges(sig){
   return out;
 }
 
+// STAGE BUY / STAGE SELL on a position row. These open PAPER orders (a
+// simulated account), NOT trades against the tracked holding shown — so the
+// SELL is gated on the PAPER position and explains itself when the paper
+// account is flat in that symbol (the common case for imported holdings).
+function stageBtns(sym, fs, pad){
+  const paperHeld = (M.paperPositions && has(M.paperPositions[sym])) ? num(M.paperPositions[sym]) : 0;
+  const buyT = 'Stage a PAPER buy of ' + sym + ' (simulated account — separate from your tracked holdings)';
+  const sellT = paperHeld > 0
+    ? 'Stage a PAPER sell of ' + sym + ' (paper account holds ' + qtyFmt(paperHeld) + ')'
+    : 'Paper account holds 0 ' + sym + ' — STAGE BUY to open a paper position first (this does NOT sell your tracked holding)';
+  const sellLive = paperHeld > 0;
+  return '<button data-act="add" data-arg="' + esc(sym) + '" data-stop="1" title="' + esc(buyT) + '" style="font-family:inherit;font-size:' + fs + ';font-weight:600;color:' + UP + ';background:rgba(47,191,113,0.1);border:1px solid rgba(47,191,113,0.35);border-radius:3px;padding:' + pad + ';cursor:pointer;white-space:nowrap;">STAGE BUY</button>' +
+    '<button data-act="trim" data-arg="' + esc(sym) + '" data-stop="1" title="' + esc(sellT) + '" style="font-family:inherit;font-size:' + fs + ';font-weight:600;color:' + DN + ';background:rgba(255,92,87,' + (sellLive ? '0.1' : '0.04') + ');border:1px solid rgba(255,92,87,' + (sellLive ? '0.35' : '0.18') + ');border-radius:3px;padding:' + pad + ';cursor:pointer;white-space:nowrap;opacity:' + (sellLive ? '1' : '0.55') + ';">STAGE SELL</button>';
+}
+
 //================================================================ SVG chart builders (ported from the design's hand-drawn charts)
 function attrs(o){ const map={strokeWidth:'stroke-width',strokeDasharray:'stroke-dasharray',strokeOpacity:'stroke-opacity',fillOpacity:'fill-opacity',stopColor:'stop-color',stopOpacity:'stop-opacity'};
   return Object.keys(o).map(k=>{ const key=map[k]||k; return key+'="'+esc(o[k])+'"'; }).join(' '); }
@@ -488,8 +503,7 @@ function positionsView(){
         statCell('UNREALIZED', (sel.total!=null?signedMoney(sel.total):'—')+' <span style="font-size:10px;">'+(sel.totalPct!=null?signedPct(sel.totalPct):'')+'</span>', dirColor(sel.total)) +
       '</div>'+
       '<div style="display:flex;align-items:center;gap:8px;margin-top:14px;flex-wrap:wrap;"><span style="font-size:9px;color:'+C.label+';letter-spacing:0.5px;margin-right:4px;">SIGNALS</span>'+sigs+
-        '<div style="margin-left:auto;display:flex;gap:6px;"><button data-act="add" data-arg="'+esc(sel.sym)+'" style="font-family:inherit;font-size:10px;font-weight:600;color:'+UP+';background:rgba(47,191,113,0.1);border:1px solid rgba(47,191,113,0.35);border-radius:3px;padding:5px 12px;cursor:pointer;white-space:nowrap;">STAGE BUY</button>'+
-        '<button data-act="trim" data-arg="'+esc(sel.sym)+'" style="font-family:inherit;font-size:10px;font-weight:600;color:'+DN+';background:rgba(255,92,87,0.1);border:1px solid rgba(255,92,87,0.35);border-radius:3px;padding:5px 12px;cursor:pointer;white-space:nowrap;">STAGE SELL</button></div></div>'+
+        '<div style="margin-left:auto;display:flex;gap:6px;">'+stageBtns(sel.sym,'10px','5px 12px')+'</div></div>'+
     '</div>';
   }
   // table
@@ -510,8 +524,7 @@ function positionsView(){
       '<div style="text-align:right;color:'+dirColor(p.day)+';">'+(p.day!=null?signedMoney(p.day):'—')+'</div>'+
       '<div style="text-align:right;color:'+dirColor(p.total)+';">'+(p.total!=null?signedMoney(p.total):'—')+' <span style="font-size:9px;opacity:0.7;">'+(p.totalPct!=null?signedPct(p.totalPct):'')+'</span></div>'+
       '<div style="display:flex;gap:4px;flex-wrap:wrap;">'+sigs+'</div>'+
-      '<div style="display:flex;gap:4px;justify-content:flex-end;"><button data-act="add" data-arg="'+esc(p.sym)+'" data-stop="1" title="stage a buy" style="font-family:inherit;font-size:9.5px;font-weight:600;color:'+UP+';background:rgba(47,191,113,0.1);border:1px solid rgba(47,191,113,0.35);border-radius:3px;padding:3px 7px;cursor:pointer;white-space:nowrap;">STAGE BUY</button>'+
-      '<button data-act="trim" data-arg="'+esc(p.sym)+'" data-stop="1" title="stage a trim" style="font-family:inherit;font-size:9.5px;font-weight:600;color:'+DN+';background:rgba(255,92,87,0.1);border:1px solid rgba(255,92,87,0.35);border-radius:3px;padding:3px 7px;cursor:pointer;white-space:nowrap;">STAGE SELL</button></div>'+
+      '<div style="display:flex;gap:4px;justify-content:flex-end;">'+stageBtns(p.sym,'9.5px','3px 7px')+'</div>'+
     '</div>';
   }).join('');
   return html;
@@ -729,7 +742,7 @@ function alertsView(){
     const draft=a.draft?esc((a.draft.side||'').toUpperCase()+' '+a.draft.qty+' '+a.draft.order_type+(a.draft.limit_price?' @ '+a.draft.limit_price:'')):'—';
     return '<div style="display:grid;grid-template-columns:'+cols+';gap:10px;padding:11px 16px;border-bottom:1px solid '+C.hairline+';align-items:center;font-size:12px;"><div style="font-weight:600;color:'+C.bright+';">'+desc+'</div>'+
       '<div style="color:'+sc+';font-size:10px;letter-spacing:0.5px;">'+esc(a.status)+'</div><div style="color:'+C.label+';">'+trig+'</div><div style="color:'+C.body+';">'+draft+'</div><div style="color:'+C.label+';">'+(esc(a.note)||'—')+'</div>'+
-      '<div style="text-align:right;"><button data-act="rearmAlert" data-arg="'+a.id+'" aria-label="Re-arm alert" style="background:none;border:none;color:'+C.label+';cursor:pointer;font-size:13px;padding:0;">↻</button></div></div>';
+      '<div style="text-align:right;display:flex;gap:8px;justify-content:flex-end;align-items:center;"><button data-act="rearmAlert" data-arg="'+a.id+'" aria-label="Re-arm alert" title="Re-arm" style="background:none;border:none;color:'+C.label+';cursor:pointer;font-size:13px;padding:0;">↻</button><button data-act="deleteAlert" data-arg="'+a.id+'" aria-label="Delete alert" title="Delete alert" style="background:none;border:none;color:'+C.faint+';cursor:pointer;font-size:12px;padding:0;line-height:1;">✕</button></div></div>';
   }).join('');
   html += '<div style="padding:12px 16px;font-size:10.5px;color:'+C.label+';line-height:1.55;">Alerts carry an optional pre-staged draft order. When the condition fires it surfaces in the banner above with a one-click <span style="color:'+C.amber+';">REVIEW TICKET</span> — the order still routes through the docked ticket and your confirm.</div>';
   return html;
@@ -1071,7 +1084,15 @@ function addToBasket(side,sym,qty,otype,limit){
   S.dockOpen=true; return true;
 }
 function quickAdd(sym){ const p=M.positions.find(x=>x.sym===sym); const q=p?Math.max(1,Math.round(p.qty*0.25)):1; if(addToBasket('buy',sym,q,'market')) toast('STAGED BUY '+q+' '+sym+' → ticket basket'); render(); }
-function quickTrim(sym){ const p=M.positions.find(x=>x.sym===sym); if(!p) return; const q=Math.max(0.0001,Math.round(p.qty*0.25*10000)/10000); if(addToBasket('sell',sym,q,'market')) toast('STAGED SELL '+qtyFmt(q)+' '+sym+' → ticket basket'); render(); }
+function quickTrim(sym){
+  // STAGE SELL stages a PAPER sell — size it off the PAPER position, not the
+  // tracked holding. If the paper account is flat in this name (the usual case
+  // for imported holdings), say so instead of staging a doomed long-only sell.
+  const ph=(M.paperPositions && has(M.paperPositions[sym]))?num(M.paperPositions[sym]):0;
+  if(ph<=0){ toast('PAPER account holds 0 '+sym+' — STAGE BUY to open a paper position first (your tracked holding is untouched)'); return; }
+  const q=Math.max(0.0001,Math.round(ph*0.25*10000)/10000);
+  if(addToBasket('sell',sym,q,'market')) toast('STAGED SELL '+qtyFmt(q)+' '+sym+' → ticket basket'); render();
+}
 function loadSym(sym){ sym=(sym||'').toUpperCase(); S.tSym=sym; S.view='positions'; if(M.positions.find(p=>p.sym===sym)) S.selSym=sym; toast('LOADED '+sym+' INTO TICKET'); }
 function runCmd(raw){
   const str=(raw||'').trim(); if(!str) return;
@@ -1137,6 +1158,7 @@ async function act(name, arg){
       break;
     case 'halt': try{ await japi('POST','/api/trading/pause',{ paused:!S.halted }); S.halted=!S.halted; toast(S.halted?'TRADING HALTED':'TRADING RESUMED'); render(); }catch(e){ toast('FAILED: '+e.message); } break;
     case 'createAlert': createAlert(); break;
+    case 'deleteAlert': try{ await japi('DELETE','/api/alerts/'+arg); toast('ALERT DELETED'); await refreshSilent(); }catch(e){ toast(e.message); } break;
     case 'dismissAlert': try{ await japi('POST','/api/alerts/'+arg+'/dismiss'); await refreshSilent(); }catch(e){ toast(e.message); } break;
     case 'rearmAlert': try{ await japi('POST','/api/alerts/'+arg+'/rearm'); await refreshSilent(); }catch(e){ toast(e.message); } break;
     case 'reviewAlert': { const a=M.alerts.find(x=>x.id==arg); if(a&&a.draft){ if(addToBasket(a.draft.side,a.sym,a.draft.qty,a.draft.order_type,a.draft.limit_price)) toast('STAGED '+a.sym+' FROM ALERT → ticket basket'); render(); } break; }
