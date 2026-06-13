@@ -538,9 +538,15 @@ async fn run_analysis_inner(
     let (mut user_content, mut use_tools, mut server_tools, mut output_schema) = match kind {
         "briefing" => (
             format!(
-                "{date}\n\nCurrent state:\n{}\n\n{track}\n\nWrite this morning's briefing: \
-                 1) portfolio state in two sentences, 2) the signals that deserve attention \
-                 today, 3) anything to watch. Under 250 words.",
+                "{date}\n\nCurrent state:\n{}\n\n{track}\n\nWrite this morning's briefing as short \
+                 markdown, under 250 words, with these sections in order:\n\n\
+                 ## TL;DR\nONE sentence: the single most important thing right now AND the one \
+                 action to take today (or 'Hold — nothing to do'). It must stand on its own and \
+                 must NOT merely restate the portfolio-state numbers below — lead with the \
+                 takeaway and the decision, not the balance.\n\n\
+                 ## Portfolio\nState in two sentences.\n\n\
+                 ## Signals\nThe signals that deserve attention today, as tight bullets.\n\n\
+                 ## Watch\nAnything to watch.",
                 portfolio_context(state).await
             ),
             false,
