@@ -515,6 +515,7 @@ mod tests {
         assert!(json["uptime_seconds"].is_u64());
         // Readiness map: the bare test_state wires no optional components.
         assert_eq!(json["components"]["market_data"], "unconfigured");
+        assert_eq!(json["components"]["daily_bars"], false);
         assert_eq!(json["components"]["trading_paper"], false);
         assert_eq!(json["components"]["ai_analyst"], false);
         assert_eq!(json["components"]["alert_push"], false);

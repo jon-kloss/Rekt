@@ -1,6 +1,7 @@
 # Operating REKT
 
-REKT is one statically-linked binary plus one SQLite file. This guide covers
+REKT is a single self-contained binary (SQLite is compiled in) plus one SQLite
+file. This guide covers
 running it for real: deployment, the data file and its backups, upgrades,
 monitoring, the security posture, and the deliberate paper-only stance on live
 trading. For what REKT *is* and the design behind it, see
@@ -8,7 +9,7 @@ trading. For what REKT *is* and the design behind it, see
 
 ## What you are running
 
-- **One process.** `rekt-server` serves the API and the embedded UI, runs the
+- **One process.** The `rekt` binary serves the API and the embedded UI, runs the
   live market-data pipeline, the order manager, and the scheduled jobs (candle
   backfill, EOD snapshots, the AI analyst). There is no separate worker.
 - **One data file.** All durable state lives in the SQLite database at `REKT_DB`
@@ -32,7 +33,7 @@ errors or `None`, never fabricated data.
 | `ALPACA_PAPER_KEY` / `ALPACA_PAPER_SECRET` | — | **paper** trading + daily bars |
 | `ANTHROPIC_API_KEY` | — | AI analyst (advisory only) |
 | `REKT_AI_DAILY_BUDGET` | `2.50` | USD/day ceiling that gates analyst runs |
-| `REKT_AI_AUTO` | `1` | set `0` to disable the scheduled briefing/review |
+| `REKT_AI_AUTO` | enabled (unset) | `0`, `false`, or `off` disable the scheduled briefing/review |
 | `REKT_NTFY_TOPIC` / `REKT_NTFY_URL` | — | alert push (see Security for the topic warning) |
 | `REKT_MAX_ORDER_NOTIONAL` | `10000` | per-order notional cap |
 | `REKT_MAX_POSITION_PCT` | `25` | max single-position % of equity |
@@ -46,7 +47,7 @@ Build a release binary and run it as an unprivileged service with the data file
 on persistent storage.
 
 ```sh
-cargo build --release -p rekt-server   # → target/release/rekt-server
+cargo build --release -p rekt-server   # → target/release/rekt  (the bin is named `rekt`)
 ```
 
 `/etc/rekt/rekt.env` (owned `root:rekt`, mode `0640` — it holds your keys):
@@ -72,10 +73,13 @@ Wants=network-online.target
 User=rekt
 Group=rekt
 EnvironmentFile=/etc/rekt/rekt.env
-ExecStart=/usr/local/bin/rekt-server
+ExecStart=/usr/local/bin/rekt
 Restart=on-failure
 RestartSec=5
-# Hardening: the process only needs its data directory.
+# Hardening: the process only needs its data directory. WorkingDirectory is
+# the writable StateDirectory so even a relative REKT_DB resolves there
+# (ProtectSystem=strict makes the default working dir, /, read-only).
+WorkingDirectory=/var/lib/rekt
 StateDirectory=rekt
 ProtectSystem=strict
 ReadWritePaths=/var/lib/rekt
@@ -89,7 +93,7 @@ WantedBy=multi-user.target
 
 ```sh
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin rekt
-sudo install -m755 target/release/rekt-server /usr/local/bin/
+sudo install -m755 target/release/rekt /usr/local/bin/
 sudo systemctl daemon-reload && sudo systemctl enable --now rekt
 journalctl -u rekt -f         # logs
 ```
@@ -125,6 +129,12 @@ extra config.
 
 The transaction log is the only irreplaceable data, but back up the whole file —
 it is small and a restore is then a single copy.
+
+The commands below use the standalone **`sqlite3` CLI** — a separate OS package
+(`sqlite3` on Debian/Ubuntu, `sqlite` on Alpine), not shipped with REKT even
+though the server bundles its own SQLite. Install it on the host (and confirm
+`command -v sqlite3`) before wiring up the cron job, or the backup silently does
+nothing.
 
 **Do not `cp` a live database.** In WAL mode the latest writes live in the
 `-wal` sidecar; a raw copy of just `rekt.db` can be stale or torn. Take a
@@ -162,7 +172,7 @@ own from the providers.
 ```sh
 git pull
 cargo build --release -p rekt-server
-sudo install -m755 target/release/rekt-server /usr/local/bin/
+sudo install -m755 target/release/rekt /usr/local/bin/
 sudo systemctl restart rekt
 ```
 
@@ -221,9 +231,13 @@ explicit opt-in after a multi-week paper soak proves the order path. Enabling it
 later is a deliberate, reviewable change, not a flag flip:
 
 1. **Separate credentials.** Live Alpaca keys are distinct env vars from the
-   paper keys; the two never share configuration, and `transactions.mode`
-   already segregates paper vs live fills at the data layer so a paper fill can
-   never touch the live portfolio.
+   paper keys; the two never share configuration. The data layer already
+   segregates by `transactions.mode`: **paper-broker fills are recorded
+   `mode='paper'` and never touch the live portfolio**, while your manually
+   entered and imported transactions are real tracked holdings (`mode='live'`).
+   A soak runs against the Alpaca *paper broker* (mode='paper'), so its fills
+   can never contaminate the live portfolio — wiring live trading would record
+   real fills as `mode='live'` alongside your holdings.
 2. **Explicit, logged opt-in.** Live requires an unambiguous switch (e.g.
    `REKT_TRADING_MODE=live`) that is loud at startup and in the UI — never the
    default.
