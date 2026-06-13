@@ -722,6 +722,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn csv_import_dry_run_validates_without_inserting() {
+        let state = test_state().await;
+        let csv = "kind,symbol,qty,price,fees,taxes,ts,note\n\
+                   deposit,,,2000,,,,seed\n\
+                   buy,AAPL,5,100,1,,2026-01-05T15:00:00Z,first buy";
+
+        // Dry run: reports what WOULD import, writes nothing.
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/import/csv?dry_run=true")
+            .header("content-type", "text/csv")
+            .body(axum::body::Body::from(csv))
+            .unwrap();
+        let response = app(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["dry_run"], true);
+        assert_eq!(body["would_import"], 2);
+        assert_eq!(body["sample"].as_array().unwrap().len(), 2);
+        assert_eq!(body["sample"][0]["kind"], "deposit");
+
+        let (_, txs) = request(state.clone(), "GET", "/api/transactions", None).await;
+        assert_eq!(txs.as_array().unwrap().len(), 0, "dry run must not insert");
+
+        // A dry run that fails validation still inserts nothing AND reports
+        // the failing line — same contract as a real import.
+        let bad = "kind,symbol,qty,price,fees,taxes,ts,note\n\
+                   sell,AAPL,6,110,,,,";
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/import/csv?dry_run=true")
+            .header("content-type", "text/csv")
+            .body(axum::body::Body::from(bad))
+            .unwrap();
+        let response = app(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Confirming (no dry_run) then actually writes the rows.
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/import/csv")
+            .header("content-type", "text/csv")
+            .body(axum::body::Body::from(csv))
+            .unwrap();
+        let response = app(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let (_, txs) = request(state.clone(), "GET", "/api/transactions", None).await;
+        assert_eq!(txs.as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn index_serves_embedded_shell() {
         let response = app(test_state().await)
             .oneshot(

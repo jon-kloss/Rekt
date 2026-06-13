@@ -29,9 +29,10 @@ pub fn parse_preset(format: &str, body: &str) -> Result<PresetParse, String> {
     let parse = match format {
         "fidelity" => parse_broker(body, &FIDELITY),
         "schwab" => parse_broker(body, &SCHWAB),
+        "robinhood" => parse_broker(body, &ROBINHOOD),
         "ibkr" => parse_ibkr(body),
         other => Err(format!(
-            "unknown CSV format {other:?} (use generic, fidelity, schwab or ibkr)"
+            "unknown CSV format {other:?} (use generic, fidelity, schwab, robinhood or ibkr)"
         )),
     }?;
     tracing::debug!(
@@ -58,7 +59,9 @@ struct BrokerPreset {
     commission: &'static [&'static str],
     amount: &'static [&'static str],
     /// Map an action to a kind, or None for "not a transaction" (skipped).
-    classify: fn(&str) -> Option<&'static str>,
+    /// Receives the row's SIGNED amount so a broker that uses one action code
+    /// for both directions (e.g. Robinhood's `ACH`) can route by sign.
+    classify: fn(&str, Option<Decimal>) -> Option<&'static str>,
 }
 
 static FIDELITY: BrokerPreset = BrokerPreset {
@@ -71,7 +74,7 @@ static FIDELITY: BrokerPreset = BrokerPreset {
     fees: &["fees"],
     commission: &["commission"],
     amount: &["amount"],
-    classify: |action| {
+    classify: |action, _amount| {
         let a = action.to_uppercase();
         // Fidelity exports a reinvested dividend as TWO rows: "DIVIDEND
         // RECEIVED" (cash in) + "REINVESTMENT" (buy, cash out). Importing
@@ -108,7 +111,7 @@ static SCHWAB: BrokerPreset = BrokerPreset {
     fees: &["fees & comm", "fees"],
     commission: &[],
     amount: &["amount"],
-    classify: |action| {
+    classify: |action, _amount| {
         let a = action.to_uppercase();
         // "Reinvest Dividend" is the cash credit; "Reinvest Shares" is the
         // matching purchase — both rows appear, so both map.
@@ -127,6 +130,41 @@ static SCHWAB: BrokerPreset = BrokerPreset {
             Some("withdrawal")
         } else {
             None
+        }
+    },
+};
+
+static ROBINHOOD: BrokerPreset = BrokerPreset {
+    name: "robinhood",
+    // Robinhood's activity export: Activity Date, Process Date, Settle Date,
+    // Instrument, Description, Trans Code, Quantity, Price, Amount.
+    date: &["activity date", "process date"],
+    action: &["trans code"],
+    symbol: &["instrument"],
+    qty: &["quantity"],
+    price: &["price"],
+    // No standalone fee columns — RH bakes regulatory fees into the amount.
+    fees: &[],
+    commission: &[],
+    amount: &["amount"],
+    classify: |action, amount| {
+        match action.trim().to_uppercase().as_str() {
+            "BUY" => Some("buy"),
+            "SELL" => Some("sell"),
+            "CDIV" => Some("dividend"), // cash dividend
+            // ONE code for both directions — route by the amount's sign
+            // (deposits credit +, withdrawals debit −). Missing/zero → deposit.
+            "ACH" => Some(match amount {
+                // `-0.00` is sign-negative but not a debit — guard it so a
+                // zero-value transfer stays a deposit, per the rule below.
+                Some(a) if a.is_sign_negative() && !a.is_zero() => "withdrawal",
+                _ => "deposit",
+            }),
+            // Everything else is reported as a skip, not silently dropped:
+            // options (BTO/STO/BTC/STC/OEXP), interest (INT), Gold fees
+            // (GOLD), tax withholding (DTAX), and splits (SPL) — RH reports a
+            // share delta, not a ratio, so splits are deferred like IBKR's.
+            _ => None,
         }
     },
 };
@@ -243,16 +281,24 @@ fn parse_broker(body: &str, preset: &BrokerPreset) -> Result<PresetParse, String
         if action.is_empty() {
             continue; // blank separator, totals row or disclaimer line
         }
-        let Some(kind) = (preset.classify)(action) else {
+        let money = |idx: Option<usize>, what: &str| -> Result<Option<Decimal>, String> {
+            parse_money(field(idx)).map_err(|m| format!("line {line}: {what}: {m}"))
+        };
+
+        // Classify on a LENIENT amount (parse errors → None): classify sees the
+        // sign so a one-code-both-directions broker (Robinhood ACH) can route
+        // by it, but a non-transaction row whose amount cell is junk ("--",
+        // "N/A") must still be skippable, not hard-fail the whole file. Rows we
+        // keep re-parse the amount strictly below, so a real transaction with a
+        // malformed amount still fails loudly.
+        let amount_for_class = parse_money(field(col_amount)).ok().flatten();
+        let Some(kind) = (preset.classify)(action, amount_for_class) else {
             skipped.push(format!(
                 "line {line}: \"{action}\" (not a portfolio transaction)"
             ));
             continue;
         };
         let ts = parse_broker_date(date_raw).map_err(|m| format!("line {line}: {m}"))?;
-        let money = |idx: Option<usize>, what: &str| -> Result<Option<Decimal>, String> {
-            parse_money(field(idx)).map_err(|m| format!("line {line}: {what}: {m}"))
-        };
 
         let qty = money(col_qty, "quantity")?.map(|d| d.abs()); // sells export negative qty
         let price = money(col_price, "price")?;
@@ -818,6 +864,74 @@ Run Date,Action,Symbol,Description,Type,Quantity,Price ($),Commission ($),Fees (
         let (_, transfer) = &parse.rows[3];
         assert_eq!(transfer.kind, "deposit");
         assert_eq!(transfer.price.unwrap().to_string(), "1000.00");
+    }
+
+    #[test]
+    fn robinhood_maps_trades_dividends_and_routes_ach_by_sign() {
+        let csv = "\
+\"Activity Date\",\"Process Date\",\"Settle Date\",\"Instrument\",\"Description\",\"Trans Code\",\"Quantity\",\"Price\",\"Amount\"\n\
+\"6/10/2026\",\"6/10/2026\",\"6/12/2026\",\"AAPL\",\"Apple\",\"Buy\",\"10\",\"$150.25\",\"($1502.50)\"\n\
+\"6/11/2026\",\"6/11/2026\",\"6/13/2026\",\"VOO\",\"Vanguard\",\"Sell\",\"5\",\"$520.10\",\"$2600.47\"\n\
+\"6/09/2026\",\"6/09/2026\",\"6/09/2026\",\"SCHD\",\"Schwab Div\",\"CDIV\",\"\",\"\",\"$25.50\"\n\
+\"6/08/2026\",\"6/08/2026\",\"6/08/2026\",\"\",\"ACH Deposit\",\"ACH\",\"\",\"\",\"$5000.00\"\n\
+\"6/12/2026\",\"6/12/2026\",\"6/12/2026\",\"\",\"ACH Withdrawal\",\"ACH\",\"\",\"\",\"($1000.00)\"\n\
+\"6/07/2026\",\"6/07/2026\",\"6/07/2026\",\"AAPL\",\"Call option\",\"BTO\",\"1\",\"$2.50\",\"($250.00)\"\n\
+\"6/06/2026\",\"6/06/2026\",\"6/06/2026\",\"\",\"Interest\",\"INT\",\"\",\"\",\"$0.42\"\n";
+        let parse = parse_preset("robinhood", csv).unwrap();
+        assert_eq!(parse.rows.len(), 5, "skipped: {:?}", parse.skipped);
+
+        let (_, buy) = &parse.rows[0];
+        assert_eq!(buy.kind, "buy");
+        assert_eq!(buy.symbol.as_deref(), Some("AAPL"));
+        assert_eq!(buy.qty.unwrap().to_string(), "10");
+        assert_eq!(buy.price.unwrap().to_string(), "150.25");
+
+        assert_eq!(parse.rows[1].1.kind, "sell");
+        assert_eq!(parse.rows[1].1.qty.unwrap().to_string(), "5");
+
+        let (_, dividend) = &parse.rows[2];
+        assert_eq!(dividend.kind, "dividend");
+        assert_eq!(dividend.symbol.as_deref(), Some("SCHD"));
+        assert_eq!(dividend.price.unwrap().to_string(), "25.50"); // cash from Amount
+
+        // Same ACH code, routed by the amount's sign.
+        assert_eq!(parse.rows[3].1.kind, "deposit");
+        assert_eq!(parse.rows[3].1.price.unwrap().to_string(), "5000.00");
+        assert_eq!(parse.rows[4].1.kind, "withdrawal");
+        assert_eq!(parse.rows[4].1.price.unwrap().to_string(), "1000.00"); // abs
+
+        // The option (BTO) and interest (INT) are reported, never silent.
+        assert_eq!(parse.skipped.len(), 2, "{:?}", parse.skipped);
+        assert!(parse.skipped.iter().any(|s| s.contains("BTO")));
+        assert!(parse.skipped.iter().any(|s| s.contains("INT")));
+    }
+
+    #[test]
+    fn skippable_row_with_junk_amount_does_not_fail_the_file() {
+        // An unmapped action whose Amount cell is unparseable ("--") must be
+        // reported as a skip, not abort the whole import (regression guard:
+        // classify runs on a lenient amount, before the strict value parse).
+        let csv = "\
+\"Activity Date\",\"Process Date\",\"Settle Date\",\"Instrument\",\"Description\",\"Trans Code\",\"Quantity\",\"Price\",\"Amount\"\n\
+\"6/06/2026\",\"6/06/2026\",\"6/06/2026\",\"\",\"Gold fee\",\"GOLD\",\"\",\"\",\"--\"\n\
+\"6/10/2026\",\"6/10/2026\",\"6/12/2026\",\"AAPL\",\"Apple\",\"Buy\",\"10\",\"$150.25\",\"($1502.50)\"\n";
+        let parse = parse_preset("robinhood", csv).unwrap();
+        assert_eq!(parse.rows.len(), 1);
+        assert_eq!(parse.rows[0].1.kind, "buy");
+        assert_eq!(parse.skipped.len(), 1);
+        assert!(parse.skipped[0].contains("GOLD"));
+    }
+
+    #[test]
+    fn zero_value_ach_is_a_deposit_not_a_withdrawal() {
+        // `($0.00)` parses to -0.00 (sign-negative) — it must NOT route to
+        // withdrawal; only a true debit does.
+        let csv = "\
+\"Activity Date\",\"Process Date\",\"Settle Date\",\"Instrument\",\"Description\",\"Trans Code\",\"Quantity\",\"Price\",\"Amount\"\n\
+\"6/08/2026\",\"6/08/2026\",\"6/08/2026\",\"\",\"Zero transfer\",\"ACH\",\"\",\"\",\"($0.00)\"\n";
+        let parse = parse_preset("robinhood", csv).unwrap();
+        assert_eq!(parse.rows.len(), 1);
+        assert_eq!(parse.rows[0].1.kind, "deposit");
     }
 
     #[test]
