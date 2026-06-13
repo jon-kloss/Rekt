@@ -471,8 +471,8 @@ function alertBanner(){
       '<span style="font-size:12px;font-weight:600;color:'+C.bright+';">'+desc+'</span>'+
       '<span style="font-size:11.5px;color:'+C.body+';">hit '+hit+'</span>'+
       '<div style="margin-left:auto;display:flex;gap:8px;">'+
-        (a.draft?'<button data-act="reviewAlert" data-arg="'+a.id+'" style="font-family:inherit;font-size:10px;font-weight:600;color:'+C.bg+';background:'+C.amber+';border:none;border-radius:3px;padding:6px 12px;cursor:pointer;">REVIEW TICKET →</button>':'')+
-        '<button data-act="dismissAlert" data-arg="'+a.id+'" style="font-family:inherit;font-size:10px;color:'+C.label+';background:transparent;border:1px solid #1A212B;border-radius:3px;padding:6px 12px;cursor:pointer;">DISMISS</button>'+
+        (a.draft?'<button data-act="reviewAlert" data-arg="'+esc(a.id)+'" style="font-family:inherit;font-size:10px;font-weight:600;color:'+C.bg+';background:'+C.amber+';border:none;border-radius:3px;padding:6px 12px;cursor:pointer;">REVIEW TICKET →</button>':'')+
+        '<button data-act="dismissAlert" data-arg="'+esc(a.id)+'" style="font-family:inherit;font-size:10px;color:'+C.label+';background:transparent;border:1px solid #1A212B;border-radius:3px;padding:6px 12px;cursor:pointer;">DISMISS</button>'+
       '</div></div>';
   }).join('');
 }
@@ -742,7 +742,7 @@ function alertsView(){
     const draft=a.draft?esc((a.draft.side||'').toUpperCase()+' '+a.draft.qty+' '+a.draft.order_type+(a.draft.limit_price?' @ '+a.draft.limit_price:'')):'—';
     return '<div style="display:grid;grid-template-columns:'+cols+';gap:10px;padding:11px 16px;border-bottom:1px solid '+C.hairline+';align-items:center;font-size:12px;"><div style="font-weight:600;color:'+C.bright+';">'+desc+'</div>'+
       '<div style="color:'+sc+';font-size:10px;letter-spacing:0.5px;">'+esc(a.status)+'</div><div style="color:'+C.label+';">'+trig+'</div><div style="color:'+C.body+';">'+draft+'</div><div style="color:'+C.label+';">'+(esc(a.note)||'—')+'</div>'+
-      '<div style="text-align:right;display:flex;gap:8px;justify-content:flex-end;align-items:center;"><button data-act="rearmAlert" data-arg="'+a.id+'" aria-label="Re-arm alert" title="Re-arm" style="background:none;border:none;color:'+C.label+';cursor:pointer;font-size:13px;padding:0;">↻</button><button data-act="deleteAlert" data-arg="'+a.id+'" aria-label="Delete alert" title="Delete alert" style="background:none;border:none;color:'+C.faint+';cursor:pointer;font-size:12px;padding:0;line-height:1;">✕</button></div></div>';
+      '<div style="text-align:right;display:flex;gap:8px;justify-content:flex-end;align-items:center;"><button data-act="rearmAlert" data-arg="'+esc(a.id)+'" aria-label="Re-arm alert" title="Re-arm" style="background:none;border:none;color:'+C.label+';cursor:pointer;font-size:13px;padding:0;">↻</button><button data-act="deleteAlert" data-arg="'+esc(a.id)+'" aria-label="Delete alert" title="Delete alert" style="background:none;border:none;color:'+C.faint+';cursor:pointer;font-size:12px;padding:0;line-height:1;">✕</button></div></div>';
   }).join('');
   html += '<div style="padding:12px 16px;font-size:10.5px;color:'+C.label+';line-height:1.55;">Alerts carry an optional pre-staged draft order. When the condition fires it surfaces in the banner above with a one-click <span style="color:'+C.amber+';">REVIEW TICKET</span> — the order still routes through the docked ticket and your confirm.</div>';
   return html;
