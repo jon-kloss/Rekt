@@ -46,7 +46,13 @@ pub async fn taxes(
     State(state): State<AppState>,
     Query(query): Query<TaxQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    tracing::debug!(year = ?query.year, "GET /api/taxes");
     let (report, years) = build(&state, query.year).await?;
+    tracing::debug!(
+        year = report.year,
+        rows = report.rows.len(),
+        "tax report built"
+    );
     let mut body = serde_json::to_value(&report).map_err(internal)?;
     body.as_object_mut()
         .expect("TaxReport serializes to an object")
@@ -59,6 +65,7 @@ pub async fn taxes_csv(
     State(state): State<AppState>,
     Query(query): Query<TaxQuery>,
 ) -> Result<Response, ApiError> {
+    tracing::debug!(year = ?query.year, "GET /api/taxes/csv");
     let (report, _) = build(&state, query.year).await?;
     let csv = to_8949_csv(&report);
     let filename = format!("rekt-form8949-{}.csv", report.year);

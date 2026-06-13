@@ -44,6 +44,8 @@ impl AlpacaData {
         path: &str,
         query: &[(String, String)],
     ) -> Result<T, DataError> {
+        // Credentials are in the request headers, never the logged path/query.
+        tracing::debug!(provider = "alpaca", path, "GET");
         let response = self
             .client
             .get(format!("{}{}", self.base_url, path))
@@ -53,6 +55,7 @@ impl AlpacaData {
             .send()
             .await
             .map_err(|e| DataError::Upstream(e.to_string()))?;
+        tracing::debug!(provider = "alpaca", path, status = %response.status(), "response");
         match response.status() {
             reqwest::StatusCode::TOO_MANY_REQUESTS => return Err(DataError::RateLimited),
             reqwest::StatusCode::NOT_FOUND => {
@@ -186,7 +189,17 @@ impl MarketData for AlpacaData {
             );
             match response.next_page_token {
                 Some(token) => page_token = Some(token),
-                None => return Ok(candles),
+                None => {
+                    tracing::debug!(
+                        provider = "alpaca",
+                        symbol,
+                        %start,
+                        %end,
+                        bars = candles.len(),
+                        "daily candles fetched"
+                    );
+                    return Ok(candles);
+                }
             }
         }
     }

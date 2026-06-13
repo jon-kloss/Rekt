@@ -375,6 +375,7 @@ async fn main() -> anyhow::Result<()> {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
             loop {
                 tick.tick().await; // first tick is immediate
+                tracing::trace!("scheduler tick: reconciliation");
                 if let Err(e) = trading::reconcile(&recon_state).await {
                     tracing::error!(error = %e, "periodic reconciliation failed");
                 }
@@ -391,6 +392,7 @@ async fn main() -> anyhow::Result<()> {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(1800));
             loop {
                 tick.tick().await;
+                tracing::trace!("scheduler tick: candle backfill + EOD snapshot");
                 if let Err(e) = history::backfill_candles(&hist_state).await {
                     tracing::error!(error = %e, "candle backfill failed");
                 }
@@ -413,6 +415,7 @@ async fn main() -> anyhow::Result<()> {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(900));
             loop {
                 tick.tick().await;
+                tracing::trace!("scheduler tick: analyst auto-run check");
                 if let Err(e) = analyst::maybe_scheduled_runs(&ai_state).await {
                     tracing::error!(error = %e, "scheduled analyst run failed");
                 }
@@ -430,6 +433,7 @@ async fn main() -> anyhow::Result<()> {
             let mut drawdowns = alerts::DrawdownCache::default();
             loop {
                 tick.tick().await;
+                tracing::trace!("scheduler tick: alert evaluation");
                 if let Err(e) = alerts::evaluate_alerts(&alert_state, &mut drawdowns).await {
                     tracing::error!(error = %e, "alert evaluation failed");
                 }

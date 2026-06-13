@@ -51,6 +51,14 @@ pub async fn run(
 ) -> Result<RunOutcome, RunFailure> {
     let mut tool_definitions: Vec<Value> = tools.map(|t| t.definitions()).unwrap_or_default();
     tool_definitions.extend(config.server_tools.iter().cloned());
+    tracing::debug!(
+        model = config.model,
+        max_tokens = config.max_tokens,
+        tools = tool_definitions.len(),
+        structured = config.output_schema.is_some(),
+        max_iterations = config.max_iterations,
+        "analyst run starting"
+    );
 
     let mut messages: Vec<Value> = vec![json!({
         "role": "user",
@@ -69,7 +77,8 @@ pub async fn run(
         };
     }
 
-    for _ in 0..config.max_iterations {
+    for iteration in 0..config.max_iterations {
+        tracing::debug!(iteration, "analyst loop iteration");
         let mut request = json!({
             "model": config.model,
             "max_tokens": config.max_tokens,
@@ -109,6 +118,13 @@ pub async fn run(
                 } else {
                     response.text()
                 };
+                tracing::debug!(
+                    requests = usage.requests,
+                    input_tokens = usage.input_tokens,
+                    output_tokens = usage.output_tokens,
+                    tool_calls = tool_log.len(),
+                    "analyst run finished (end_turn)"
+                );
                 return Ok(RunOutcome {
                     text,
                     usage,
@@ -125,10 +141,12 @@ pub async fn run(
             // Server-side tool (web search) paused its loop: echo the
             // assistant turn back verbatim and the API resumes on its own.
             Some("pause_turn") => {
+                tracing::debug!("pause_turn — echoing assistant turn to resume");
                 messages.push(json!({"role": "assistant", "content": response.content}));
             }
             Some("tool_use") => {
                 let calls = response.tool_uses();
+                tracing::debug!(calls = calls.len(), "tool_use turn");
                 messages.push(json!({"role": "assistant", "content": response.content}));
                 let Some(executor) = tools else {
                     fail!(AnalystError::BadResponse(
@@ -141,6 +159,7 @@ pub async fn run(
                         Ok(output) => (output, false),
                         Err(message) => (message, true),
                     };
+                    tracing::debug!(tool = %name, ok = !is_error, "tool executed");
                     tool_log.push(json!({"name": name, "input": input, "ok": !is_error}));
                     results.push(json!({
                         "type": "tool_result",

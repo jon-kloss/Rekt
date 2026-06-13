@@ -231,6 +231,15 @@ impl Broker for Alpaca {
         if let Some(limit) = ticket.limit_price {
             body["limit_price"] = serde_json::Value::String(limit.to_string());
         }
+        tracing::debug!(
+            mode = ?self.mode,
+            client_order_id,
+            symbol = %ticket.symbol,
+            qty = %ticket.qty,
+            side = ticket.side.as_str(),
+            order_type = ticket.order_type.as_str(),
+            "submit_order → POST /v2/orders"
+        );
         let response = self
             .request(reqwest::Method::POST, "/v2/orders")
             .json(&body)
@@ -238,10 +247,17 @@ impl Broker for Alpaca {
             .await
             .map_err(|e| BrokerError::Upstream(e.to_string()))?;
         let order: AlpacaOrder = Self::handle(response).await?;
+        tracing::debug!(
+            client_order_id,
+            broker_order_id = %order.id,
+            status = %order.status,
+            "submit_order accepted"
+        );
         Ok(order.into_broker_order())
     }
 
     async fn cancel_order(&self, broker_order_id: &str) -> Result<(), BrokerError> {
+        tracing::debug!(broker_order_id, "cancel_order → DELETE /v2/orders/:id");
         let response = self
             .request(
                 reqwest::Method::DELETE,
@@ -263,6 +279,7 @@ impl Broker for Alpaca {
     }
 
     async fn cancel_all(&self) -> Result<(), BrokerError> {
+        tracing::debug!("cancel_all → DELETE /v2/orders");
         let response = self
             .request(reqwest::Method::DELETE, "/v2/orders")
             .send()
@@ -282,6 +299,7 @@ impl Broker for Alpaca {
         &self,
         client_order_id: &str,
     ) -> Result<Option<BrokerOrder>, BrokerError> {
+        tracing::debug!(client_order_id, "order_by_client_id");
         let response = self
             .request(reqwest::Method::GET, "/v2/orders:by_client_order_id")
             .query(&[("client_order_id", client_order_id)])
@@ -289,6 +307,7 @@ impl Broker for Alpaca {
             .await
             .map_err(|e| BrokerError::Upstream(e.to_string()))?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
+            tracing::debug!(client_order_id, "order_by_client_id: not found");
             return Ok(None);
         }
         let order: AlpacaOrder = Self::handle(response).await?;
@@ -303,6 +322,7 @@ impl Broker for Alpaca {
             .await
             .map_err(|e| BrokerError::Upstream(e.to_string()))?;
         let orders: Vec<AlpacaOrder> = Self::handle(response).await?;
+        tracing::debug!(count = orders.len(), "list_orders");
         Ok(orders
             .into_iter()
             .map(AlpacaOrder::into_broker_order)
@@ -344,12 +364,18 @@ impl Broker for Alpaca {
             );
             // A short page means we've drained the range.
             if page_len < PAGE_SIZE || page_token.is_none() {
+                tracing::debug!(
+                    after = ?after,
+                    fills = executions.len(),
+                    "executions_since drained"
+                );
                 return Ok(executions);
             }
         }
     }
 
     async fn account(&self) -> Result<AccountInfo, BrokerError> {
+        tracing::debug!("account → GET /v2/account");
         let response = self
             .request(reqwest::Method::GET, "/v2/account")
             .send()
@@ -360,12 +386,19 @@ impl Broker for Alpaca {
             s.parse::<Decimal>()
                 .map_err(|_| BrokerError::Upstream(format!("bad {what}: {s}")))
         };
-        Ok(AccountInfo {
+        let info = AccountInfo {
             cash: parse(&account.cash, "cash")?,
             buying_power: parse(&account.buying_power, "buying_power")?,
             equity: parse(&account.equity, "equity")?,
             daytrade_count: account.daytrade_count,
-        })
+        };
+        tracing::debug!(
+            equity = %info.equity,
+            buying_power = %info.buying_power,
+            daytrade_count = info.daytrade_count,
+            "account fetched"
+        );
+        Ok(info)
     }
 }
 

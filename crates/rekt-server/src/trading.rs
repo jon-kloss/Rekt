@@ -570,6 +570,13 @@ pub async fn submit_order(
     State(state): State<AppState>,
     Json(input): Json<TicketInput>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    tracing::debug!(
+        symbol = %input.symbol,
+        side = ?input.side,
+        order_type = ?input.order_type,
+        qty = %input.qty,
+        "POST /api/orders"
+    );
     let broker = broker_or_503(&state)?;
     if !state.trading.ready.load(Ordering::Relaxed) {
         return Err(err(
@@ -694,6 +701,7 @@ pub async fn cancel_order(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
+    tracing::debug!(order = id, "DELETE /api/orders/:id");
     let broker = broker_or_503(&state)?;
     let row = sqlx::query("SELECT broker_order_id, status FROM orders WHERE id = ?")
         .bind(id)
@@ -742,6 +750,7 @@ pub async fn cancel_order(
 /// orders pending_cancel so the UI reflects intent even if the stream is
 /// down (reconcile finalizes states).
 pub async fn cancel_all(State(state): State<AppState>) -> Result<StatusCode, ApiError> {
+    tracing::debug!("POST /api/orders/cancel_all (kill switch)");
     let broker = broker_or_503(&state)?;
     broker.cancel_all().await.map_err(map_broker_err)?;
     sqlx::query(
@@ -766,6 +775,7 @@ pub async fn set_paused(
     State(state): State<AppState>,
     Json(input): Json<PauseInput>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    tracing::debug!(paused = input.paused, "POST /api/trading/pause");
     // Persist FIRST — a safety switch that doesn't survive a crash isn't one.
     repo::set_setting(
         &state.db,

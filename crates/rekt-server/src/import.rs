@@ -25,14 +25,22 @@ pub struct PresetParse {
 }
 
 pub fn parse_preset(format: &str, body: &str) -> Result<PresetParse, String> {
-    match format {
+    tracing::debug!(format, bytes = body.len(), "parsing broker CSV preset");
+    let parse = match format {
         "fidelity" => parse_broker(body, &FIDELITY),
         "schwab" => parse_broker(body, &SCHWAB),
         "ibkr" => parse_ibkr(body),
         other => Err(format!(
             "unknown CSV format {other:?} (use generic, fidelity, schwab or ibkr)"
         )),
-    }
+    }?;
+    tracing::debug!(
+        format,
+        rows = parse.rows.len(),
+        skipped = parse.skipped.len(),
+        "preset parsed"
+    );
+    Ok(parse)
 }
 
 /// What one broker's export looks like: how to find columns and how to map

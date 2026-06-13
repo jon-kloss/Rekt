@@ -203,8 +203,33 @@ binary *and* the data together if needed.
 Point your uptime monitor at `status == "ok"`. The `components` map is for
 confirming a deployment wired up the env you intended — if `market_data` reads
 `unconfigured` or `ai_analyst` is `false` when you expected otherwise, a key is
-missing. Logs are structured (tracing) on stdout/journald; raise detail with
-`RUST_LOG`.
+missing.
+
+### Log levels
+
+Logs are structured (tracing) on stdout/journald. `RUST_LOG` selects the level
+per module; every code path has logging available:
+
+- **`info`** (default) — lifecycle and notable events: startup config, orders
+  submitted/filled, alerts triggered, scheduled analyst runs, backfills.
+- **`debug`** — per-operation detail for tracing a single request end to end:
+  every HTTP handler entry, each DB mutation (with the rows affected), every
+  outbound provider/broker/Claude API call and its status, and each analyst
+  loop iteration. Secrets are never logged — API keys live in request headers
+  or query strings that are deliberately excluded.
+- **`trace`** — the per-tick hot paths: inbound price ticks, snapshot
+  broadcasts, scheduler ticks, and history cache hits. Noisy by design; scope
+  it narrowly.
+
+```sh
+RUST_LOG=rekt_server=debug,rekt_broker=debug,info   # debug REKT, quiet deps
+RUST_LOG=rekt_server::live=trace,info               # watch the live pipeline
+```
+
+The pure `rekt-core` crate (portfolio/tax/signal math) is intentionally
+I/O-free and carries no logging of its own; it is deterministic, so its inputs
+and outputs are visible in the `debug` logs of the server boundary that calls
+it (e.g. "history cache miss — rebuilding series", "tax report built").
 
 ## Security posture
 

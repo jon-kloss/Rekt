@@ -78,6 +78,9 @@ impl MarketData for Finnhub {
     }
 
     async fn quote(&self, symbol: &str) -> Result<Quote, DataError> {
+        // NB: the token rides in the query string, so the URL is never
+        // logged — only the symbol.
+        tracing::debug!(provider = "finnhub", symbol, "GET /quote");
         let url = format!("{}/quote", self.base_url);
         let response = self
             .client
@@ -87,7 +90,9 @@ impl MarketData for Finnhub {
             .await
             .map_err(|e| DataError::Upstream(e.to_string()))?;
 
-        match response.status() {
+        let status = response.status();
+        tracing::debug!(provider = "finnhub", symbol, %status, "quote response");
+        match status {
             reqwest::StatusCode::TOO_MANY_REQUESTS => return Err(DataError::RateLimited),
             status if !status.is_success() => {
                 return Err(DataError::Upstream(format!("finnhub returned {status}")));
@@ -99,7 +104,9 @@ impl MarketData for Finnhub {
             .json()
             .await
             .map_err(|e| DataError::Upstream(e.to_string()))?;
-        into_quote(symbol, raw)
+        let quote = into_quote(symbol, raw)?;
+        tracing::debug!(provider = "finnhub", symbol, price = %quote.price, "quote parsed");
+        Ok(quote)
     }
 }
 

@@ -159,9 +159,9 @@ pub async fn history(
     State(state): State<AppState>,
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    Ok(Json(
-        history_payload(&state, query.range.as_deref().unwrap_or("all")).await?,
-    ))
+    let range = query.range.as_deref().unwrap_or("all");
+    tracing::debug!(range, "GET /api/history");
+    Ok(Json(history_payload(&state, range).await?))
 }
 
 /// The history response body, callable outside the HTTP layer too (the AI
@@ -197,8 +197,18 @@ pub async fn history_payload(state: &AppState, range: &str) -> Result<serde_json
             .map(|(_, points, meta)| (points.clone(), meta.clone()))
     };
     let (points, meta) = match cached {
-        Some(hit) => hit,
-        None => build_series(state, key).await?,
+        Some(hit) => {
+            tracing::trace!(tx_rev, candles_rev, "history cache hit");
+            hit
+        }
+        None => {
+            tracing::debug!(
+                tx_rev,
+                candles_rev,
+                "history cache miss — rebuilding series"
+            );
+            build_series(state, key).await?
+        }
     };
 
     let sliced: &[DayPoint] = match days {

@@ -81,6 +81,7 @@ pub async fn create_alert(
     State(state): State<AppState>,
     Json(input): Json<AlertInput>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    tracing::debug!(symbol = %input.symbol, condition = %input.condition, "POST /api/alerts");
     let symbol = validate_symbol(&input.symbol)?;
     let condition: AlertCondition = input
         .condition
