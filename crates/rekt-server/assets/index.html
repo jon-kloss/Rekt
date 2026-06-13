@@ -563,8 +563,11 @@ function equityPanel(H){
 function attentionItems(){
   const items=[];
   const CL={ price_below:'≤ $',price_above:'≥ $',drawdown_above:'DD ≥ ' };
+  // ALERT = a threshold YOU armed that has fired. SIGNAL = a derived indicator
+  // (computed live from prices, never saved). IDEA = an analyst suggestion.
+  // The tag makes the source explicit so signals aren't mistaken for alerts.
   M.alerts.filter(a=>a.status==='triggered').forEach(a=>{
-    items.push({ icon:'🚨', color:DN, act:'view', arg:'alerts',
+    items.push({ icon:'🚨', color:DN, tag:'ALERT', tagColor:DN, act:'view', arg:'alerts',
       text:a.sym+' '+(CL[a.condition]||'')+a.threshold+(a.condition==='drawdown_above'?'%':'')+' — alert triggered'+(has(a.triggeredValue)?(' at '+a.triggeredValue):'') });
   });
   M.positions.forEach(p=>{
@@ -575,12 +578,12 @@ function attentionItems(){
     const v50=has(s.vs_sma50_pct)?num(s.vs_sma50_pct):null, v200=has(s.vs_sma200_pct)?num(s.vs_sma200_pct):null;
     if(v50!=null && v200!=null && v50<0 && v200<0) flags.push('below 50d & 200d');
     if(has(s.drawdown_pct) && num(s.drawdown_pct)>=20) flags.push('DD '+s.drawdown_pct+'%');
-    if(flags.length) items.push({ icon:'⚠', color:AM, act:'gotoPos', arg:p.sym, text:p.sym+' — '+flags.join(' · ') });
+    if(flags.length) items.push({ icon:'⚠', color:AM, tag:'SIGNAL', tagColor:AM, act:'gotoPos', arg:p.sym, text:p.sym+' — '+flags.join(' · ') });
   });
   const actionable=M.recs.filter(r=>['BUY','TRIM','SELL','ADD'].includes(r.action));
   if(actionable.length){
     const list=actionable.slice(0,3).map(r=>r.action.toLowerCase()+' '+r.sym).join(', ');
-    items.push({ icon:'🤖', color:C.blue, act:'view', arg:'analyst',
+    items.push({ icon:'🤖', color:C.blue, tag:'IDEA', tagColor:C.blue, act:'view', arg:'analyst',
       text:actionable.length+' AI trade idea'+(actionable.length===1?'':'s')+(list?(' — '+list+(actionable.length>3?'…':'')):'') });
   }
   return items;
@@ -607,11 +610,15 @@ function overviewView(){
   // Allocation (left) + Needs Attention (right), side by side — the latter
   // surfaces what actually needs a decision and fills the dashboard width.
   const items=attentionItems();
-  const attnHtml='<div style="font-size:11px;letter-spacing:1px;color:'+C.body+';margin-bottom:4px;">NEEDS ATTENTION'+(items.length?' <span style="color:'+C.amber+';">'+items.length+'</span>':'')+'</div>'+
+  const attnHtml='<div style="font-size:11px;letter-spacing:1px;color:'+C.body+';margin-bottom:2px;">NEEDS ATTENTION'+(items.length?' <span style="color:'+C.amber+';">'+items.length+'</span>':'')+'</div>'+
+    '<div style="font-size:9.5px;color:'+C.faint+';margin-bottom:4px;line-height:1.4;">Live read-out — derived <span style="color:'+AM+';">signals</span> (computed, not saved) and any <span style="color:'+DN+';">alerts</span> you\'ve armed. Click a row to jump there; nothing here trades on its own.</div>'+
     (items.length ? items.map(it=>'<div'+(it.act?' data-act="'+it.act+'" data-arg="'+esc(it.arg)+'"':'')+' style="display:flex;align-items:flex-start;gap:10px;padding:7px 0;border-top:1px solid '+C.hairline+';font-size:12px;'+(it.act?'cursor:pointer;':'')+'">'+
         '<span aria-hidden="true" style="flex-shrink:0;">'+it.icon+'</span>'+
         '<span style="color:'+(it.color||C.body)+';line-height:1.5;">'+esc(it.text)+'</span>'+
-        (it.act?'<span style="margin-left:auto;color:'+C.faint+';font-size:10px;flex-shrink:0;">→</span>':'')+
+        '<span style="margin-left:auto;display:flex;align-items:center;gap:7px;flex-shrink:0;">'+
+          (it.tag?'<span title="'+(it.tag==='SIGNAL'?'derived indicator — recomputed from prices, not a saved alert':it.tag==='ALERT'?'a threshold you armed has fired':'analyst suggestion')+'" style="font-size:8px;letter-spacing:0.5px;color:'+(it.tagColor||C.faint)+';border:1px solid '+(it.tagColor||C.faint)+';border-radius:3px;padding:1px 4px;opacity:0.85;">'+it.tag+'</span>':'')+
+          (it.act?'<span style="color:'+C.faint+';font-size:10px;">→</span>':'')+
+        '</span>'+
       '</div>').join('')
      : '<div style="padding:12px 0;color:'+C.faint+';font-size:11.5px;border-top:1px solid '+C.hairline+';">✓ All clear — no triggered alerts, no signal extremes, nothing pressing.</div>');
   html += '<div style="padding:16px;border-bottom:1px solid '+C.border+';display:flex;align-items:flex-start;gap:32px;flex-wrap:wrap;">'+
