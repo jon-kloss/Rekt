@@ -1364,6 +1364,44 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
+    #[tokio::test]
+    async fn ibkr_activity_statement_imports_through_the_endpoint() {
+        let state = test_state().await;
+        // A minimal Activity Statement: a funding deposit, a stock buy, an
+        // option trade (skipped), and the section subtotals IBKR emits.
+        let ibkr = "\
+Statement,Header,Field Name,Field Value\n\
+Statement,Data,BrokerName,Interactive Brokers LLC\n\
+Deposits & Withdrawals,Header,Currency,Settle Date,Description,Amount\n\
+Deposits & Withdrawals,Data,USD,2026-06-08,Electronic Fund Transfer,5000\n\
+Deposits & Withdrawals,Data,Total,,,5000\n\
+Trades,Header,DataDiscriminator,Asset Category,Currency,Symbol,Date/Time,Quantity,T. Price,Comm/Fee\n\
+Trades,Data,Order,Stocks,USD,AAPL,\"2026-06-10, 10:30:00\",10,150.25,-1\n\
+Trades,Data,Order,Equity and Index Options,USD,AAPL 240920C,\"2026-06-10, 10:30:00\",1,2.50,-1\n";
+        let request_body = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/import/csv?format=ibkr")
+            .header("content-type", "text/csv")
+            .body(axum::body::Body::from(ibkr))
+            .unwrap();
+        let response = app(state.clone()).oneshot(request_body).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["imported"], 2);
+        assert!(json["skipped"][0].as_str().unwrap().contains("Options"));
+
+        // The imported rows replay cleanly through the portfolio engine.
+        let (status, portfolio) = request(state.clone(), "GET", "/api/portfolio", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let p = &portfolio["portfolio"];
+        // 5000 deposited − (10 × 150.25 + 1 fee) = 3496.50 cash.
+        assert_eq!(p["cash"], "3496.50");
+        assert_eq!(p["positions"][0]["symbol"], "AAPL");
+        assert_eq!(p["positions"][0]["qty"], "10");
+    }
+
     /// Scripted Claude transport: returns canned responses in order.
     struct MockClaude {
         responses: std::sync::Mutex<Vec<serde_json::Value>>,
