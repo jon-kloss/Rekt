@@ -131,6 +131,7 @@ const S = {
   side:'buy', otype:'market', tSym:'', tQty:'5', tLimit:'', basket:[],
   importOpen:false, importFmt:'generic', importText:'', importPreview:null, importErr:'', importBusy:false,
   manageOpen:false, confirmDelPf:null,
+  newAlert:{sym:'',cond:'price_below',thr:'',note:''},
 };
 // M holds the latest server-derived data the views render from.
 const M = {
@@ -265,6 +266,21 @@ function sigBadges(sig){
   if(has(sig.vs_sma50_pct)){ const v=num(sig.vs_sma50_pct); out.push({ text:(v>=0?'▲':'▼')+'50d '+Math.abs(v)+'%', color:v>=0?UP:DN, title:'vs 50-day SMA' }); }
   if(has(sig.drawdown_pct) && num(sig.drawdown_pct)>=20) out.push({ text:'DD '+sig.drawdown_pct+'%', color:DN, title:'max drawdown' });
   return out;
+}
+
+// STAGE BUY / STAGE SELL on a position row. These open PAPER orders (a
+// simulated account), NOT trades against the tracked holding shown — so the
+// SELL is gated on the PAPER position and explains itself when the paper
+// account is flat in that symbol (the common case for imported holdings).
+function stageBtns(sym, fs, pad){
+  const paperHeld = (M.paperPositions && has(M.paperPositions[sym])) ? num(M.paperPositions[sym]) : 0;
+  const buyT = 'Stage a PAPER buy of ' + sym + ' (simulated account — separate from your tracked holdings)';
+  const sellT = paperHeld > 0
+    ? 'Stage a PAPER sell of ' + sym + ' (paper account holds ' + qtyFmt(paperHeld) + ')'
+    : 'Paper account holds 0 ' + sym + ' — STAGE BUY to open a paper position first (this does NOT sell your tracked holding)';
+  const sellLive = paperHeld > 0;
+  return '<button data-act="add" data-arg="' + esc(sym) + '" data-stop="1" title="' + esc(buyT) + '" style="font-family:inherit;font-size:' + fs + ';font-weight:600;color:' + UP + ';background:rgba(47,191,113,0.1);border:1px solid rgba(47,191,113,0.35);border-radius:3px;padding:' + pad + ';cursor:pointer;white-space:nowrap;">STAGE BUY</button>' +
+    '<button data-act="trim" data-arg="' + esc(sym) + '" data-stop="1" title="' + esc(sellT) + '" style="font-family:inherit;font-size:' + fs + ';font-weight:600;color:' + DN + ';background:rgba(255,92,87,' + (sellLive ? '0.1' : '0.04') + ');border:1px solid rgba(255,92,87,' + (sellLive ? '0.35' : '0.18') + ');border-radius:3px;padding:' + pad + ';cursor:pointer;white-space:nowrap;opacity:' + (sellLive ? '1' : '0.55') + ';">STAGE SELL</button>';
 }
 
 //================================================================ SVG chart builders (ported from the design's hand-drawn charts)
@@ -455,8 +471,8 @@ function alertBanner(){
       '<span style="font-size:12px;font-weight:600;color:'+C.bright+';">'+desc+'</span>'+
       '<span style="font-size:11.5px;color:'+C.body+';">hit '+hit+'</span>'+
       '<div style="margin-left:auto;display:flex;gap:8px;">'+
-        (a.draft?'<button data-act="reviewAlert" data-arg="'+a.id+'" style="font-family:inherit;font-size:10px;font-weight:600;color:'+C.bg+';background:'+C.amber+';border:none;border-radius:3px;padding:6px 12px;cursor:pointer;">REVIEW TICKET →</button>':'')+
-        '<button data-act="dismissAlert" data-arg="'+a.id+'" style="font-family:inherit;font-size:10px;color:'+C.label+';background:transparent;border:1px solid #1A212B;border-radius:3px;padding:6px 12px;cursor:pointer;">DISMISS</button>'+
+        (a.draft?'<button data-act="reviewAlert" data-arg="'+esc(a.id)+'" style="font-family:inherit;font-size:10px;font-weight:600;color:'+C.bg+';background:'+C.amber+';border:none;border-radius:3px;padding:6px 12px;cursor:pointer;">REVIEW TICKET →</button>':'')+
+        '<button data-act="dismissAlert" data-arg="'+esc(a.id)+'" style="font-family:inherit;font-size:10px;color:'+C.label+';background:transparent;border:1px solid #1A212B;border-radius:3px;padding:6px 12px;cursor:pointer;">DISMISS</button>'+
       '</div></div>';
   }).join('');
 }
@@ -487,8 +503,7 @@ function positionsView(){
         statCell('UNREALIZED', (sel.total!=null?signedMoney(sel.total):'—')+' <span style="font-size:10px;">'+(sel.totalPct!=null?signedPct(sel.totalPct):'')+'</span>', dirColor(sel.total)) +
       '</div>'+
       '<div style="display:flex;align-items:center;gap:8px;margin-top:14px;flex-wrap:wrap;"><span style="font-size:9px;color:'+C.label+';letter-spacing:0.5px;margin-right:4px;">SIGNALS</span>'+sigs+
-        '<div style="margin-left:auto;display:flex;gap:6px;"><button data-act="add" data-arg="'+esc(sel.sym)+'" style="font-family:inherit;font-size:10px;font-weight:600;color:'+UP+';background:rgba(47,191,113,0.1);border:1px solid rgba(47,191,113,0.35);border-radius:3px;padding:5px 12px;cursor:pointer;white-space:nowrap;">STAGE BUY</button>'+
-        '<button data-act="trim" data-arg="'+esc(sel.sym)+'" style="font-family:inherit;font-size:10px;font-weight:600;color:'+DN+';background:rgba(255,92,87,0.1);border:1px solid rgba(255,92,87,0.35);border-radius:3px;padding:5px 12px;cursor:pointer;white-space:nowrap;">STAGE SELL</button></div></div>'+
+        '<div style="margin-left:auto;display:flex;gap:6px;">'+stageBtns(sel.sym,'10px','5px 12px')+'</div></div>'+
     '</div>';
   }
   // table
@@ -509,8 +524,7 @@ function positionsView(){
       '<div style="text-align:right;color:'+dirColor(p.day)+';">'+(p.day!=null?signedMoney(p.day):'—')+'</div>'+
       '<div style="text-align:right;color:'+dirColor(p.total)+';">'+(p.total!=null?signedMoney(p.total):'—')+' <span style="font-size:9px;opacity:0.7;">'+(p.totalPct!=null?signedPct(p.totalPct):'')+'</span></div>'+
       '<div style="display:flex;gap:4px;flex-wrap:wrap;">'+sigs+'</div>'+
-      '<div style="display:flex;gap:4px;justify-content:flex-end;"><button data-act="add" data-arg="'+esc(p.sym)+'" data-stop="1" title="stage a buy" style="font-family:inherit;font-size:9.5px;font-weight:600;color:'+UP+';background:rgba(47,191,113,0.1);border:1px solid rgba(47,191,113,0.35);border-radius:3px;padding:3px 7px;cursor:pointer;white-space:nowrap;">STAGE BUY</button>'+
-      '<button data-act="trim" data-arg="'+esc(p.sym)+'" data-stop="1" title="stage a trim" style="font-family:inherit;font-size:9.5px;font-weight:600;color:'+DN+';background:rgba(255,92,87,0.1);border:1px solid rgba(255,92,87,0.35);border-radius:3px;padding:3px 7px;cursor:pointer;white-space:nowrap;">STAGE SELL</button></div>'+
+      '<div style="display:flex;gap:4px;justify-content:flex-end;">'+stageBtns(p.sym,'9.5px','3px 7px')+'</div>'+
     '</div>';
   }).join('');
   return html;
@@ -696,10 +710,30 @@ function analystView(){
   return html;
 }
 
+function alertCreateForm(){
+  const a=S.newAlert||{};
+  const conds=[['price_below','Price ≤ $'],['price_above','Price ≥ $'],['drawdown_above','Drawdown ≥ %']];
+  const condOpts=conds.map(c=>'<option value="'+c[0]+'"'+(c[0]===a.cond?' selected':'')+'>'+c[1]+'</option>').join('');
+  const inp=(id,val,ph,w)=>'<input id="'+id+'" value="'+esc(val||'')+'"'+(ph?' placeholder="'+esc(ph)+'"':'')+' style="width:'+(w||'100%')+';background:'+C.bg+';border:1px solid '+C.border+';border-radius:4px;color:'+C.bright+';font-family:inherit;font-size:12.5px;padding:8px 9px;outline:none;box-sizing:border-box;">';
+  const lbl=t=>'<div style="font-size:9px;letter-spacing:1px;color:'+C.label+';margin-bottom:4px;">'+t+'</div>';
+  return '<div style="padding:14px 16px;border-bottom:1px solid '+C.border+';background:'+C.panel2+';">'+
+    '<div style="font-size:11px;letter-spacing:1px;color:'+C.body+';margin-bottom:9px;">＋ NEW ALERT</div>'+
+    '<div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">'+
+      '<div style="width:110px;">'+lbl('SYMBOL')+inp('alSym',a.sym,S.selSym||'AAPL')+'</div>'+
+      '<div style="width:150px;">'+lbl('CONDITION')+'<select id="alCond" style="width:100%;background:'+C.bg+';border:1px solid '+C.border+';border-radius:4px;color:'+C.bright+';font-family:inherit;font-size:12.5px;padding:8px 9px;outline:none;">'+condOpts+'</select></div>'+
+      '<div style="width:110px;">'+lbl(a.cond==='drawdown_above'?'PERCENT':'PRICE')+inp('alThr',a.thr,a.cond==='drawdown_above'?'20':'0.00')+'</div>'+
+      '<div style="flex:1;min-width:140px;">'+lbl('NOTE (optional)')+inp('alNote',a.note,'why this matters')+'</div>'+
+      '<button data-act="createAlert" style="font-family:inherit;font-size:11px;font-weight:600;letter-spacing:0.5px;color:'+C.bg+';background:'+C.amber+';border:none;border-radius:4px;padding:9px 16px;cursor:pointer;white-space:nowrap;">ARM ALERT</button>'+
+    '</div>'+
+    '<div style="font-size:10px;color:'+C.faint+';margin-top:8px;line-height:1.5;">Alerts watch your tracked positions and the broadcaster fires them in real time. An already-true condition is rejected (it would fire instantly) — pick a level the market hasn\'t reached yet.</div>'+
+  '</div>';
+}
+
 function alertsView(){
   const cols='1.4fr 0.8fr 1.2fr 1.5fr 1.3fr 0.5fr';
   const CL={ price_below:'≤ $',price_above:'≥ $',drawdown_above:'DD ≥ ' };
-  let html='<div style="display:grid;grid-template-columns:'+cols+';gap:10px;padding:8px 16px;font-size:9.5px;letter-spacing:0.5px;color:'+C.label+';border-bottom:1px solid '+C.border+';"><div>ALERT</div><div>STATUS</div><div>TRIGGERED</div><div>DRAFT ORDER</div><div>NOTE</div><div style="text-align:right;">RE-ARM</div></div>';
+  let html=alertCreateForm();
+  html+='<div style="display:grid;grid-template-columns:'+cols+';gap:10px;padding:8px 16px;font-size:9.5px;letter-spacing:0.5px;color:'+C.label+';border-bottom:1px solid '+C.border+';"><div>ALERT</div><div>STATUS</div><div>TRIGGERED</div><div>DRAFT ORDER</div><div>NOTE</div><div style="text-align:right;">RE-ARM</div></div>';
   if(!M.alerts.length){ html+='<div style="padding:22px 16px;text-align:center;color:'+C.faint+';font-size:11px;">no alerts set</div>'; }
   else html += M.alerts.map(a=>{
     const sc=a.status==='triggered'?DN:a.status==='active'?UP:'#8A93A6';
@@ -708,7 +742,7 @@ function alertsView(){
     const draft=a.draft?esc((a.draft.side||'').toUpperCase()+' '+a.draft.qty+' '+a.draft.order_type+(a.draft.limit_price?' @ '+a.draft.limit_price:'')):'—';
     return '<div style="display:grid;grid-template-columns:'+cols+';gap:10px;padding:11px 16px;border-bottom:1px solid '+C.hairline+';align-items:center;font-size:12px;"><div style="font-weight:600;color:'+C.bright+';">'+desc+'</div>'+
       '<div style="color:'+sc+';font-size:10px;letter-spacing:0.5px;">'+esc(a.status)+'</div><div style="color:'+C.label+';">'+trig+'</div><div style="color:'+C.body+';">'+draft+'</div><div style="color:'+C.label+';">'+(esc(a.note)||'—')+'</div>'+
-      '<div style="text-align:right;"><button data-act="rearmAlert" data-arg="'+a.id+'" aria-label="Re-arm alert" style="background:none;border:none;color:'+C.label+';cursor:pointer;font-size:13px;padding:0;">↻</button></div></div>';
+      '<div style="text-align:right;display:flex;gap:8px;justify-content:flex-end;align-items:center;"><button data-act="rearmAlert" data-arg="'+esc(a.id)+'" aria-label="Re-arm alert" title="Re-arm" style="background:none;border:none;color:'+C.label+';cursor:pointer;font-size:13px;padding:0;">↻</button><button data-act="deleteAlert" data-arg="'+esc(a.id)+'" aria-label="Delete alert" title="Delete alert" style="background:none;border:none;color:'+C.faint+';cursor:pointer;font-size:12px;padding:0;line-height:1;">✕</button></div></div>';
   }).join('');
   html += '<div style="padding:12px 16px;font-size:10.5px;color:'+C.label+';line-height:1.55;">Alerts carry an optional pre-staged draft order. When the condition fires it surfaces in the banner above with a one-click <span style="color:'+C.amber+';">REVIEW TICKET</span> — the order still routes through the docked ticket and your confirm.</div>';
   return html;
@@ -814,7 +848,8 @@ function dock(){
   const input=(id,val,label,ph)=>'<div><div style="font-size:9.5px;letter-spacing:1px;color:'+C.label+';margin-bottom:5px;">'+label+'</div><input id="'+id+'" value="'+esc(val)+'"'+(ph?' placeholder="'+ph+'"':'')+' style="width:100%;background:'+C.bg+';border:1px solid '+C.border+';border-radius:4px;color:'+C.bright+';font-family:inherit;font-size:13px;padding:9px 10px;outline:none;"></div>';
 
   let ticketHtml='<div style="padding:14px 16px;border-bottom:1px solid '+C.border+';">'+
-    '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:8px;"><span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">ORDER TICKET</span><span style="display:flex;align-items:center;gap:8px;"><span style="font-size:10px;color:'+C.faint+';">'+(t.held?'HOLD '+qtyFmt(t.held.qty)+(t.held.avg!=null?' @ '+money(t.held.avg):''):'NO POSITION')+'</span><button data-act="toggleDock" title="Collapse order ticket (T)" aria-label="Collapse order ticket" aria-expanded="true" style="background:transparent;border:1px solid #1A212B;border-radius:3px;color:'+C.label+';font-size:12px;line-height:1;padding:2px 7px;cursor:pointer;">›</button></span></div>'+
+    '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:8px;"><span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">ORDER TICKET <span style="font-size:8px;letter-spacing:0.5px;color:'+AM+';border:1px solid rgba(199,162,75,0.4);border-radius:3px;padding:1px 4px;vertical-align:middle;">PAPER</span></span><span style="display:flex;align-items:center;gap:8px;"><span style="font-size:10px;color:'+C.faint+';">'+(t.held?'PAPER HOLDS '+qtyFmt(t.held.qty)+(t.held.avg!=null?' @ '+money(t.held.avg):''):'PAPER: flat')+'</span><button data-act="toggleDock" title="Collapse order ticket (T)" aria-label="Collapse order ticket" aria-expanded="true" style="background:transparent;border:1px solid #1A212B;border-radius:3px;color:'+C.label+';font-size:12px;line-height:1;padding:2px 7px;cursor:pointer;">›</button></span></div>'+
+    '<div style="font-size:10px;color:'+C.faint+';line-height:1.45;margin-bottom:12px;padding:7px 9px;background:rgba(199,162,75,0.07);border:1px solid rgba(199,162,75,0.25);border-radius:4px;">Simulated <b style="color:'+AM+';">paper</b> account — separate from your tracked holdings on the left. Practice trades here; fills never change your imported positions.</div>'+
     '<div style="display:grid;grid-template-columns:1fr 1fr;border:1px solid '+C.border+';border-radius:4px;overflow:hidden;margin-bottom:8px;">'+segBtn('setBuy','BUY',buyOn)+segBtn('setSell','SELL',sellOn,null,null,'border-left:1px solid '+C.border+';')+'</div>'+
     '<div style="display:grid;grid-template-columns:1fr 1fr;border:1px solid '+C.border+';border-radius:4px;overflow:hidden;margin-bottom:12px;">'+segBtn('setMkt','MARKET',mktOn,null,8)+segBtn('setLim','LIMIT',limOn,null,8,'border-left:1px solid '+C.border+';')+'</div>'+
     '<div style="display:grid;grid-template-columns:1.4fr 1fr;gap:8px;margin-bottom:8px;">'+input('tSym',S.tSym,'SYMBOL')+input('tQty',S.tQty,'QTY')+'</div>'+
@@ -981,7 +1016,7 @@ function render(){
         '<span style="font-size:11px;font-variant-numeric:tabular-nums;color:'+dirColor(M.dayPnl)+';">DAY '+(M.ready?signedMoney(M.dayPnl):'—')+'</span>'+
         portfolioSelect()+
         '<button data-act="manageOpen" aria-label="Manage portfolios" title="Manage portfolios" style="font-family:inherit;font-size:11px;color:'+C.label+';background:transparent;border:1px solid #1A212B;border-radius:4px;padding:4px 7px;cursor:pointer;">⚙</button>'+
-        '<span style="font-size:10px;letter-spacing:0.5px;color:'+C.amber+';">[ PAPER ]</span>'+
+        '<span title="The order ticket trades a SIMULATED paper account (Alpaca paper), separate from your tracked holdings — fills never change your imported positions. The numbers on the dashboard are your real tracked book." style="font-size:10px;letter-spacing:0.5px;color:'+C.amber+';cursor:help;">[ PAPER ]</span>'+
         '<span style="font-size:11px;color:'+marketColor+';display:flex;align-items:center;gap:6px;"><span style="width:6px;height:6px;border-radius:50%;background:'+marketColor+';"></span>'+(M.market==='open'?'MKT OPEN':'MKT CLOSED')+'</span>'+
         '<span style="font-size:11px;color:'+UP+';display:flex;align-items:center;gap:6px;"><span style="width:6px;height:6px;border-radius:50%;background:'+UP+';animation:pulse 1.4s ease infinite;"></span>'+clock+'</span>'+
         '<button data-act="importOpen" title="Import transactions from CSV (Fidelity, Schwab, Robinhood, IBKR, or generic)" style="font-family:inherit;font-size:10px;letter-spacing:0.5px;color:'+C.label+';background:transparent;border:1px solid #1A212B;padding:5px 10px;border-radius:4px;cursor:pointer;">⬆ IMPORT</button>'+
@@ -1049,7 +1084,15 @@ function addToBasket(side,sym,qty,otype,limit){
   S.dockOpen=true; return true;
 }
 function quickAdd(sym){ const p=M.positions.find(x=>x.sym===sym); const q=p?Math.max(1,Math.round(p.qty*0.25)):1; if(addToBasket('buy',sym,q,'market')) toast('STAGED BUY '+q+' '+sym+' → ticket basket'); render(); }
-function quickTrim(sym){ const p=M.positions.find(x=>x.sym===sym); if(!p) return; const q=Math.max(0.0001,Math.round(p.qty*0.25*10000)/10000); if(addToBasket('sell',sym,q,'market')) toast('STAGED SELL '+qtyFmt(q)+' '+sym+' → ticket basket'); render(); }
+function quickTrim(sym){
+  // STAGE SELL stages a PAPER sell — size it off the PAPER position, not the
+  // tracked holding. If the paper account is flat in this name (the usual case
+  // for imported holdings), say so instead of staging a doomed long-only sell.
+  const ph=(M.paperPositions && has(M.paperPositions[sym]))?num(M.paperPositions[sym]):0;
+  if(ph<=0){ toast('PAPER account holds 0 '+sym+' — STAGE BUY to open a paper position first (your tracked holding is untouched)'); return; }
+  const q=Math.max(0.0001,Math.round(ph*0.25*10000)/10000);
+  if(addToBasket('sell',sym,q,'market')) toast('STAGED SELL '+qtyFmt(q)+' '+sym+' → ticket basket'); render();
+}
 function loadSym(sym){ sym=(sym||'').toUpperCase(); S.tSym=sym; S.view='positions'; if(M.positions.find(p=>p.sym===sym)) S.selSym=sym; toast('LOADED '+sym+' INTO TICKET'); }
 function runCmd(raw){
   const str=(raw||'').trim(); if(!str) return;
@@ -1114,6 +1157,8 @@ async function act(name, arg){
       } else { S.confirmDelTx=arg; render(); } // first click — arm
       break;
     case 'halt': try{ await japi('POST','/api/trading/pause',{ paused:!S.halted }); S.halted=!S.halted; toast(S.halted?'TRADING HALTED':'TRADING RESUMED'); render(); }catch(e){ toast('FAILED: '+e.message); } break;
+    case 'createAlert': createAlert(); break;
+    case 'deleteAlert': try{ await japi('DELETE','/api/alerts/'+arg); toast('ALERT DELETED'); await refreshSilent(); }catch(e){ toast(e.message); } break;
     case 'dismissAlert': try{ await japi('POST','/api/alerts/'+arg+'/dismiss'); await refreshSilent(); }catch(e){ toast(e.message); } break;
     case 'rearmAlert': try{ await japi('POST','/api/alerts/'+arg+'/rearm'); await refreshSilent(); }catch(e){ toast(e.message); } break;
     case 'reviewAlert': { const a=M.alerts.find(x=>x.id==arg); if(a&&a.draft){ if(addToBasket(a.draft.side,a.sym,a.draft.qty,a.draft.order_type,a.draft.limit_price)) toast('STAGED '+a.sym+' FROM ALERT → ticket basket'); render(); } break; }
@@ -1203,6 +1248,20 @@ async function newPortfolio(){
   toast((created?'CREATED "':'"')+name+'" — switching…');
   await switchPortfolio(name);
 }
+async function createAlert(){
+  const a=S.newAlert||{};
+  const sym=(a.sym||'').trim().toUpperCase();
+  const thr=String(a.thr||'').trim();
+  if(!sym||!thr){ toast('Symbol and threshold are required'); return; }
+  const body={ symbol:sym, condition:a.cond||'price_below', threshold:thr };
+  if((a.note||'').trim()) body.note=(a.note||'').trim();
+  try{
+    await japi('POST','/api/alerts',body);
+    toast('ALERT ARMED · '+sym);
+    S.newAlert={sym:'',cond:a.cond||'price_below',thr:'',note:''};
+    await refreshSilent(); render();
+  }catch(e){ toast(e.message); render(); }
+}
 async function deletePortfolio(name){
   try{
     await japi('DELETE','/api/portfolios/'+encodeURIComponent(name));
@@ -1230,11 +1289,15 @@ document.addEventListener('input', (e)=>{
   if(id==='tQty'){ S.tQty=e.target.value; patchTicket(); return; }
   if(id==='tLimit'){ S.tLimit=e.target.value; patchTicket(); return; }
   if(id==='importtext'){ S.importText=e.target.value; if(S.importPreview){ S.importPreview=null; render(); } return; } // editing invalidates a prior preview
+  if(id==='alSym'){ S.newAlert.sym=e.target.value.toUpperCase(); return; }
+  if(id==='alThr'){ S.newAlert.thr=e.target.value; return; }
+  if(id==='alNote'){ S.newAlert.note=e.target.value; return; }
   if(id==='__taxyear'){ }
 });
 document.addEventListener('change', (e)=>{
   if(e.target.getAttribute && e.target.getAttribute('data-act')==='taxYear'){ M.taxYear=Number(e.target.value); reloadTax(); return; }
   if(e.target.id==='pfsel'){ const v=e.target.value; if(v==='__new__'){ e.target.value=M.activePortfolio||(M.portfolios[0]&&M.portfolios[0].name)||''; newPortfolio(); } else { switchPortfolio(v); } return; }
+  if(e.target.id==='alCond'){ S.newAlert.cond=e.target.value; render(); return; }
   if(e.target.id==='importfmt'){ S.importFmt=e.target.value; S.importPreview=null; S.importErr=''; render(); return; }
   if(e.target.id==='importfile'){
     const f=e.target.files && e.target.files[0];
