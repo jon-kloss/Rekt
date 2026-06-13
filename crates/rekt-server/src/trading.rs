@@ -25,7 +25,7 @@ use axum::{
 };
 use chrono::{DateTime, Duration, Utc};
 use chrono_tz::America::New_York;
-use rekt_broker::{stream::BrokerEvent, Broker, BrokerError, BrokerOrder, Execution};
+use rekt_broker::{stream::BrokerEvent, AccountInfo, Broker, BrokerError, BrokerOrder, Execution};
 use rekt_core::orders::{check_ticket, OrderStatus, OrderTicket, Side};
 use rekt_core::portfolio::compute_basis;
 use rust_decimal::Decimal;
@@ -48,6 +48,15 @@ pub struct TradingState {
     /// (revision, rendered orders JSON) — avoids a DB query per broadcast
     /// tick when no order changed.
     orders_cache: RwLock<(u64, serde_json::Value)>,
+    /// Cached paper broker account (cash/equity/buying_power). Refreshed on
+    /// reconcile, fills, and order submit — NEVER fetched on the broadcast
+    /// path. Lets the order ticket size against the account that actually
+    /// executes instead of the (segregated) tracked live portfolio.
+    account_cache: RwLock<Option<rekt_broker::AccountInfo>>,
+    /// (tx_revision, paper holdings JSON {symbol: qty}). Gated like the live
+    /// basis cache so the broadcast path never re-reads the paper log unless
+    /// a fill/tx landed.
+    paper_positions_cache: RwLock<(u64, serde_json::Value)>,
 }
 
 impl TradingState {
@@ -57,6 +66,31 @@ impl TradingState {
 }
 
 const PAUSED_SETTING: &str = "trading.paused";
+const CLIENT_ID_NONCE_SETTING: &str = "client_order_id.nonce";
+
+/// Per-database nonce mixed into every `client_order_id`. The broker account
+/// outlives any single database (a paper account persists across resets,
+/// backups, and restores), and a deterministic `rekt-{mode}-{rowid}` id would
+/// REPLAY ids 1, 2, 3… on a fresh/restored DB — which the broker rejects with
+/// "client_order_id must be unique". Generated once and persisted, so ids stay
+/// stable for crash-recovery WITHIN an install while a FRESH or RESET database
+/// gets a new nonce and never replays a prior DB's ids. (Restoring a backup
+/// taken AFTER some orders were placed still carries the same nonce and could
+/// replay those exact ids — harmless, since those orders are terminal and the
+/// broker rejecting a duplicate is the desired idempotency.)
+async fn ensure_client_id_nonce(pool: &SqlitePool) -> Result<String> {
+    if let Some(nonce) = repo::get_setting(pool, CLIENT_ID_NONCE_SETTING).await? {
+        return Ok(nonce);
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let nonce = format!("{:x}{:x}", std::process::id(), nanos);
+    repo::set_setting(pool, CLIENT_ID_NONCE_SETTING, &nonce).await?;
+    tracing::info!(%nonce, "minted per-database client_order_id nonce");
+    Ok(nonce)
+}
 
 /// Restore persisted flags at startup.
 pub async fn load_persisted(state: &AppState) -> Result<()> {
@@ -162,6 +196,8 @@ async fn insert_pending_order(
     ticket: &OrderTicket,
     mode: &str,
 ) -> Result<(i64, String)> {
+    // Off-transaction: a per-DB nonce so ids never replay against the broker.
+    let nonce = ensure_client_id_nonce(pool).await?;
     let mut dbtx = pool.begin().await?;
     let instrument_id = repo::ensure_instrument(&mut dbtx, &ticket.symbol).await?;
     let now = Utc::now().to_rfc3339();
@@ -184,8 +220,10 @@ async fn insert_pending_order(
     .await?
     .last_insert_rowid();
 
-    // Deterministic, derived from the rowid we just claimed.
-    let client_order_id = format!("rekt-{mode}-{id}");
+    // Deterministic within this DB: per-database nonce + the rowid we just
+    // claimed. The nonce keeps ids unique across DB resets/restores (see
+    // ensure_client_id_nonce) while staying stable for crash-recovery.
+    let client_order_id = format!("rekt-{mode}-{nonce}-{id}");
     sqlx::query("UPDATE orders SET client_order_id = ? WHERE id = ?")
         .bind(&client_order_id)
         .bind(id)
@@ -381,10 +419,11 @@ pub async fn apply_event(state: &AppState, event: BrokerEvent) -> Result<()> {
             let bo = order.into_broker_order();
             tracing::info!(client_order_id = %bo.client_order_id, event = %event, "order update");
 
-            let outcome = {
+            let (outcome, filled) = {
                 // Serialize with manual mutations: fill ingestion writes the
                 // transaction log too.
                 let _guard = state.mutations.lock().await;
+                let mut filled = false;
                 let outcome = apply_broker_order(&state.db, &bo).await?;
                 if outcome != ApplyOutcome::Unknown {
                     if let Some(stream_execution) = &execution {
@@ -418,12 +457,21 @@ pub async fn apply_event(state: &AppState, event: BrokerEvent) -> Result<()> {
                             .await?;
                             if ingested {
                                 state.live.bump_tx_revision();
+                                filled = true;
                             }
                         }
                     }
                 }
-                outcome
+                (outcome, filled)
             };
+            // A fill changed paper cash/positions — refresh the cached account
+            // OUTSIDE the mutations lock: a slow/hung broker account endpoint
+            // must never block writers (submit_order, reconcile, other fills).
+            // The positions cache self-heals via tx_revision on the next
+            // snapshot regardless; this only keeps the ticket's BP fresh.
+            if filled {
+                refresh_account_cache(state).await;
+            }
             if outcome == ApplyOutcome::Unknown {
                 tracing::warn!(client_order_id = %bo.client_order_id,
                     "update for unknown order — reconciling");
@@ -526,6 +574,9 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
         Err(e) => tracing::error!(error = %e, "fill backfill failed"),
     }
 
+    // Prime the cached paper account so the order ticket can size against it
+    // (buying power / oversell / position cap) from the first snapshot.
+    refresh_account_cache(state).await;
     state.trading.ready.store(true, Ordering::Relaxed);
     state.trading.bump_orders();
     state.live.mark_dirty();
@@ -601,7 +652,12 @@ pub async fn submit_order(
     // is the equity source for the position cap (the local paper log has
     // no cash deposits).
     let account_equity = match broker.account().await {
-        Ok(account) => Some(account.equity),
+        Ok(account) => {
+            let equity = account.equity;
+            // Reuse this required fetch to refresh the ticket's cached account.
+            cache_account(&state, account).await;
+            Some(equity)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "account fetch failed — position cap will use local basis");
             None
@@ -821,11 +877,84 @@ pub async fn snapshot_block(state: &AppState) -> serde_json::Value {
             fresh
         }
     };
+    // Paper account + holdings the order ticket can ACTUALLY trade. The
+    // headline portfolio stays the (segregated) live tracked one; these let
+    // the client size buying power / oversell / position-cap against the
+    // account that executes. Account comes from a cache refreshed off the
+    // broadcast path; positions are gated on tx_revision (paper fills bump
+    // it) so we never re-read the log per tick.
+    let tx_rev = state.live.tx_revision();
+    let positions = {
+        let cache = state.trading.paper_positions_cache.read().await;
+        if cache.0 == tx_rev && !cache.1.is_null() {
+            cache.1.clone()
+        } else {
+            drop(cache);
+            let pos = active_positions_json(state, broker.mode().as_str()).await;
+            *state.trading.paper_positions_cache.write().await = (tx_rev, pos.clone());
+            pos
+        }
+    };
+    let account = state
+        .trading
+        .account_cache
+        .read()
+        .await
+        .as_ref()
+        .map(|a| serde_json::json!({ "cash": a.cash, "equity": a.equity, "buying_power": a.buying_power }));
     serde_json::json!({
         "enabled": true,
         "mode": broker.mode().as_str(),
         "ready": state.trading.ready.load(Ordering::Relaxed),
         "paused": state.trading.paused.load(Ordering::Relaxed),
         "orders": orders,
+        "account": account,
+        "positions": positions,
     })
+}
+
+/// Holdings for the currently-active broker mode as a `{symbol: qty}` JSON
+/// object (zero-qty filtered out), from that mode's transaction log. Today
+/// the broker is always paper, but this reads `mode` so it stays correct if a
+/// live broker is ever wired. Used only off-tick (gated by the caller on
+/// tx_revision).
+async fn active_positions_json(state: &AppState, mode: &str) -> serde_json::Value {
+    let txs = match repo::fetch_mode_txs(&state.db, mode).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "paper positions fetch failed");
+            return serde_json::json!({});
+        }
+    };
+    match compute_basis(&txs) {
+        Ok(basis) => {
+            let map: serde_json::Map<String, serde_json::Value> = basis
+                .positions
+                .iter()
+                .filter(|(_, p)| p.qty != Decimal::ZERO)
+                .map(|(s, p)| (s.clone(), serde_json::json!(p.qty)))
+                .collect();
+            serde_json::Value::Object(map)
+        }
+        Err(_) => serde_json::json!({}),
+    }
+}
+
+/// Refresh the cached paper account from the broker. Called off the
+/// broadcast path (reconcile, fills, order submit) so snapshots read the
+/// cache only and never make a network call per tick.
+pub async fn refresh_account_cache(state: &AppState) {
+    let Some(broker) = &state.broker else {
+        return;
+    };
+    match broker.account().await {
+        Ok(acct) => *state.trading.account_cache.write().await = Some(acct),
+        Err(e) => tracing::warn!(error = %e, "paper account cache refresh failed"),
+    }
+}
+
+/// Store an already-fetched account into the cache (submit path reuses the
+/// account call it must make anyway).
+pub async fn cache_account(state: &AppState, account: AccountInfo) {
+    *state.trading.account_cache.write().await = Some(account);
 }

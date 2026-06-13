@@ -306,6 +306,22 @@ pub async fn last_candle_date(pool: &SqlitePool, symbol: &str) -> Result<Option<
     Ok(date.as_deref().and_then(|s| s.parse().ok()))
 }
 
+/// Earliest cached candle date for a symbol. Pairs with [`last_candle_date`]
+/// so backfill can tell when its cached window starts LATER than the range
+/// now needed (older transactions added after the symbol was first cached at
+/// a shorter window) and fill the earlier gap.
+pub async fn first_candle_date(pool: &SqlitePool, symbol: &str) -> Result<Option<NaiveDate>> {
+    let row = sqlx::query(
+        r#"SELECT MIN(c.date) AS d FROM candles c
+           JOIN instruments i ON i.id = c.instrument_id WHERE i.symbol = ?"#,
+    )
+    .bind(symbol)
+    .fetch_one(pool)
+    .await?;
+    let date: Option<String> = row.get("d");
+    Ok(date.as_deref().and_then(|s| s.parse().ok()))
+}
+
 /// All cached closes for the given symbols, keyed by symbol.
 pub async fn closes_map(pool: &SqlitePool, symbols: &[String]) -> Result<HashMap<String, Closes>> {
     closes_map_since(pool, symbols, None).await
@@ -879,13 +895,17 @@ pub async fn list_recommendations(
 pub async fn set_recommendation_status(pool: &SqlitePool, id: i64, status: &str) -> Result<bool> {
     // The expiry clause pairs with list_recommendations' computed status:
     // a lapsed recommendation presents as 'expired' and cannot be moved.
+    // Idempotent on the target status: the UI keeps a STAGE/DROP button on
+    // already-accepted/dismissed recs, so re-issuing the same transition must
+    // succeed (no 409) rather than fail because the row left 'open'.
     let result = sqlx::query(
         r#"UPDATE recommendations SET status = ?
-           WHERE id = ? AND status = 'open'
+           WHERE id = ? AND (status = 'open' OR status = ?)
              AND (expires_ts IS NULL OR expires_ts >= ?)"#,
     )
     .bind(status)
     .bind(id)
+    .bind(status)
     .bind(Utc::now().to_rfc3339())
     .execute(pool)
     .await?;
