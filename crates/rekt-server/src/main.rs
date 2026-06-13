@@ -792,10 +792,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn csv_import_orders_same_day_buy_before_sell() {
+        let state = test_state().await;
+        // A same-timestamp round trip with the SELL listed ABOVE the BUY (as a
+        // newest-first brokerage export would). Without acquire-before-dispose
+        // ordering the sell would replay first, spuriously oversell, and be
+        // dropped — losing realized P&L. All three rows must import.
+        let csv = "kind,symbol,qty,price,fees,taxes,ts,note\n\
+                   deposit,,,1000,,,2026-01-01T15:00:00Z,seed\n\
+                   sell,AAPL,5,110,,,2026-02-01T21:00:00Z,same-day close\n\
+                   buy,AAPL,5,100,,,2026-02-01T21:00:00Z,same-day open";
+        let request_body = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/import/csv")
+            .header("content-type", "text/csv")
+            .body(axum::body::Body::from(csv))
+            .unwrap();
+        let response = app(state.clone()).oneshot(request_body).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["imported"], 3, "{body}"); // nothing dropped
+        let (_, txs) = request(state.clone(), "GET", "/api/transactions", None).await;
+        assert_eq!(txs.as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
     async fn csv_import_dry_run_validates_without_inserting() {
         let state = test_state().await;
         let csv = "kind,symbol,qty,price,fees,taxes,ts,note\n\
-                   deposit,,,2000,,,,seed\n\
+                   deposit,,,2000,,,2026-01-01T15:00:00Z,seed\n\
                    buy,AAPL,5,100,1,,2026-01-05T15:00:00Z,first buy";
 
         // Dry run: reports what WOULD import, writes nothing.

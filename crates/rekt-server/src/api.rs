@@ -219,9 +219,11 @@ async fn reconcile_import(
                 symbol, have, want, ..
             } => {
                 dropped.push(format!(
-                    "line {line}: sell {want} {symbol} skipped — only {have} held in this \
-                     import (position opened before the export window, or changed by a split/\
-                     merger this importer doesn't model). Add an opening lot manually to track it."
+                    "line {line}: sell {want} {symbol} skipped — only {have} held in this import. \
+                     {symbol} may still show shares here that you actually sold, and this sale's \
+                     proceeds and realized P&L are NOT recorded. Cause: the opening lot predates \
+                     this export, or a split/merger this importer doesn't model changed the share \
+                     count. Fix by adding an opening lot (or adjusting {symbol}) manually."
                 ));
                 kept.retain(|&k| k != idx);
             }
@@ -361,6 +363,39 @@ pub async fn import_csv(
             },
         ));
     }
+    // Bound the reconcile replay (O(n²) worst case on all-oversell input).
+    const MAX_IMPORT_ROWS: usize = 10_000;
+    if new_txs.len() > MAX_IMPORT_ROWS {
+        return Err(err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "import has {} mapped rows; the limit is {MAX_IMPORT_ROWS} — split the file",
+                new_txs.len()
+            ),
+        ));
+    }
+
+    // Replay order is (ts, id) everywhere and ids are assigned at INSERT time,
+    // so insert order decides same-timestamp tie-breaks. Brokerage exports are
+    // newest-first and don't guarantee buy-before-sell within a day (Robinhood
+    // normalizes every row to 4pm NY, collapsing a same-day round-trip to one
+    // timestamp). Sort so that for any timestamp, acquisitions/credits land
+    // before disposals — otherwise a same-day sell could spuriously oversell a
+    // same-day buy and be dropped. Stable on the original file order otherwise.
+    {
+        use rekt_core::portfolio::TxKind;
+        let rank = |k: TxKind| matches!(k, TxKind::Sell | TxKind::Withdrawal) as u8;
+        let mut order: Vec<usize> = (0..new_txs.len()).collect();
+        order.sort_by(|&a, &b| {
+            new_txs[a]
+                .ts
+                .cmp(&new_txs[b].ts)
+                .then(rank(new_txs[a].kind).cmp(&rank(new_txs[b].kind)))
+                .then(a.cmp(&b))
+        });
+        new_txs = order.iter().map(|&i| new_txs[i].clone()).collect();
+        new_tx_lines = order.iter().map(|&i| new_tx_lines[i]).collect();
+    }
 
     let _guard = state.mutations.lock().await;
     // Replay-validate; drop (and report) candidate sells that can't be backed
@@ -369,6 +404,9 @@ pub async fn import_csv(
     let (keep, dropped) = reconcile_import(&state, &new_txs, &new_tx_lines).await?;
     if keep.len() != new_txs.len() {
         new_txs = keep.iter().map(|&i| new_txs[i].clone()).collect();
+        // NOTE: new_tx_lines is intentionally NOT re-filtered here — it has
+        // already served reconcile_import and nothing past this point reads it.
+        // If a future validation step needs line numbers, filter it in parallel.
     }
     skipped.extend(dropped);
     if new_txs.is_empty() {
@@ -377,6 +415,27 @@ pub async fn import_csv(
             "no importable rows remain after reconciliation — every mapped trade was an \
              un-backable sell (positions opened before this export's window)"
                 .to_string(),
+        ));
+    }
+
+    // Corporate actions (splits/mergers/spin-offs) are skipped, but unlike an
+    // un-backable sell they can leave a position's share count silently WRONG
+    // without ever tripping an oversell (e.g. a reverse split that isn't
+    // applied). Surface a reconcile-risk caveat so the user knows to verify.
+    const CORP_ACTION_CODES: &[&str] = &["SPR", "MRGS", "SOFF", "SDIV", "BCXL", "SPL"];
+    let corp_actions = skipped
+        .iter()
+        .filter(|s| {
+            CORP_ACTION_CODES
+                .iter()
+                .any(|c| s.contains(&format!("\"{c}\"")))
+        })
+        .count();
+    if corp_actions > 0 {
+        skipped.push(format!(
+            "NOTE: {corp_actions} corporate-action row(s) (splits / mergers / spin-offs) were \
+             skipped — affected positions' imported share counts may not match your broker. \
+             Verify those positions and adjust the quantity manually if needed."
         ));
     }
 

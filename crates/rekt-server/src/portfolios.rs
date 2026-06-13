@@ -392,6 +392,12 @@ pub async fn delete(
     }
 
     let entry = reg.portfolios.remove(idx);
+    // Persist the registry BEFORE touching the file. A crash between the two
+    // then leaves at worst an orphaned DB file (harmless, recoverable) rather
+    // than a registry that still names a portfolio whose file is gone (which
+    // would fail to open on next boot).
+    save(&state.data_dir, &reg).map_err(internal)?;
+
     // Only delete the file if no remaining entry references it (defends against
     // a legacy registry where two names mapped to the same DB) — never delete a
     // file another portfolio, or the active pool, still uses.
@@ -416,7 +422,6 @@ pub async fn delete(
         }
     }
 
-    save(&state.data_dir, &reg).map_err(internal)?;
     tracing::info!(name = %name, "portfolio deleted");
     Ok(Json(json!({ "deleted": name })))
 }

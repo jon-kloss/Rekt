@@ -1190,7 +1190,10 @@ async function newPortfolio(){
     // auto-switch was blocked by an open order). Refresh first so the entry
     // appears, then fall through to switching to it; surface any other error.
     await refreshPortfolios(); render();
-    const exists=(M.portfolios||[]).some(p=>(p.name||'').toLowerCase()===name.toLowerCase());
+    // Exact-name match only: a case/slug-collision 409 names a DIFFERENT
+    // portfolio, so falling through would silently switch to the wrong one —
+    // surface the error instead.
+    const exists=(M.portfolios||[]).some(p=>p.name===name);
     if(!exists){ toast(e.message); return; }
   }
   // Make the new portfolio visible in the dropdown REGARDLESS of whether the
