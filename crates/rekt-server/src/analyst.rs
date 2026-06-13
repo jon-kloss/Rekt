@@ -360,26 +360,29 @@ pub async fn run_analysis(state: AppState, id: i64, kind: String, question: Opti
             // the report + persisted recommendations. A parse failure is an
             // honest error (with the tokens we PAID for still accounted),
             // never a silently-mangled report.
-            let (report, error): (String, Option<String>) = if kind == "weekly_review" {
-                match serde_json::from_str::<Value>(&outcome.text) {
-                    Ok(parsed) => {
-                        store_recommendations(&state, id, &parsed).await;
-                        (
-                            parsed["report_md"]
-                                .as_str()
-                                .unwrap_or(&outcome.text)
-                                .to_string(),
-                            None,
-                        )
+            // The CLI backend returns prose (no structured schema), so only
+            // the API-backed weekly review parses into recommendations.
+            let (report, error): (String, Option<String>) =
+                if kind == "weekly_review" && !state.analyst_cli {
+                    match serde_json::from_str::<Value>(&outcome.text) {
+                        Ok(parsed) => {
+                            store_recommendations(&state, id, &parsed).await;
+                            (
+                                parsed["report_md"]
+                                    .as_str()
+                                    .unwrap_or(&outcome.text)
+                                    .to_string(),
+                                None,
+                            )
+                        }
+                        Err(e) => (
+                            outcome.text.clone(), // keep the raw output for debugging
+                            Some(format!("structured output did not parse: {e}")),
+                        ),
                     }
-                    Err(e) => (
-                        outcome.text.clone(), // keep the raw output for debugging
-                        Some(format!("structured output did not parse: {e}")),
-                    ),
-                }
-            } else {
-                (outcome.text.clone(), None)
-            };
+                } else {
+                    (outcome.text.clone(), None)
+                };
             let row = repo::AnalysisOutcome {
                 input_tokens: outcome.usage.input_tokens as i64,
                 output_tokens: outcome.usage.output_tokens as i64,
@@ -451,7 +454,7 @@ async fn run_analysis_inner(
     // user turn (after the cached prefix), never in the system prompt.
     let track = track_record(state).await;
 
-    let (user_content, use_tools, server_tools, output_schema) = match kind {
+    let (mut user_content, mut use_tools, mut server_tools, mut output_schema) = match kind {
         "briefing" => (
             format!(
                 "{date}\n\nCurrent state:\n{}\n\n{track}\n\nWrite this morning's briefing: \
@@ -486,6 +489,22 @@ async fn run_analysis_inner(
             None,
         ),
     };
+
+    // CLI backend (`claude -p`) drives no in-process tool loop and is
+    // launched with no tools, so every kind runs tool-lessly: strip tools
+    // and the structured schema, and inject the portfolio snapshot that the
+    // tool-using kinds would otherwise have fetched.
+    if state.analyst_cli {
+        use_tools = false;
+        server_tools = vec![];
+        output_schema = None;
+        if kind != "briefing" {
+            user_content = format!(
+                "{user_content}\n\nCurrent portfolio state:\n{}",
+                portfolio_context(state).await
+            );
+        }
+    }
 
     let tools = ServerTools {
         state: state.clone(),

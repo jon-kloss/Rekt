@@ -239,6 +239,133 @@ impl Transport for HttpTransport {
     }
 }
 
+/// Parse the JSON object `claude -p --output-format json` prints into a
+/// [`MessageResponse`]. Factored out so it's unit-testable without the CLI.
+fn parse_cli_output(stdout: &str) -> Result<MessageResponse, AnalystError> {
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| AnalystError::BadResponse(format!("claude -p output not JSON: {e}")))?;
+    if v["is_error"].as_bool().unwrap_or(false)
+        || v["subtype"].as_str() == Some("error_during_execution")
+    {
+        let msg = v["result"]
+            .as_str()
+            .unwrap_or("claude -p reported an error")
+            .to_string();
+        return Err(AnalystError::Api {
+            status: 0,
+            message: msg,
+        });
+    }
+    let text = v["result"].as_str().unwrap_or_default().to_string();
+    // The CLI's `usage` block uses the same field names as the API's.
+    let usage: Usage = serde_json::from_value(v["usage"].clone()).unwrap_or_default();
+    Ok(MessageResponse {
+        content: vec![serde_json::json!({ "type": "text", "text": text })],
+        stop_reason: Some("end_turn".to_string()),
+        usage,
+    })
+}
+
+/// Transport that drives the analyst through the local Claude Code CLI
+/// (`claude -p`) instead of the HTTP API, so a self-hoster on the same
+/// machine reuses their existing Claude Code auth (subscription or key) —
+/// no `ANTHROPIC_API_KEY` needed.
+///
+/// SAFETY: the CLI is launched with `--allowed-tools ""`, so it can run NO
+/// tools — it cannot read files, run bash, or reach REKT's order API. The
+/// advisory-only invariant holds two ways: by the crate graph (this crate
+/// still has no path to `rekt-broker`) AND by the empty tool allowlist. The
+/// server runs every analysis kind tool-lessly (context injected into the
+/// prompt) when this transport is active.
+pub struct CliTransport {
+    bin: String,
+    timeout: Duration,
+}
+
+impl CliTransport {
+    pub fn new() -> Self {
+        Self {
+            bin: "claude".to_string(),
+            // Deep reviews can run minutes; bound it like the HTTP client.
+            timeout: Duration::from_secs(600),
+        }
+    }
+
+    pub fn with_bin(bin: String) -> Self {
+        Self { bin, ..Self::new() }
+    }
+}
+
+impl Default for CliTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Transport for CliTransport {
+    async fn send(&self, request: &serde_json::Value) -> Result<MessageResponse, AnalystError> {
+        use std::process::Stdio;
+        use tokio::io::AsyncWriteExt;
+
+        let model = request["model"].as_str().unwrap_or(ANALYST_MODEL);
+        let system = request["system"]
+            .get(0)
+            .and_then(|s| s["text"].as_str())
+            .unwrap_or("");
+        // Tool-less runs carry a single user turn whose content is a string.
+        let prompt = request["messages"]
+            .as_array()
+            .map(|msgs| {
+                msgs.iter()
+                    .filter(|m| m["role"] == "user")
+                    .filter_map(|m| m["content"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            })
+            .unwrap_or_default();
+
+        let mut cmd = tokio::process::Command::new(&self.bin);
+        cmd.arg("-p")
+            .arg("--output-format")
+            .arg("json")
+            // EMPTY allowlist = the CLI may run no tools (no orders, no I/O).
+            .arg("--allowed-tools")
+            .arg("")
+            .arg("--model")
+            .arg(model);
+        if !system.is_empty() {
+            cmd.arg("--append-system-prompt").arg(system);
+        }
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        tracing::debug!(model, "claude -p (CLI transport)");
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| AnalystError::Network(format!("could not launch `{}`: {e}", self.bin)))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(prompt.as_bytes()).await; // drop closes → EOF
+        }
+        let out = tokio::time::timeout(self.timeout, child.wait_with_output())
+            .await
+            .map_err(|_| AnalystError::Network("claude -p timed out".into()))?
+            .map_err(|e| AnalystError::Network(e.to_string()))?;
+        if !out.status.success() && out.stdout.is_empty() {
+            let err: String = String::from_utf8_lossy(&out.stderr)
+                .chars()
+                .take(300)
+                .collect();
+            return Err(AnalystError::Api {
+                status: 0,
+                message: format!("claude -p failed: {err}"),
+            });
+        }
+        parse_cli_output(&String::from_utf8_lossy(&out.stdout))
+    }
+}
+
 /// Read-only data the analyst may ask for. Implemented by the server over
 /// its own caches/DB; nothing in this trait can mutate anything.
 #[async_trait]
@@ -282,5 +409,30 @@ mod tests {
         assert_eq!(totals.input_tokens, 10);
         assert_eq!(totals.cache_read_tokens, 100);
         assert_eq!(totals.requests, 1);
+    }
+
+    #[test]
+    fn cli_output_parses_into_an_end_turn_response() {
+        // Captured shape of `claude -p --output-format json`.
+        let out = r#"{"type":"result","subtype":"success","is_error":false,
+            "result":"Portfolio is concentrated in semis.","stop_reason":"end_turn",
+            "total_cost_usd":0.0123,
+            "usage":{"input_tokens":12,"output_tokens":40,"cache_creation_input_tokens":2000,"cache_read_input_tokens":0}}"#;
+        let resp = parse_cli_output(out).unwrap();
+        assert_eq!(resp.text(), "Portfolio is concentrated in semis.");
+        assert_eq!(resp.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(resp.usage.input_tokens, 12);
+        assert_eq!(resp.usage.output_tokens, 40);
+        assert_eq!(resp.usage.cache_creation_input_tokens, Some(2000));
+    }
+
+    #[test]
+    fn cli_error_output_surfaces_as_an_error() {
+        let out = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom"}"#;
+        assert!(matches!(
+            parse_cli_output(out),
+            Err(AnalystError::Api { .. })
+        ));
+        assert!(parse_cli_output("not json").is_err());
     }
 }

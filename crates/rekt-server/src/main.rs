@@ -55,6 +55,10 @@ pub struct AppState {
     /// Claude API transport (ANTHROPIC_API_KEY) — None disables the analyst
     /// honestly. NOTE: the analyst layer never touches `broker` (PLAN.md §5).
     pub analyst: Option<Arc<dyn rekt_analyst::Transport>>,
+    /// True when the analyst transport is the Claude Code CLI (`claude -p`):
+    /// every kind runs tool-lessly with injected context, since the CLI is
+    /// launched with no tools and drives no in-process tool loop.
+    pub analyst_cli: bool,
     /// Daily AI spend ceiling (REKT_AI_DAILY_BUDGET, USD).
     pub ai_budget: rust_decimal::Decimal,
     /// Single-flight latch: one analysis at a time.
@@ -310,17 +314,34 @@ async fn main() -> anyhow::Result<()> {
             }),
     };
 
-    // AI analyst (PLAN.md §5): env-only key, honest 503 without it.
-    let analyst: Option<Arc<dyn rekt_analyst::Transport>> = std::env::var("ANTHROPIC_API_KEY")
-        .ok()
-        .filter(|k| !k.is_empty())
-        .map(|key| {
-            tracing::info!("AI analyst enabled (advisory only — it can never execute orders)");
-            Arc::new(rekt_analyst::HttpTransport::new(key)) as Arc<dyn rekt_analyst::Transport>
-        });
-    if analyst.is_none() {
-        tracing::warn!("no ANTHROPIC_API_KEY — AI analyst disabled");
-    }
+    // AI analyst (PLAN.md §5): two backends, both advisory only.
+    //   REKT_ANALYST_BACKEND=cli → drive the local Claude Code CLI
+    //     (`claude -p`), reusing its auth; no ANTHROPIC_API_KEY needed.
+    //     Runs tool-less with injected context (no orders — empty allowlist).
+    //   else                     → the HTTP API client (ANTHROPIC_API_KEY).
+    let analyst_cli = std::env::var("REKT_ANALYST_BACKEND")
+        .map(|v| v.eq_ignore_ascii_case("cli"))
+        .unwrap_or(false);
+    let analyst: Option<Arc<dyn rekt_analyst::Transport>> = if analyst_cli {
+        tracing::info!(
+            "AI analyst enabled via Claude Code CLI (claude -p; advisory only, no tools)"
+        );
+        Some(Arc::new(rekt_analyst::CliTransport::new()) as Arc<dyn rekt_analyst::Transport>)
+    } else {
+        let t = std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
+            .map(|key| {
+                tracing::info!("AI analyst enabled (advisory only — it can never execute orders)");
+                Arc::new(rekt_analyst::HttpTransport::new(key)) as Arc<dyn rekt_analyst::Transport>
+            });
+        if t.is_none() {
+            tracing::warn!(
+                "no ANTHROPIC_API_KEY and REKT_ANALYST_BACKEND!=cli — AI analyst disabled"
+            );
+        }
+        t
+    };
     let ai_budget = std::env::var("REKT_AI_DAILY_BUDGET")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -341,6 +362,7 @@ async fn main() -> anyhow::Result<()> {
         notify_url,
         backfill_lock: Arc::new(Mutex::new(())),
         analyst,
+        analyst_cli,
         ai_budget,
         analyst_running: Arc::new(AtomicBool::new(false)),
     });
@@ -481,6 +503,7 @@ mod tests {
             notify_url: None,
             backfill_lock: Arc::new(Mutex::new(())),
             analyst: None,
+            analyst_cli: false,
             ai_budget: rust_decimal::Decimal::new(250, 2),
             analyst_running: Arc::new(AtomicBool::new(false)),
         }

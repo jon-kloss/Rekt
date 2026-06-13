@@ -31,7 +31,8 @@ errors or `None`, never fabricated data.
 | `REKT_LISTEN` | `127.0.0.1:7777` | bind address (loopback by default — see Security) |
 | `FINNHUB_API_KEY` | — | live quotes + trade stream; falls back to Alpaca data |
 | `ALPACA_PAPER_KEY` / `ALPACA_PAPER_SECRET` | — | **paper** trading + daily bars |
-| `ANTHROPIC_API_KEY` | — | AI analyst (advisory only) |
+| `ANTHROPIC_API_KEY` | — | AI analyst via HTTP API (advisory only) |
+| `REKT_ANALYST_BACKEND` | `http` | `cli` drives the local `claude` CLI (`claude -p`) instead of the HTTP API — reuses its auth, no key needed; runs tool-less (empty allowlist) so it still cannot place orders or touch the filesystem |
 | `REKT_AI_DAILY_BUDGET` | `2.50` | USD/day ceiling that gates analyst runs |
 | `REKT_AI_AUTO` | enabled (unset) | `0`, `false`, or `off` disable the scheduled briefing/review |
 | `REKT_NTFY_TOPIC` / `REKT_NTFY_URL` | — | alert push (see Security for the topic warning) |
@@ -244,7 +245,10 @@ it (e.g. "history cache miss — rebuilding series", "tax report built").
 - **The AI analyst cannot trade.** `rekt-analyst` has no dependency path to
   `rekt-broker`; its tools are read-only and a recommendation can only *prefill*
   the normal guarded order ticket a human confirms. This is enforced by the
-  crate graph, not just convention.
+  crate graph, not just convention. The `REKT_ANALYST_BACKEND=cli` backend
+  launches `claude -p` with an empty `--allowed-tools` allowlist, so the CLI
+  can run no tools at all (no bash, no file reads, no network) — the
+  advisory-only guarantee holds a second way, by allowlist as well as by graph.
 - **License.** AGPL-3.0 — if you run a modified REKT as a network service, you
   must offer your changes to its users.
 
