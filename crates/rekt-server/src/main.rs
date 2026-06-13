@@ -1817,12 +1817,18 @@ Trades,Data,Order,Equity and Index Options,USD,AAPL 240920C,\"2026-06-10, 10:30:
         assert_eq!(taxes["long"]["gain"], "4000");
         assert_eq!(taxes["short"]["gain"], "0");
         assert_eq!(taxes["long"]["disallowed"], "0"); // no rebuy → no wash
+        assert_eq!(taxes["long"]["reportable"], "4000"); // Schedule D line: gain + disallowed
 
         let (_, history) = request(state.clone(), "GET", "/api/history?range=all", None).await;
+        // Pin history's totals to the expected values directly, so a missing
+        // key fails cleanly (not via a dec() panic) and an in-lockstep drift
+        // with the portfolio engine can't hide behind the comparison below.
+        assert_eq!(history["totals"]["realized_pnl"], "4000");
+        assert_eq!(history["totals"]["dividends"], "120");
 
-        // The invariant: economic realized P&L (portfolio) == capital gain
-        // (taxes, no wash) == history totals — all 4000, all derived from
-        // one transaction log by three independent paths.
+        // The invariant the test exists for: economic realized P&L
+        // (portfolio) == capital gain (taxes, no wash) == history totals —
+        // 4000 derived from one log by three independent paths.
         let dec = |v: &serde_json::Value| {
             v.as_str()
                 .unwrap()
@@ -1864,21 +1870,19 @@ Trades,Data,Order,Equity and Index Options,USD,AAPL 240920C,\"2026-06-10, 10:30:
 
         let (_, taxes) = request(state.clone(), "GET", "/api/taxes?year=2026", None).await;
         assert_eq!(taxes["rows"][0]["code"], "W");
-        assert_eq!(taxes["short"]["gain"], "-500"); // raw loss matches the engine
-        assert_eq!(taxes["short"]["disallowed"], "500"); // …but fully disallowed
+        assert_eq!(taxes["short"]["disallowed"], "500"); // fully disallowed
         assert_eq!(taxes["short"]["reportable"], "0"); // so nothing lands this year
 
-        let dec = |v: &serde_json::Value| {
-            v.as_str()
-                .unwrap()
-                .parse::<rust_decimal::Decimal>()
-                .unwrap()
-        };
-        // reportable = economic gain + disallowed: the engines reconcile.
+        // The genuinely independent invariant (NOT the tautology
+        // reportable == gain + disallowed, which holds by TermTotals'
+        // definition): the portfolio's economic loss and the tax engine's
+        // raw pre-adjustment gain are two separate replays that must agree
+        // on -500 — while reportable (0) is what diverges via the wash.
         assert_eq!(
-            dec(&taxes["short"]["reportable"]),
-            dec(&portfolio["portfolio"]["realized_pnl"]) + dec(&taxes["short"]["disallowed"])
+            portfolio["portfolio"]["realized_pnl"],
+            taxes["short"]["gain"]
         );
+        assert_eq!(taxes["short"]["gain"], "-500");
     }
 
     #[tokio::test]
@@ -1916,8 +1920,9 @@ Trades,Data,Order,Equity and Index Options,USD,AAPL 240920C,\"2026-06-10, 10:30:
         let (_, taxes) = request(state.clone(), "GET", "/api/taxes?year=2026", None).await;
         assert_eq!(taxes["rows"].as_array().unwrap().len(), 1);
         assert_eq!(taxes["rows"][0]["long_term"], true); // held >1yr
-        assert_eq!(taxes["long"]["gain"], "1000");
-        // Same number, two engines, fed from one uploaded CSV.
-        assert_eq!(p["realized_pnl"], taxes["long"]["gain"]);
+                                                         // These two standalone pins are the real coverage: both engines,
+                                                         // fed from one uploaded CSV, independently arrive at 1000.
+        assert_eq!(p["realized_pnl"], "1000"); // portfolio (10 × (500 − 400))
+        assert_eq!(taxes["long"]["gain"], "1000"); // tax engine
     }
 }
