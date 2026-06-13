@@ -105,7 +105,12 @@ function mdSummary(src){
     s = paras[0]||'';
   }
   s = s.replace(/^[-*]\s+/gm,'').replace(/[*_`>#]/g,'').replace(/\[([^\]]+)\]\([^)]*\)/g,'$1').replace(/\s+/g,' ').trim();
-  return s.length>300 ? s.slice(0,297).replace(/\s+\S*$/,'')+'…' : s;
+  // Show the whole bottom-line/headline. Only trim if it's genuinely long, and
+  // then at a SENTENCE boundary so it never cuts off mid-thought.
+  const LIM=700;
+  if(s.length<=LIM) return s;
+  const cut=s.slice(0,LIM), lastEnd=Math.max(cut.lastIndexOf('. '),cut.lastIndexOf('! '),cut.lastIndexOf('? '));
+  return lastEnd>250 ? cut.slice(0,lastEnd+1) : cut.replace(/\s+\S*$/,'')+'…';
 }
 // Highly-skimmable TL;DR card for the top of an analysis. Empty until a real
 // analysis exists (briefingHead is set only then). Server text → esc().
@@ -119,11 +124,11 @@ function aiSummaryCard(){
 }
 
 //================================================================ state + data store
-const VIEWS = ['overview','positions','performance','analyst','alerts','blotter','taxes'];
+const VIEWS = ['overview','positions','performance','analyst','alerts','blotter','taxes','ledger'];
 const S = {
   view:'positions', selSym:null, cmd:'', showHelp:false, expanded:null, candleRange:'6m',
-  briefOpen:true, hoverIdx:null, eqHoverIdx:null, toast:'', halted:false, dockOpen:true,
-  side:'buy', otype:'market', tSym:'', tQty:'5', tLimit:'',
+  briefOpen:true, hoverIdx:null, eqHoverIdx:null, toast:'', halted:false, dockOpen:true, confirmDelTx:null, switching:'',
+  side:'buy', otype:'market', tSym:'', tQty:'5', tLimit:'', basket:[],
   importOpen:false, importFmt:'generic', importText:'', importPreview:null, importErr:'', importBusy:false,
 };
 // M holds the latest server-derived data the views render from.
@@ -134,7 +139,7 @@ const M = {
   positions:[], watchlist:[], alerts:[], orders:[], txns:[], recs:[], track:{favorable:0,tested:0},
   briefing:'', briefingHead:'', analystEnabled:false, analystBackend:null, todayCost:0, budget:0,
   hist:[], metrics:{}, totals:{}, tax:null, taxYear:null, taxYears:[],
-  candleCache:{}, lastPrices:{},
+  candleCache:{}, lastPrices:{}, portfolios:[], activePortfolio:'',
 };
 
 //================================================================ API
@@ -152,6 +157,7 @@ function applyPortfolio(p){
   M.cash = num(pf.cash); M.equity = num(pf.equity); M.dayPnl = num(pf.day_pnl);
   M.unreal = num(pf.unrealized_pnl); M.realized = num(pf.realized_pnl); M.dividends = num(pf.dividends);
   M.dayPct = (M.equity - M.dayPnl) !== 0 ? M.dayPnl/(M.equity - M.dayPnl)*100 : 0;
+  if(has(p.active_portfolio)) M.activePortfolio = p.active_portfolio;
   M.market = p.market || 'closed';
   M.liveFeed = !!p.live_feed;
   M.tradingEnabled = !!(p.trading && p.trading.enabled);
@@ -191,7 +197,7 @@ function applyOrders(list){ M.orders = (list||[]).map(o => ({
   id:o.id, ts:(o.submitted_ts||'').slice(0,16).replace('T',' '), sym:o.symbol, side:o.side, order_type:o.order_type,
   qty:num(o.qty), limit:has(o.limit_price)?num(o.limit_price):null, status:o.status, filled:num(o.filled_qty),
   avg:has(o.avg_fill_price)?num(o.avg_fill_price):null })); }
-function applyTxns(list){ M.txns = (list||[]).map(t => ({ ts:(t.ts||'').slice(0,16).replace('T',' '), kind:t.kind, sym:t.symbol||'', qty:num(t.qty), price:num(t.price), fees:num(t.fees), note:t.note||'' })); }
+function applyTxns(list){ M.txns = (list||[]).map(t => ({ id:t.id, ts:(t.ts||'').slice(0,16).replace('T',' '), kind:t.kind, sym:t.symbol||'', qty:num(t.qty), price:num(t.price), fees:num(t.fees), note:t.note||'', mode:t.mode||'live' })); }
 function applyAnalyst(a){
   M.analystEnabled = !!a.enabled; M.analystBackend = a.backend || null; M.todayCost = num(a.today_cost_usd); M.budget = num(a.budget_usd);
   M.track = a.track_record || {favorable:0,tested:0};
@@ -217,6 +223,7 @@ async function loadAll(){
     ]);
     applyPortfolio(pf); applyHistory(hist); applyAnalyst(an); applyOrders(ords); applyTxns(txns);
     try { applyTax(await jget('/api/taxes' + (M.taxYear?('?year='+M.taxYear):''))); } catch(e){}
+    try { const pl=await jget('/api/portfolios'); M.portfolios=pl.portfolios||[]; M.activePortfolio=pl.active||M.activePortfolio; } catch(e){}
     M.ready = true; render();
   } catch(e){ console.error(e); toast('LOAD FAILED — is the server up?'); }
 }
@@ -412,7 +419,7 @@ function fillMarkers(sym, arr){
 
 //================================================================ RENDER
 function navTabs(){
-  const labels={ overview:'OVERVIEW',positions:'POSITIONS',performance:'PERF',analyst:'AI',alerts:'ALERTS',blotter:'BLOTTER',taxes:'TAX' };
+  const labels={ overview:'OVERVIEW',positions:'POSITIONS',performance:'PERF',analyst:'AI',alerts:'ALERTS',blotter:'BLOTTER',taxes:'TAX',ledger:'LEDGER' };
   return VIEWS.map((k,i)=>{ const on=S.view===k;
     return '<button role="tab" aria-selected="'+on+'" data-act="view" data-arg="'+k+'" style="font-family:inherit;font-size:11px;letter-spacing:0.5px;color:'+(on?C.bg:C.label)+';background:'+(on?C.amber:'transparent')+';border:none;padding:5px 11px;border-radius:3px;cursor:pointer;">'+(i+1)+' '+labels[k]+'</button>';
   }).join('');
@@ -479,8 +486,8 @@ function positionsView(){
         statCell('UNREALIZED', (sel.total!=null?signedMoney(sel.total):'—')+' <span style="font-size:10px;">'+(sel.totalPct!=null?signedPct(sel.totalPct):'')+'</span>', dirColor(sel.total)) +
       '</div>'+
       '<div style="display:flex;align-items:center;gap:8px;margin-top:14px;flex-wrap:wrap;"><span style="font-size:9px;color:'+C.label+';letter-spacing:0.5px;margin-right:4px;">SIGNALS</span>'+sigs+
-        '<div style="margin-left:auto;display:flex;gap:6px;"><button data-act="add" data-arg="'+esc(sel.sym)+'" style="font-family:inherit;font-size:10px;font-weight:600;color:'+UP+';background:rgba(47,191,113,0.1);border:1px solid rgba(47,191,113,0.35);border-radius:3px;padding:5px 12px;cursor:pointer;">ADD</button>'+
-        '<button data-act="trim" data-arg="'+esc(sel.sym)+'" style="font-family:inherit;font-size:10px;font-weight:600;color:'+DN+';background:rgba(255,92,87,0.1);border:1px solid rgba(255,92,87,0.35);border-radius:3px;padding:5px 12px;cursor:pointer;">TRIM</button></div></div>'+
+        '<div style="margin-left:auto;display:flex;gap:6px;"><button data-act="add" data-arg="'+esc(sel.sym)+'" style="font-family:inherit;font-size:10px;font-weight:600;color:'+UP+';background:rgba(47,191,113,0.1);border:1px solid rgba(47,191,113,0.35);border-radius:3px;padding:5px 12px;cursor:pointer;white-space:nowrap;">STAGE BUY</button>'+
+        '<button data-act="trim" data-arg="'+esc(sel.sym)+'" style="font-family:inherit;font-size:10px;font-weight:600;color:'+DN+';background:rgba(255,92,87,0.1);border:1px solid rgba(255,92,87,0.35);border-radius:3px;padding:5px 12px;cursor:pointer;white-space:nowrap;">STAGE SELL</button></div></div>'+
     '</div>';
   }
   // table
@@ -501,8 +508,8 @@ function positionsView(){
       '<div style="text-align:right;color:'+dirColor(p.day)+';">'+(p.day!=null?signedMoney(p.day):'—')+'</div>'+
       '<div style="text-align:right;color:'+dirColor(p.total)+';">'+(p.total!=null?signedMoney(p.total):'—')+' <span style="font-size:9px;opacity:0.7;">'+(p.totalPct!=null?signedPct(p.totalPct):'')+'</span></div>'+
       '<div style="display:flex;gap:4px;flex-wrap:wrap;">'+sigs+'</div>'+
-      '<div style="display:flex;gap:4px;justify-content:flex-end;"><button data-act="add" data-arg="'+esc(p.sym)+'" data-stop="1" title="stage a buy" style="font-family:inherit;font-size:9.5px;font-weight:600;color:'+UP+';background:rgba(47,191,113,0.1);border:1px solid rgba(47,191,113,0.35);border-radius:3px;padding:3px 8px;cursor:pointer;">ADD</button>'+
-      '<button data-act="trim" data-arg="'+esc(p.sym)+'" data-stop="1" title="stage a trim" style="font-family:inherit;font-size:9.5px;font-weight:600;color:'+DN+';background:rgba(255,92,87,0.1);border:1px solid rgba(255,92,87,0.35);border-radius:3px;padding:3px 8px;cursor:pointer;">TRIM</button></div>'+
+      '<div style="display:flex;gap:4px;justify-content:flex-end;"><button data-act="add" data-arg="'+esc(p.sym)+'" data-stop="1" title="stage a buy" style="font-family:inherit;font-size:9.5px;font-weight:600;color:'+UP+';background:rgba(47,191,113,0.1);border:1px solid rgba(47,191,113,0.35);border-radius:3px;padding:3px 7px;cursor:pointer;white-space:nowrap;">STAGE BUY</button>'+
+      '<button data-act="trim" data-arg="'+esc(p.sym)+'" data-stop="1" title="stage a trim" style="font-family:inherit;font-size:9.5px;font-weight:600;color:'+DN+';background:rgba(255,92,87,0.1);border:1px solid rgba(255,92,87,0.35);border-radius:3px;padding:3px 7px;cursor:pointer;white-space:nowrap;">STAGE SELL</button></div>'+
     '</div>';
   }).join('');
   return html;
@@ -550,6 +557,34 @@ function equityPanel(H){
     eqHoverTip()+'</div>';
 }
 
+// "What needs a decision" — triggered alerts, signal extremes on holdings,
+// and open AI recommendations. Each item can link to the relevant view.
+function attentionItems(){
+  const items=[];
+  const CL={ price_below:'≤ $',price_above:'≥ $',drawdown_above:'DD ≥ ' };
+  M.alerts.filter(a=>a.status==='triggered').forEach(a=>{
+    items.push({ icon:'🚨', color:DN, act:'view', arg:'alerts',
+      text:a.sym+' '+(CL[a.condition]||'')+a.threshold+(a.condition==='drawdown_above'?'%':'')+' — alert triggered'+(has(a.triggeredValue)?(' at '+a.triggeredValue):'') });
+  });
+  M.positions.forEach(p=>{
+    const s=p.signals; if(!s) return; const flags=[];
+    const rsi=has(s.rsi14)?num(s.rsi14):null;
+    if(rsi!=null && rsi>=70) flags.push('RSI '+s.rsi14+' overbought');
+    else if(rsi!=null && rsi<=30) flags.push('RSI '+s.rsi14+' oversold');
+    const v50=has(s.vs_sma50_pct)?num(s.vs_sma50_pct):null, v200=has(s.vs_sma200_pct)?num(s.vs_sma200_pct):null;
+    if(v50!=null && v200!=null && v50<0 && v200<0) flags.push('below 50d & 200d');
+    if(has(s.drawdown_pct) && num(s.drawdown_pct)>=20) flags.push('DD '+s.drawdown_pct+'%');
+    if(flags.length) items.push({ icon:'⚠', color:AM, act:'gotoPos', arg:p.sym, text:p.sym+' — '+flags.join(' · ') });
+  });
+  const actionable=M.recs.filter(r=>['BUY','TRIM','SELL','ADD'].includes(r.action));
+  if(actionable.length){
+    const list=actionable.slice(0,3).map(r=>r.action.toLowerCase()+' '+r.sym).join(', ');
+    items.push({ icon:'🤖', color:C.blue, act:'view', arg:'analyst',
+      text:actionable.length+' AI trade idea'+(actionable.length===1?'':'s')+(list?(' — '+list+(actionable.length>3?'…':'')):'') });
+  }
+  return items;
+}
+
 function overviewView(){
   const head=M.briefingHead?('<span style="font-size:10px;color:'+C.label+';">'+esc(M.briefingHead)+'</span>'):'';
   let html='<div style="margin:14px 16px 0;background:linear-gradient(135deg,#0B1018,#0B0E13);border:1px solid #1B2A44;border-radius:6px;overflow:hidden;">'+
@@ -568,8 +603,21 @@ function overviewView(){
   '</div>';
   const slices=allocSlices();
   const legend=slices.map(d=>'<div style="display:flex;align-items:center;justify-content:space-between;font-size:11.5px;"><span style="display:flex;align-items:center;gap:8px;"><span style="width:8px;height:8px;background:'+d.color+';"></span>'+esc(d.sym)+'</span><span style="color:'+C.label+';">'+(d.frac*100).toFixed(1)+'%</span></div>').join('');
-  html += '<div style="padding:14px 16px;border-bottom:1px solid '+C.border+';display:flex;align-items:center;gap:24px;">'+buildDonut(slices,128)+
-    '<div style="flex:1;display:flex;flex-direction:column;gap:5px;max-width:320px;"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;"><span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">ALLOCATION</span><button data-act="expand" data-arg="donut" title="expand chart" style="font-family:inherit;font-size:11px;color:'+C.label+';background:transparent;border:1px solid #1A212B;border-radius:3px;padding:2px 7px;cursor:pointer;">⤢</button></div>'+legend+'</div></div>';
+  // Allocation (left) + Needs Attention (right), side by side — the latter
+  // surfaces what actually needs a decision and fills the dashboard width.
+  const items=attentionItems();
+  const attnHtml='<div style="font-size:11px;letter-spacing:1px;color:'+C.body+';margin-bottom:4px;">NEEDS ATTENTION'+(items.length?' <span style="color:'+C.amber+';">'+items.length+'</span>':'')+'</div>'+
+    (items.length ? items.map(it=>'<div'+(it.act?' data-act="'+it.act+'" data-arg="'+esc(it.arg)+'"':'')+' style="display:flex;align-items:flex-start;gap:10px;padding:7px 0;border-top:1px solid '+C.hairline+';font-size:12px;'+(it.act?'cursor:pointer;':'')+'">'+
+        '<span aria-hidden="true" style="flex-shrink:0;">'+it.icon+'</span>'+
+        '<span style="color:'+(it.color||C.body)+';line-height:1.5;">'+esc(it.text)+'</span>'+
+        (it.act?'<span style="margin-left:auto;color:'+C.faint+';font-size:10px;flex-shrink:0;">→</span>':'')+
+      '</div>').join('')
+     : '<div style="padding:12px 0;color:'+C.faint+';font-size:11.5px;border-top:1px solid '+C.hairline+';">✓ All clear — no triggered alerts, no signal extremes, nothing pressing.</div>');
+  html += '<div style="padding:16px;border-bottom:1px solid '+C.border+';display:flex;align-items:flex-start;gap:32px;flex-wrap:wrap;">'+
+    '<div style="display:flex;align-items:center;gap:22px;flex-shrink:0;">'+buildDonut(slices,128)+
+      '<div style="display:flex;flex-direction:column;gap:5px;min-width:190px;max-width:300px;"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;"><span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">ALLOCATION</span><button data-act="expand" data-arg="donut" title="expand chart" style="font-family:inherit;font-size:11px;color:'+C.label+';background:transparent;border:1px solid #1A212B;border-radius:3px;padding:2px 7px;cursor:pointer;">⤢</button></div>'+legend+'</div></div>'+
+    '<div style="flex:1;min-width:320px;">'+attnHtml+'</div>'+
+  '</div>';
   return html;
 }
 
@@ -601,21 +649,42 @@ function analystView(){
       '<div style="font-size:10px;color:'+C.label+';margin-top:3px;">'+M.track.favorable+'/'+M.track.tested+' FAVORABLE</div>'+
       '<div style="font-size:9.5px;letter-spacing:1px;color:'+C.label+';margin-top:14px;">TODAY SPEND</div><div style="font-size:15px;font-weight:600;color:'+C.text+';margin-top:5px;">'+money(M.todayCost)+' <span style="font-size:11px;color:'+C.label+';">/ '+money(M.budget)+'</span></div>'+
       '<div style="display:flex;gap:6px;margin-top:14px;"><button data-act="briefingRun" style="flex:1;font-family:inherit;font-size:9px;color:'+C.body+';background:transparent;border:1px solid '+C.border+';border-radius:3px;padding:6px;cursor:pointer;">☀ BRIEF</button><button data-act="reviewRun" style="flex:1;font-family:inherit;font-size:9px;color:'+C.body+';background:transparent;border:1px solid '+C.border+';border-radius:3px;padding:6px;cursor:pointer;">🔍 REVIEW</button></div></div></div>';
-  html += '<div style="padding:12px 16px 8px;font-size:11px;letter-spacing:1px;color:'+C.body+';">RECOMMENDATIONS <span style="color:'+C.faint+';">· ADVISORY ONLY · GROUNDED IN TOOLS</span></div>';
-  if(!M.recs.length){ html+='<div style="padding:18px 16px;color:'+C.faint+';font-size:11px;border-top:1px solid '+C.border+';">no recommendations yet — run a weekly review.</div>'; return html; }
+  // Only BUY/SELL/TRIM are actionable (a STAGE button means something). HOLD /
+  // WATCH are situational reads — surfaced separately as FYI, no action button.
+  const isAction=r=>['BUY','SELL','TRIM','ADD'].includes(r.action);
+  const actionable=M.recs.filter(isAction), outlook=M.recs.filter(r=>!isAction(r));
+  // Headline is the first sentence of the rationale; strip it from the detail
+  // so the two don't read as a stutter.
+  const detailOf=r=>{ const d=r.reason||'', h=r.headline||''; return (h && d.indexOf(h)===0) ? d.slice(h.length).replace(/^[.\s—–-]+/,'') : d; };
   const VC={ favorable:UP, unfavorable:DN, pending:'#8A93A6' };
-  html += M.recs.map(r=>{
-    const actColor = r.action==='BUY'?UP:(r.action==='TRIM'||r.action==='SELL')?DN:AM;
+
+  html += '<div style="padding:12px 16px 8px;font-size:11px;letter-spacing:1px;color:'+C.body+';">RECOMMENDATIONS <span style="color:'+C.faint+';">· ACTIONABLE · CONFIRM BEFORE PLACING</span></div>';
+  if(!M.recs.length){ html+='<div style="padding:18px 16px;color:'+C.faint+';font-size:11px;border-top:1px solid '+C.border+';">no analysis yet — run a weekly review.</div>'; return html; }
+  if(!actionable.length){ html+='<div style="padding:16px;color:'+C.body+';font-size:11.5px;border-top:1px solid '+C.border+';"><span style="color:'+UP+';">✓</span> No trades to make right now — nothing to buy or sell. Situational read below.</div>'; }
+  else html += actionable.map(r=>{
+    const actColor = r.action==='BUY'?UP:DN;
     const vc=VC[r.verdict]||'#8A93A6';
     return '<div style="padding:14px 16px;border-top:1px solid '+C.border+';display:flex;gap:18px;align-items:flex-start;">'+
-      '<div style="flex:1;min-width:0;"><div style="display:flex;align-items:center;gap:10px;margin-bottom:7px;"><span style="font-size:10px;font-weight:600;letter-spacing:0.5px;color:'+actColor+';border:1px solid '+actColor+';padding:2px 8px;border-radius:3px;">'+esc(r.action)+' '+esc(r.sym)+'</span><span style="font-size:13px;font-weight:600;color:'+C.bright+';">'+esc(r.headline)+'</span></div>'+
-        '<div style="font-size:12px;line-height:1.6;color:'+C.body+';max-width:640px;">'+esc(r.reason)+'</div></div>'+
+      '<div style="flex:1;min-width:0;"><div style="display:flex;align-items:center;gap:10px;margin-bottom:7px;flex-wrap:wrap;"><span style="font-size:10px;font-weight:600;letter-spacing:0.5px;color:'+actColor+';border:1px solid '+actColor+';padding:2px 8px;border-radius:3px;">'+esc(r.action)+' '+esc(r.sym)+'</span><span style="font-size:13px;font-weight:600;color:'+C.bright+';">'+esc(r.headline)+'</span></div>'+
+        '<div style="font-size:12px;line-height:1.6;color:'+C.body+';max-width:640px;">'+esc(detailOf(r))+'</div></div>'+
       '<div style="width:180px;flex-shrink:0;display:flex;flex-direction:column;gap:9px;align-items:flex-end;">'+
         '<div style="font-size:10px;color:'+C.label+';text-align:right;">'+esc(r.sizing)+' · '+esc(r.conf)+' CONF</div>'+
         '<div style="display:flex;align-items:center;gap:7px;font-size:10px;"><span style="color:'+C.label+';">OUTCOME</span><span style="color:'+vc+';border:1px solid '+vc+';padding:1px 6px;border-radius:3px;">'+esc(r.verdict.toUpperCase())+' '+esc(r.move)+'</span></div>'+
         '<div style="display:flex;gap:6px;width:100%;"><button data-act="stageRec" data-arg="'+r.id+'" style="flex:1;padding:7px;border-radius:3px;border:1px solid rgba(47,191,113,0.4);background:rgba(47,191,113,0.1);color:'+UP+';font-family:inherit;font-size:10px;font-weight:600;cursor:pointer;">STAGE →</button>'+
         '<button data-act="dropRec" data-arg="'+r.id+'" style="flex:1;padding:7px;border-radius:3px;border:1px solid '+C.border+';background:transparent;color:'+C.label+';font-family:inherit;font-size:10px;font-weight:600;cursor:pointer;">DROP</button></div></div></div>';
   }).join('');
+
+  // PORTFOLIO OUTLOOK (FYI) — per-holding situational read + what to watch.
+  if(outlook.length){
+    html += '<div style="padding:16px 16px 8px;font-size:11px;letter-spacing:1px;color:'+C.body+';border-top:1px solid '+C.border+';">PORTFOLIO OUTLOOK <span style="color:'+C.faint+';">· FYI · NO ACTION NEEDED</span></div>';
+    html += outlook.map(r=>{ const tag = r.action==='WATCH'?C.blue:C.gray;
+      return '<div style="padding:12px 16px;border-top:1px solid '+C.hairline+';display:flex;gap:14px;align-items:flex-start;">'+
+        '<span style="flex-shrink:0;font-size:10px;font-weight:600;letter-spacing:0.5px;color:'+tag+';border:1px solid '+tag+';padding:2px 8px;border-radius:3px;">'+esc(r.action)+' '+esc(r.sym)+'</span>'+
+        '<div style="flex:1;min-width:0;"><div style="font-size:12.5px;font-weight:600;color:'+C.bright+';margin-bottom:4px;">'+esc(r.headline)+'</div>'+
+          '<div style="font-size:12px;line-height:1.55;color:'+C.body+';max-width:780px;">'+esc(detailOf(r))+'</div></div>'+
+        '<span style="flex-shrink:0;font-size:9.5px;letter-spacing:0.5px;color:'+C.label+';">'+esc(r.conf)+' CONF</span></div>';
+    }).join('');
+  }
   return html;
 }
 
@@ -649,6 +718,36 @@ function blotterView(){
     '<div style="color:'+(o.side==='buy'?UP:DN)+';">'+esc((o.side||'').toUpperCase())+'</div><div style="color:'+C.body+';">'+esc(o.order_type)+'</div>'+
     '<div style="text-align:right;color:'+C.body+';">'+qtyFmt(o.qty)+'</div><div style="text-align:right;color:'+C.body+';">'+(o.limit!=null?money(o.limit):'—')+'</div>'+
     '<div style="color:'+(OC[o.status]||'#8A93A6')+';font-size:9.5px;letter-spacing:0.5px;">'+esc((o.status||'').replace('_',' ').toUpperCase())+'</div><div style="text-align:right;color:'+C.body+';">'+qtyFmt(o.filled)+'</div></div>').join('');
+  return html;
+}
+
+// The raw transaction ledger — every recorded entry (manual, CSV import, and
+// broker fills), the source of truth behind positions/taxes. All server-sourced
+// fields go through esc(). Delete uses a two-click arm/confirm so a stray click
+// can't drop a holding; the server still rejects deletes that break replay.
+function ledgerView(){
+  const cols='1fr 0.8fr 0.7fr 0.7fr 0.85fr 0.7fr 0.6fr 1.5fr 0.55fr';
+  const KC={ buy:UP, sell:DN, dividend:C.blue, deposit:C.green, withdrawal:DN, split:C.purple };
+  const shareKind=k=>k==='buy'||k==='sell'||k==='split';
+  let html='<div style="padding:11px 16px 9px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid '+C.border+';"><span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">TRANSACTION LEDGER <span style="color:'+C.faint+';">· '+M.txns.length+' ENTRIES · MANUAL · CSV · BROKER FILLS</span></span>'+
+    '<button data-act="importOpen" style="font-size:10px;color:'+C.text+';background:transparent;border:1px solid '+C.border+';border-radius:3px;padding:6px 10px;cursor:pointer;font-family:inherit;">⬆ IMPORT CSV</button></div>'+
+    '<div style="display:grid;grid-template-columns:'+cols+';gap:8px;padding:8px 16px;font-size:9.5px;letter-spacing:0.5px;color:'+C.label+';border-bottom:1px solid '+C.border+';"><div>WHEN</div><div>TYPE</div><div>SYMBOL</div><div style="text-align:right;">QTY</div><div style="text-align:right;">PRICE</div><div style="text-align:right;">FEES</div><div>MODE</div><div>NOTE</div><div style="text-align:right;">DEL</div></div>';
+  if(!M.txns.length){ html+='<div style="padding:22px 16px;text-align:center;color:'+C.faint+';font-size:11px;">no transactions yet — stage a buy in the ticket, or ⬆ IMPORT CSV</div>'; return html; }
+  html += M.txns.map(t=>{
+    const armed=S.confirmDelTx==t.id;
+    return '<div style="display:grid;grid-template-columns:'+cols+';gap:8px;padding:10px 16px;border-bottom:1px solid '+C.hairline+';font-size:11.5px;align-items:center;font-variant-numeric:tabular-nums;">'+
+      '<div style="color:'+C.label+';">'+esc(t.ts)+'</div>'+
+      '<div style="color:'+(KC[t.kind]||C.body)+';font-size:10px;letter-spacing:0.5px;">'+esc((t.kind||'').toUpperCase())+'</div>'+
+      '<div style="font-weight:600;color:'+C.bright+';">'+(t.sym?esc(t.sym):'—')+'</div>'+
+      '<div style="text-align:right;color:'+C.body+';">'+(shareKind(t.kind)?qtyFmt(t.qty):'—')+'</div>'+
+      '<div style="text-align:right;color:'+C.body+';">'+money(t.price)+'</div>'+
+      '<div style="text-align:right;color:'+(t.fees?C.body:C.faint)+';">'+(t.fees?money(t.fees):'—')+'</div>'+
+      '<div style="font-size:9px;letter-spacing:0.5px;color:'+(t.mode==='paper'?AM:C.label)+';">'+esc((t.mode||'live').toUpperCase())+'</div>'+
+      '<div style="color:'+C.label+';white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="'+esc(t.note)+'">'+(esc(t.note)||'—')+'</div>'+
+      '<div style="text-align:right;"><button data-act="delTx" data-arg="'+esc(t.id)+'" aria-label="'+(armed?'Confirm delete transaction':'Delete transaction')+'" style="background:'+(armed?'rgba(255,92,87,0.15)':'none')+';border:1px solid '+(armed?DN:'#1A212B')+';color:'+DN+';cursor:pointer;font-size:'+(armed?'9':'11')+'px;line-height:1;padding:'+(armed?'4px 7px':'4px 8px')+';border-radius:3px;font-family:inherit;'+(armed?'font-weight:600;letter-spacing:0.5px;':'')+'">'+(armed?'CONFIRM':'✕')+'</button></div>'+
+    '</div>';
+  }).join('');
+  html += '<div style="padding:12px 16px;font-size:10px;color:'+C.label+';line-height:1.55;">Every recorded transaction across all modes. <span style="color:'+AM+';">PAPER</span> rows are broker fills, segregated from the live tracked portfolio. A delete that would break the replay (e.g. an oversell) is rejected.</div>';
   return html;
 }
 
@@ -702,10 +801,7 @@ function dock(){
   const sellOn={ bg:S.side==='sell'?'rgba(255,92,87,0.16)':'transparent', color:S.side==='sell'?DN:C.label };
   const mktOn={ bg:S.otype==='market'?'#1A212B':'transparent', color:S.otype==='market'?C.bright:C.label };
   const limOn={ bg:S.otype==='limit'?'#1A212B':'transparent', color:S.otype==='limit'?C.bright:C.label };
-  const canPlace=t.canPlace && !S.halted && M.tradingEnabled;
-  const submitBg = canPlace ? (S.side==='buy'?'#1B7A45':'#A8332E') : C.border;
-  const submitColor = canPlace ? '#fff' : C.faint;
-  const submitLabel = S.halted ? 'TRADING HALTED' : (!M.tradingEnabled ? 'NO BROKER (PAPER KEYS)' : (S.side==='buy'?'BUY // PAPER':'SELL // PAPER'));
+  const stageOk = !!t.symU && t.qty>0;
   const warns=t.warns.map(w=>'<div style="font-size:10.5px;color:'+w.color+';line-height:1.4;">'+esc(w.text)+'</div>').join('');
   const input=(id,val,label,ph)=>'<div><div style="font-size:9.5px;letter-spacing:1px;color:'+C.label+';margin-bottom:5px;">'+label+'</div><input id="'+id+'" value="'+esc(val)+'"'+(ph?' placeholder="'+ph+'"':'')+' style="width:100%;background:'+C.bg+';border:1px solid '+C.border+';border-radius:4px;color:'+C.bright+';font-family:inherit;font-size:13px;padding:9px 10px;outline:none;"></div>';
 
@@ -718,8 +814,34 @@ function dock(){
     '<div style="background:'+C.bg+';border:1px solid '+C.border+';border-radius:4px;padding:10px 12px;margin:6px 0 10px;display:flex;flex-direction:column;gap:6px;">'+
       '<div style="display:flex;justify-content:space-between;font-size:11.5px;"><span style="color:'+C.label+';">EST COST</span><span style="color:'+C.text+';font-variant-numeric:tabular-nums;">'+money(t.estCost)+'</span></div>'+
       '<div style="display:flex;justify-content:space-between;font-size:11.5px;"><span style="color:'+C.label+';">BP AFTER</span><span style="color:'+(t.bpAfter<0?DN:C.text)+';font-variant-numeric:tabular-nums;">'+money(t.bpAfter)+'</span></div>'+warns+'</div>'+
-    '<button data-act="placeOrder" aria-label="Place order" style="width:100%;padding:11px;border:none;border-radius:4px;background:'+submitBg+';color:'+submitColor+';font-family:inherit;font-size:12px;font-weight:600;letter-spacing:1px;cursor:'+(canPlace?'pointer':'not-allowed')+';">'+submitLabel+'</button>'+
-    '<div style="font-size:10px;color:'+C.faint+';margin-top:9px;line-height:1.5;">Confirm-before-send · guardrails: max notional $10k · 25% position cap · long-only.</div></div>';
+    '<button data-act="stageCompose" aria-label="Stage order into basket" style="width:100%;padding:11px;border:none;border-radius:4px;background:'+(stageOk?'#16324A':C.border)+';color:'+(stageOk?C.bright:C.faint)+';font-family:inherit;font-size:12px;font-weight:600;letter-spacing:1px;cursor:'+(stageOk?'pointer':'not-allowed')+';">＋ STAGE '+(S.side==='buy'?'BUY':'SELL')+'</button>'+
+    '<div style="font-size:10px;color:'+C.faint+';margin-top:9px;line-height:1.5;">Stage as many as you like, then PLACE ALL. Confirm-before-send · guardrails: max notional $10k · 25% position cap · long-only.</div></div>';
+
+  // The basket: every staged order, then one PLACE ALL submits them.
+  let basketHtml='';
+  if(S.basket.length){
+    let buyCost=0, sellProceeds=0;
+    const rows=S.basket.map((b,i)=>{ const px=basketRefPx(b), cost=b.qty*px; if(b.side==='buy') buyCost+=cost; else sellProceeds+=cost;
+      return '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 16px;border-bottom:1px solid '+C.hairline+';font-size:11.5px;">'+
+        '<div style="min-width:0;"><span style="color:'+(b.side==='buy'?UP:DN)+';font-weight:600;">'+esc(b.side.toUpperCase())+'</span> <span style="color:'+C.bright+';font-weight:600;">'+esc(b.sym)+'</span> <span style="color:'+C.label+';">'+qtyFmt(b.qty)+'</span> <span style="color:'+C.faint+';font-size:10px;">'+esc(b.otype)+((b.otype==='limit'&&b.limit)?(' @'+money(b.limit)):'')+'</span></div>'+
+        '<div style="display:flex;align-items:center;gap:8px;flex-shrink:0;"><span style="color:'+C.body+';font-variant-numeric:tabular-nums;">'+(px?('~'+money(cost)):'—')+'</span>'+
+        '<button data-act="removeBasket" data-arg="'+i+'" aria-label="Remove from basket" style="background:none;border:1px solid #1A212B;color:'+DN+';cursor:pointer;font-size:10px;line-height:1;padding:3px 7px;border-radius:3px;">✕</button></div></div>';
+    }).join('');
+    const cashBase=(M.paperBuyingPower!=null?M.paperBuyingPower:M.cash), bpAfter=cashBase-buyCost+sellProceeds, overBP=buyCost>cashBase;
+    const canAll=!S.halted && M.tradingEnabled;
+    const allLabel=S.halted?'TRADING HALTED':(!M.tradingEnabled?'NO BROKER (PAPER KEYS)':'PLACE ALL ('+S.basket.length+') // PAPER');
+    basketHtml='<div style="border-bottom:1px solid '+C.border+';background:'+C.bg+';">'+
+      '<div style="display:flex;justify-content:space-between;align-items:center;padding:11px 16px 8px;"><span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">TICKET BASKET <span style="color:'+C.amber+';">'+S.basket.length+'</span></span>'+
+        '<button data-act="clearBasket" style="font-family:inherit;font-size:9.5px;letter-spacing:0.5px;color:'+C.label+';background:transparent;border:1px solid #1A212B;border-radius:3px;padding:4px 9px;cursor:pointer;">⊘ CLEAR</button></div>'+
+      '<div style="max-height:200px;overflow-y:auto;">'+rows+'</div>'+
+      '<div style="padding:9px 16px 4px;display:flex;flex-direction:column;gap:5px;">'+
+        '<div style="display:flex;justify-content:space-between;font-size:11.5px;"><span style="color:'+C.label+';">EST BUY COST</span><span style="color:'+C.text+';font-variant-numeric:tabular-nums;">'+money(buyCost)+'</span></div>'+
+        '<div style="display:flex;justify-content:space-between;font-size:11.5px;"><span style="color:'+C.label+';">BP AFTER ALL</span><span style="color:'+(bpAfter<0?DN:C.text)+';font-variant-numeric:tabular-nums;">'+money(bpAfter)+'</span></div>'+
+        (overBP?'<div style="font-size:10.5px;color:'+DN+';">✕ buy cost over buying power by '+money(buyCost-cashBase)+'</div>':'')+
+      '</div>'+
+      '<div style="padding:4px 16px 12px;"><button data-act="placeAll" aria-label="Place all staged orders" style="width:100%;padding:11px;border:none;border-radius:4px;background:'+(canAll?'#1B7A45':C.border)+';color:'+(canAll?'#fff':C.faint)+';font-family:inherit;font-size:12px;font-weight:600;letter-spacing:1px;cursor:'+(canAll?'pointer':'not-allowed')+';">'+allLabel+'</button></div>'+
+    '</div>';
+  }
 
   const open=M.orders.filter(o=>['accepted','partially_filled','pending_submit'].includes(o.status));
   let workingHtml='<div style="flex:1;min-height:0;display:flex;flex-direction:column;"><div style="display:flex;justify-content:space-between;align-items:center;padding:11px 16px 9px;border-bottom:1px solid '+C.border+';"><span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">WORKING ORDERS <span style="color:'+C.amber+';">'+open.length+'</span></span>'+
@@ -732,7 +854,7 @@ function dock(){
       '<button data-act="cancelOrder" data-arg="'+o.id+'" aria-label="Cancel order" style="background:none;border:1px solid #1A212B;color:'+DN+';cursor:pointer;font-size:11px;padding:4px 8px;border-radius:3px;flex-shrink:0;">✕</button></div>').join('');
   } else { workingHtml += '<div style="padding:22px 16px;text-align:center;color:'+C.faint+';font-size:11px;">no working orders</div>'; }
   workingHtml += '</div></div>';
-  return '<aside aria-label="Order ticket and working orders" style="display:flex;flex-direction:column;background:'+C.panel2+';min-height:0;">'+ticketHtml+workingHtml+'</aside>';
+  return '<aside aria-label="Order ticket and working orders" style="display:flex;flex-direction:column;background:'+C.panel2+';min-height:0;">'+ticketHtml+basketHtml+workingHtml+'</aside>';
 }
 
 function importModal(){
@@ -770,9 +892,12 @@ function importModal(){
 
 function overlays(){
   let html='';
+  if(S.switching){ html += '<div style="position:fixed;inset:0;z-index:80;background:rgba(3,5,8,0.93);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;">'+
+    '<div style="font-size:15px;letter-spacing:1px;color:'+C.amber+';">SWITCHING TO '+esc((S.switching||'').toUpperCase())+'…</div>'+
+    '<div style="font-size:11px;letter-spacing:0.5px;color:'+C.label+';">restarting · reconnecting</div></div>'; }
   html += importModal();
   if(S.showHelp){
-    const rows=[['Focus command bar','/'],['Stage order from command','b 10 nvda ↵'],['Set ticket side','B / S'],['Toggle order ticket','T'],['Switch view','1 – 7'],['Move position selection','↑ ↓  or  j k'],['Load selected into ticket','↵'],['Toggle this help','?'],['Clear / blur','Esc']];
+    const rows=[['Focus command bar','/'],['Stage order from command','b 10 nvda ↵'],['Set ticket side','B / S'],['Toggle order ticket','T'],['Switch view','1 – 8'],['Move position selection','↑ ↓  or  j k'],['Load selected into ticket','↵'],['Toggle this help','?'],['Clear / blur','Esc']];
     html += '<div data-act="closeHelp" style="position:fixed;inset:0;z-index:60;background:rgba(3,5,8,0.8);display:flex;align-items:center;justify-content:center;"><div style="background:'+C.panel+';border:1px solid #1A212B;border-radius:8px;padding:26px 30px;width:460px;max-width:90vw;"><div style="font-size:13px;letter-spacing:1px;color:'+C.amber+';margin-bottom:18px;">KEYBOARD SHORTCUTS</div><div style="display:flex;flex-direction:column;gap:11px;font-size:12.5px;">'+
       rows.map(r=>'<div style="display:flex;justify-content:space-between;gap:16px;"><span style="color:'+C.body+';">'+esc(r[0])+'</span><span style="color:'+C.amber+';font-weight:600;">'+esc(r[1])+'</span></div>').join('')+
       '</div><div style="margin-top:20px;font-size:11px;color:'+C.faint+';">esc or click anywhere to close</div></div></div>';
@@ -801,6 +926,7 @@ function viewBody(){
     case 'alerts': return alertsView();
     case 'blotter': return blotterView();
     case 'taxes': return taxesView();
+    case 'ledger': return ledgerView();
     default: return positionsView();
   }
 }
@@ -821,9 +947,11 @@ function render(){
         '<input id="cmd" value="'+esc(S.cmd)+'" placeholder="symbol, or  b 10 nvda  ·  s 5 tsla @ 240   ( / to focus )" aria-label="Command" style="flex:1;background:transparent;border:none;color:'+C.text+';font-family:inherit;font-size:12.5px;padding:8px 0;outline:none;"><span style="font-size:10px;color:'+C.faint+';">↵</span></div>'+
       '<div style="margin-left:auto;display:flex;align-items:center;gap:14px;flex-shrink:0;">'+
         '<span style="font-size:11px;font-variant-numeric:tabular-nums;color:'+dirColor(M.dayPnl)+';">DAY '+(M.ready?signedMoney(M.dayPnl):'—')+'</span>'+
+        portfolioSelect()+
         '<span style="font-size:10px;letter-spacing:0.5px;color:'+C.amber+';">[ PAPER ]</span>'+
         '<span style="font-size:11px;color:'+marketColor+';display:flex;align-items:center;gap:6px;"><span style="width:6px;height:6px;border-radius:50%;background:'+marketColor+';"></span>'+(M.market==='open'?'MKT OPEN':'MKT CLOSED')+'</span>'+
         '<span style="font-size:11px;color:'+UP+';display:flex;align-items:center;gap:6px;"><span style="width:6px;height:6px;border-radius:50%;background:'+UP+';animation:pulse 1.4s ease infinite;"></span>'+clock+'</span>'+
+        '<button data-act="importOpen" title="Import transactions from CSV (Fidelity, Schwab, Robinhood, IBKR, or generic)" style="font-family:inherit;font-size:10px;letter-spacing:0.5px;color:'+C.label+';background:transparent;border:1px solid #1A212B;padding:5px 10px;border-radius:4px;cursor:pointer;">⬆ IMPORT</button>'+
         '<button data-act="halt" aria-pressed="'+S.halted+'" style="font-family:inherit;font-size:10px;letter-spacing:0.5px;color:'+haltColor+';background:'+haltBg+';border:1px solid '+haltColor+';padding:5px 10px;border-radius:4px;cursor:pointer;">'+haltLabel+'</button>'+
       '</div></header>'+
     // body grid
@@ -839,7 +967,7 @@ function render(){
     '<footer style="display:flex;align-items:center;gap:16px;padding:6px 14px;border-top:1px solid '+C.border+';background:'+C.panel2+';flex-shrink:0;font-size:10.5px;color:'+C.label+';">'+
       '<span style="color:'+(M.tradingEnabled?UP:C.label)+';">● '+(M.tradingEnabled?'RECONCILED':'TRACK-ONLY')+'</span>'+
       '<span>'+(M.liveFeed?'FEED LIVE':'FEED IDLE')+'</span><span style="color:'+C.faint+';">|</span>'+
-      '<span><span style="color:'+C.body+';">/</span> command</span><span><span style="color:'+C.body+';">B/S</span> side</span><span><span style="color:'+C.body+';">T</span> ticket</span><span><span style="color:'+C.body+';">1–7</span> views</span><span><span style="color:'+C.body+';">↑↓</span> select</span><span><span style="color:'+C.body+';">↵</span> load ticket</span>'+
+      '<span><span style="color:'+C.body+';">/</span> command</span><span><span style="color:'+C.body+';">B/S</span> side</span><span><span style="color:'+C.body+';">T</span> ticket</span><span><span style="color:'+C.body+';">1–8</span> views</span><span><span style="color:'+C.body+';">↑↓</span> select</span><span><span style="color:'+C.body+';">↵</span> load ticket</span>'+
       '<button data-act="help" style="margin-left:auto;font-family:inherit;font-size:10.5px;color:'+C.label+';background:transparent;border:1px solid #1A212B;border-radius:3px;padding:3px 9px;cursor:pointer;">? shortcuts</button>'+
     '</footer>'+
   '</div>'+ overlays();
@@ -876,27 +1004,51 @@ function wireCharts(){
 
 //================================================================ actions
 function toast(msg){ S.toast=msg; S.announce=msg; render(); clearTimeout(toast._t); toast._t=setTimeout(()=>{ S.toast=''; render(); }, 3200); }
-function setView(v){ S.view=v; S.hoverIdx=null; render(); }
-function stage(side,sym,qty,otype,limit){ S.side=side; S.tSym=(sym||'').toUpperCase(); S.tQty=String(qty); S.otype=otype||'market'; S.tLimit=limit!=null?String(limit):''; S.dockOpen=true; }
-function quickAdd(sym){ const p=M.positions.find(x=>x.sym===sym); stage('buy',sym, p?Math.max(1,Math.round(p.qty*0.25)):1, 'market'); toast('STAGED BUY '+sym); }
-function quickTrim(sym){ const p=M.positions.find(x=>x.sym===sym); if(!p) return; stage('sell',sym, Math.max(0.0001,Math.round(p.qty*0.25*10000)/10000), 'market'); toast('STAGED TRIM '+sym); }
+function setView(v){ S.view=v; S.hoverIdx=null; S.confirmDelTx=null; render(); if(v==='ledger') reloadTxns(); }
+// The order ticket is a BASKET: stage many, then PLACE ALL. Every "stage" path
+// — position STAGE buttons, command bar, analyst, alerts, manual compose —
+// accumulates here. Same symbol+side+type+limit merges (qty summed).
+function addToBasket(side,sym,qty,otype,limit){
+  sym=(sym||'').toUpperCase(); qty=parseFloat(qty)||0; otype=otype||'market'; limit=(limit!=null&&limit!=='')?String(limit):'';
+  if(!sym || qty<=0){ toast('Nothing to stage — symbol + qty required'); return false; }
+  const ex=S.basket.find(b=>b.sym===sym && b.side===side && b.otype===otype && String(b.limit)===String(limit));
+  if(ex){ ex.qty=Math.round((ex.qty+qty)*10000)/10000; } else { S.basket.push({side,sym,qty,otype,limit}); }
+  S.dockOpen=true; return true;
+}
+function quickAdd(sym){ const p=M.positions.find(x=>x.sym===sym); const q=p?Math.max(1,Math.round(p.qty*0.25)):1; if(addToBasket('buy',sym,q,'market')) toast('STAGED BUY '+q+' '+sym+' → ticket basket'); render(); }
+function quickTrim(sym){ const p=M.positions.find(x=>x.sym===sym); if(!p) return; const q=Math.max(0.0001,Math.round(p.qty*0.25*10000)/10000); if(addToBasket('sell',sym,q,'market')) toast('STAGED SELL '+qtyFmt(q)+' '+sym+' → ticket basket'); render(); }
 function loadSym(sym){ sym=(sym||'').toUpperCase(); S.tSym=sym; S.view='positions'; if(M.positions.find(p=>p.sym===sym)) S.selSym=sym; toast('LOADED '+sym+' INTO TICKET'); }
 function runCmd(raw){
   const str=(raw||'').trim(); if(!str) return;
   const tok=str.split(/\s+/); const sideMap={ b:'buy',buy:'buy',s:'sell',sell:'sell' }; const first=tok[0].toLowerCase();
   if(sideMap[first] && tok.length>=3){ const side=sideMap[first], qty=tok[1], sym=tok[2].toUpperCase(); let otype='market',limit='';
-    if(tok[3]==='@' && tok[4]){ otype='limit'; limit=tok[4]; } stage(side,sym,qty,otype,limit); S.cmd=''; toast('STAGED '+side.toUpperCase()+' '+qty+' '+sym+' — REVIEW & PLACE'); }
-  else { loadSym(tok[0]); S.cmd=''; }
+    if(tok[3]==='@' && tok[4]){ otype='limit'; limit=tok[4]; } if(addToBasket(side,sym,qty,otype,limit)) toast('STAGED '+side.toUpperCase()+' '+qty+' '+sym+' → ticket basket'); S.cmd=''; render(); }
+  else { loadSym(tok[0]); S.cmd=''; render(); }
 }
-async function placeOrder(){
-  const t=ticket();
+// Stage the manual compose editor (side/symbol/qty/type/limit) into the basket.
+function stageCompose(){
+  const symU=(S.tSym||'').toUpperCase(), qty=parseFloat(S.tQty)||0;
+  if(!symU || qty<=0){ toast('Enter a symbol and qty to stage'); return; }
+  if(S.otype==='limit' && !(parseFloat(S.tLimit)>0)){ toast('Limit order needs a price'); return; }
+  if(addToBasket(S.side,symU,S.tQty,S.otype,S.tLimit)){ toast('STAGED '+S.side.toUpperCase()+' '+qtyFmt(qty)+' '+symU); S.tSym=''; render(); }
+}
+function removeBasket(idx){ idx=+idx; if(idx>=0 && idx<S.basket.length){ S.basket.splice(idx,1); render(); } }
+function clearBasket(){ S.basket=[]; render(); }
+function basketRefPx(b){ const lp=M.positions.find(p=>p.sym===b.sym), w=M.watchlist.find(x=>x.sym===b.sym); const live=lp&&lp.price!=null?lp.price:(w&&w.price!=null?w.price:0); return (b.otype==='limit'&&b.limit)?(parseFloat(b.limit)||0):live; }
+// Submit every staged order; placed ones leave the basket, rejected ones stay
+// (with the first error surfaced) so they can be corrected and retried.
+async function placeAll(){
   if(S.halted){ toast('TRADING HALTED — nothing placed'); return; }
   if(!M.tradingEnabled){ toast('NO BROKER CONFIGURED — set ALPACA_PAPER_KEY/SECRET'); return; }
-  if(!t.canPlace){ toast(t.blockMsg||'Order blocked'); return; }
-  const body={ symbol:t.symU, side:S.side, order_type:S.otype, qty:S.tQty, tif:'day' };
-  if(S.otype==='limit') body.limit_price=S.tLimit;
-  try { await japi('POST','/api/orders',body); toast(S.side.toUpperCase()+' '+t.qty+' '+t.symU+' SUBMITTED [paper]'); await refreshSilent(); }
-  catch(e){ toast('REJECTED: '+e.message); }
+  if(!S.basket.length){ toast('Basket is empty'); return; }
+  let ok=0, fail=0, firstErr='';
+  for(const b of [...S.basket]){
+    const body={ symbol:b.sym, side:b.side, order_type:b.otype, qty:String(b.qty), tif:'day' };
+    if(b.otype==='limit') body.limit_price=String(b.limit);
+    try { await japi('POST','/api/orders',body); ok++; S.basket=S.basket.filter(x=>x!==b); }
+    catch(e){ fail++; if(!firstErr) firstErr=e.message; }
+  }
+  toast(ok+' PLACED'+(fail?(' · '+fail+' REJECTED: '+firstErr):'')+' [paper]'); await refreshSilent();
 }
 async function act(name, arg){
   switch(name){
@@ -909,20 +1061,30 @@ async function act(name, arg){
     case 'closeExpand': S.expanded=null; render(); break;
     case 'range': S.candleRange=arg; S.hoverIdx=null; render(); break;
     case 'selrow': S.selSym=arg; S.tSym=arg; S.hoverIdx=null; render(); { const v=$('viewscroll'); if(v) v.scrollTo({top:0,behavior:'smooth'}); } break;
+    case 'gotoPos': S.view='positions'; S.selSym=arg; S.tSym=arg; S.hoverIdx=null; render(); break;
     case 'add': quickAdd(arg); break;
     case 'trim': quickTrim(arg); break;
     case 'setBuy': S.side='buy'; render(); break;
     case 'setSell': S.side='sell'; render(); break;
     case 'setMkt': S.otype='market'; S.tLimit=''; render(); break;
     case 'setLim': S.otype='limit'; render(); break;
-    case 'placeOrder': placeOrder(); break;
+    case 'stageCompose': stageCompose(); break;
+    case 'placeAll': placeAll(); break;
+    case 'removeBasket': removeBasket(arg); break;
+    case 'clearBasket': clearBasket(); break;
     case 'cancelOrder': try{ await japi('DELETE','/api/orders/'+arg); toast('CANCEL REQUESTED'); await refreshSilent(); }catch(e){ toast('CANCEL FAILED: '+e.message); } break;
     case 'cancelAll': try{ await japi('POST','/api/orders/cancel_all'); toast('ALL OPEN ORDERS CANCELED'); await refreshSilent(); }catch(e){ toast('FAILED: '+e.message); } break;
+    case 'delTx':
+      if(S.confirmDelTx==arg){ // second click — confirmed
+        try{ await japi('DELETE','/api/transactions/'+arg); S.confirmDelTx=null; toast('TRANSACTION DELETED'); await reloadTxns(); await refreshSilent(); }
+        catch(e){ S.confirmDelTx=null; toast('DELETE FAILED: '+e.message); render(); }
+      } else { S.confirmDelTx=arg; render(); } // first click — arm
+      break;
     case 'halt': try{ await japi('POST','/api/trading/pause',{ paused:!S.halted }); S.halted=!S.halted; toast(S.halted?'TRADING HALTED':'TRADING RESUMED'); render(); }catch(e){ toast('FAILED: '+e.message); } break;
     case 'dismissAlert': try{ await japi('POST','/api/alerts/'+arg+'/dismiss'); await refreshSilent(); }catch(e){ toast(e.message); } break;
     case 'rearmAlert': try{ await japi('POST','/api/alerts/'+arg+'/rearm'); await refreshSilent(); }catch(e){ toast(e.message); } break;
-    case 'reviewAlert': { const a=M.alerts.find(x=>x.id==arg); if(a&&a.draft){ stage(a.draft.side,a.sym,a.draft.qty,a.draft.order_type,a.draft.limit_price); toast('STAGED '+a.sym+' FROM ALERT — REVIEW & PLACE'); } break; }
-    case 'stageRec': { const r=M.recs.find(x=>x.id==arg); if(r){ const side=r.action==='BUY'?'buy':'sell'; stage(side,r.sym,r.action==='TRIM'?10:5,'market'); toast('STAGED '+r.sym+' FROM ANALYST — REVIEW & PLACE'); try{ await japi('POST','/api/recommendations/'+arg+'/accept'); }catch(e){} } break; }
+    case 'reviewAlert': { const a=M.alerts.find(x=>x.id==arg); if(a&&a.draft){ if(addToBasket(a.draft.side,a.sym,a.draft.qty,a.draft.order_type,a.draft.limit_price)) toast('STAGED '+a.sym+' FROM ALERT → ticket basket'); render(); } break; }
+    case 'stageRec': { const r=M.recs.find(x=>x.id==arg); if(r){ const side=['BUY','ADD'].includes(r.action)?'buy':'sell'; if(addToBasket(side,r.sym,r.action==='TRIM'?10:5,'market')) toast('STAGED '+r.sym+' FROM ANALYST → ticket basket'); render(); try{ await japi('POST','/api/recommendations/'+arg+'/accept'); }catch(e){} } break; }
     case 'dropRec': try{ await japi('POST','/api/recommendations/'+arg+'/dismiss'); M.recs=M.recs.filter(r=>r.id!=arg); render(); }catch(e){ toast(e.message); } break;
     case 'importOpen': S.importOpen=true; S.importPreview=null; S.importErr=''; render(); break;
     case 'importClose': S.importOpen=false; render(); break;
@@ -962,7 +1124,28 @@ async function doImportConfirm(){
   }catch(e){ S.importErr=e.message; S.importBusy=false; render(); }
 }
 async function reloadAnalyst(){ try{ applyAnalyst(await jget('/api/analyst')); render(); }catch(e){} }
+async function reloadTxns(){ try{ applyTxns(await jget('/api/transactions')); render(); }catch(e){} }
 async function reloadTax(){ try{ applyTax(await jget('/api/taxes?year='+M.taxYear)); render(); }catch(e){} }
+
+//================================================================ portfolios (separate datasets, one active at a time)
+function portfolioSelect(){
+  const list = (M.portfolios && M.portfolios.length) ? M.portfolios : [{name:(M.activePortfolio||'real'), active:true}];
+  const opts = list.map(p=>'<option value="'+esc(p.name)+'"'+((p.active||p.name===M.activePortfolio)?' selected':'')+'>'+esc(p.name)+'</option>').join('')
+    + '<option value="__new__">＋ new portfolio…</option>';
+  return '<select id="pfsel" aria-label="Active portfolio" title="Active portfolio — switching reloads the app" style="font-family:inherit;font-size:10px;letter-spacing:0.5px;color:'+C.bright+';background:'+C.bg+';border:1px solid #1A212B;border-radius:4px;padding:4px 6px;cursor:pointer;max-width:150px;">'+opts+'</select>';
+}
+async function switchPortfolio(name){
+  if(!name || name===M.activePortfolio) return;
+  S.switching=name; render();
+  try{ await japi('POST','/api/portfolios/switch',{name}); setTimeout(()=>location.reload(), 1200); }
+  catch(e){ S.switching=''; toast(e.message); render(); }
+}
+async function newPortfolio(){
+  const name=(window.prompt('Name for the new portfolio:')||'').trim();
+  if(!name) return;
+  try{ await japi('POST','/api/portfolios',{name}); toast('CREATED "'+name+'" — switching…'); await switchPortfolio(name); }
+  catch(e){ toast(e.message); render(); }
+}
 
 //================================================================ events
 document.addEventListener('click', (e)=>{
@@ -985,6 +1168,7 @@ document.addEventListener('input', (e)=>{
 });
 document.addEventListener('change', (e)=>{
   if(e.target.getAttribute && e.target.getAttribute('data-act')==='taxYear'){ M.taxYear=Number(e.target.value); reloadTax(); return; }
+  if(e.target.id==='pfsel'){ const v=e.target.value; if(v==='__new__'){ e.target.value=M.activePortfolio||(M.portfolios[0]&&M.portfolios[0].name)||''; newPortfolio(); } else { switchPortfolio(v); } return; }
   if(e.target.id==='importfmt'){ S.importFmt=e.target.value; S.importPreview=null; S.importErr=''; render(); return; }
   if(e.target.id==='importfile'){
     const f=e.target.files && e.target.files[0];
@@ -1002,7 +1186,7 @@ document.addEventListener('keydown', (e)=>{
   if(e.target.id==='cmd' && e.key==='Enter'){ runCmd(S.cmd); render(); return; }
   if(typing) return;
   if(e.key==='?'){ e.preventDefault(); S.showHelp=!S.showHelp; render(); return; }
-  if(e.key>='1' && e.key<='7'){ setView(VIEWS[+e.key-1]); return; }
+  if(e.key>='1' && e.key<=String(VIEWS.length)){ setView(VIEWS[+e.key-1]); return; }
   const k=e.key.toLowerCase();
   if(k==='t'){ S.dockOpen=!S.dockOpen; render(); return; }
   if(k==='b'){ S.side='buy'; render(); return; }
