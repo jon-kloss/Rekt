@@ -1140,11 +1140,28 @@ async function switchPortfolio(name){
   try{ await japi('POST','/api/portfolios/switch',{name}); setTimeout(()=>location.reload(), 1200); }
   catch(e){ S.switching=''; toast(e.message); render(); }
 }
+async function refreshPortfolios(){
+  try{ const pl=await jget('/api/portfolios'); M.portfolios=pl.portfolios||M.portfolios; if(pl.active) M.activePortfolio=pl.active; }catch(e){}
+}
 async function newPortfolio(){
   const name=(window.prompt('Name for the new portfolio:')||'').trim();
   if(!name) return;
-  try{ await japi('POST','/api/portfolios',{name}); toast('CREATED "'+name+'" — switching…'); await switchPortfolio(name); }
-  catch(e){ toast(e.message); render(); }
+  let created=false;
+  try{ await japi('POST','/api/portfolios',{name}); created=true; }
+  catch(e){
+    // A create can fail because it already exists (e.g. a prior create whose
+    // auto-switch was blocked by an open order). Refresh first so the entry
+    // appears, then fall through to switching to it; surface any other error.
+    await refreshPortfolios(); render();
+    const exists=(M.portfolios||[]).some(p=>(p.name||'').toLowerCase()===name.toLowerCase());
+    if(!exists){ toast(e.message); return; }
+  }
+  // Make the new portfolio visible in the dropdown REGARDLESS of whether the
+  // switch below succeeds — switching can be refused (open orders) and the
+  // portfolio must not vanish until the next full reload.
+  await refreshPortfolios(); render();
+  toast((created?'CREATED "':'"')+name+'" — switching…');
+  await switchPortfolio(name);
 }
 
 //================================================================ events
