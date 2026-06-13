@@ -6,7 +6,7 @@ A self-hosted, single-user web dashboard for **tracking and trading** a US
 stocks & ETFs portfolio in real time, with an AI analyst watching over your
 shoulder. One Rust binary, one SQLite file, your keys never leave your box.
 
-**Status: Phase 9** — tracking, paper trading, history & insight,
+**Status: Phase 10 (hardening toward v1.0)** — tracking, paper trading, history & insight,
 alerts-to-action, the **AI analyst** (morning briefings, weekly deep
 reviews with web search, on-demand analysis over the Claude API — all
 **advisory only**: no dependency path to the broker, read-only tools,
@@ -58,6 +58,16 @@ scheduled briefing/review), and guardrails:
 (default 25), `REKT_MAX_ORDERS_PER_DAY` (default 20),
 `REKT_MAX_DAILY_LOSS` (circuit breaker on new buys, default 1000;
 ≤0 disables).
+
+## Running it for real
+
+Deployment (systemd), reverse-proxy + TLS, the SQLite backup/restore
+procedure, monitoring via `/api/health`, the security posture, and the
+deliberate paper-only stance on live trading are all in
+[docs/OPERATIONS.md](docs/OPERATIONS.md). The short version: it's one
+binary and one SQLite file, it binds loopback with no built-in auth (front
+it with a TLS proxy to expose it), and you back it up with
+`sqlite3 rekt.db "VACUUM INTO 'backup.db'"` while it's live.
 
 ## Development
 
