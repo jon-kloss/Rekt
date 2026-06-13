@@ -715,37 +715,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn csv_import_is_all_or_nothing() {
+    async fn csv_import_drops_unbacked_sells_but_rejects_malformed_rows() {
         let state = test_state().await;
-        // Second row oversells — nothing must be imported.
-        let bad_csv = "kind,symbol,qty,price,fees,taxes,ts,note\n\
+        // An un-backable SELL (sell 6 of a 5-share position) is DROPPED and
+        // reported, not aborted — real brokerage exports contain sells of
+        // positions opened before the export's earliest row. The buy still
+        // lands.
+        let oversell_csv = "kind,symbol,qty,price,fees,taxes,ts,note\n\
                        buy,AAPL,5,100,,,,\n\
                        sell,AAPL,6,110,,,,";
         let request_body = axum::http::Request::builder()
             .method("POST")
             .uri("/api/import/csv")
             .header("content-type", "text/csv")
-            .body(axum::body::Body::from(bad_csv))
+            .body(axum::body::Body::from(oversell_csv))
             .unwrap();
         let response = app(state.clone()).oneshot(request_body).await.unwrap();
         let status = response.status();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        // Replay errors name the line in the ORIGINAL file (header = line 1;
-        // the oversell is data row 2 = file line 3), like every other path.
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["imported"], 1, "{body}"); // only the buy
+                                                   // The dropped sell is reported, named by its ORIGINAL file line (the
+                                                   // oversell is data row 2 = file line 3), like every other path.
+        let skipped = body["skipped"].as_array().unwrap();
         assert!(
-            body["error"].as_str().unwrap().starts_with("line 3:"),
+            skipped
+                .iter()
+                .any(|s| s.as_str().unwrap().starts_with("line 3:")),
             "{body}"
         );
-
         let (_, txs) = request(state.clone(), "GET", "/api/transactions", None).await;
-        assert_eq!(txs.as_array().unwrap().len(), 0);
+        assert_eq!(txs.as_array().unwrap().len(), 1);
+
+        // But a MALFORMED row (unparseable qty) is still all-or-nothing: the
+        // whole file is rejected and nothing new is written.
+        let malformed_csv = "kind,symbol,qty,price,fees,taxes,ts,note\n\
+                       buy,MSFT,notanumber,100,,,,";
+        let request_body = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/import/csv")
+            .header("content-type", "text/csv")
+            .body(axum::body::Body::from(malformed_csv))
+            .unwrap();
+        let response = app(state.clone()).oneshot(request_body).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let (_, txs) = request(state.clone(), "GET", "/api/transactions", None).await;
+        assert_eq!(txs.as_array().unwrap().len(), 1); // unchanged
 
         // A clean file imports fully.
         let good_csv = "kind,symbol,qty,price,fees,taxes,ts,note\n\
                         deposit,,,2000,,,,seed\n\
-                        buy,AAPL,5,100,1,,2026-01-05T15:00:00Z,first buy";
+                        buy,NVDA,5,100,1,,2026-01-05T15:00:00Z,first buy";
         let request_body = axum::http::Request::builder()
             .method("POST")
             .uri("/api/import/csv")
@@ -756,7 +777,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let (_, txs) = request(state.clone(), "GET", "/api/transactions", None).await;
-        assert_eq!(txs.as_array().unwrap().len(), 2);
+        assert_eq!(txs.as_array().unwrap().len(), 3); // buy + deposit + buy
 
         // CSV imports must be recorded with source='csv', not 'manual'.
         use sqlx::Row;
@@ -767,7 +788,7 @@ mod tests {
             .into_iter()
             .map(|r| r.get("source"))
             .collect();
-        assert_eq!(sources, vec!["csv", "csv"]);
+        assert_eq!(sources, vec!["csv", "csv", "csv"]);
     }
 
     #[tokio::test]
