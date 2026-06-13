@@ -607,7 +607,7 @@ function overviewView(){
   // surfaces what actually needs a decision and fills the dashboard width.
   const items=attentionItems();
   const attnHtml='<div style="font-size:11px;letter-spacing:1px;color:'+C.body+';margin-bottom:4px;">NEEDS ATTENTION'+(items.length?' <span style="color:'+C.amber+';">'+items.length+'</span>':'')+'</div>'+
-    (items.length ? items.map(it=>'<div'+(it.act?' data-act="'+it.act+'" data-arg="'+it.arg+'"':'')+' style="display:flex;align-items:flex-start;gap:10px;padding:7px 0;border-top:1px solid '+C.hairline+';font-size:12px;'+(it.act?'cursor:pointer;':'')+'">'+
+    (items.length ? items.map(it=>'<div'+(it.act?' data-act="'+it.act+'" data-arg="'+esc(it.arg)+'"':'')+' style="display:flex;align-items:flex-start;gap:10px;padding:7px 0;border-top:1px solid '+C.hairline+';font-size:12px;'+(it.act?'cursor:pointer;':'')+'">'+
         '<span aria-hidden="true" style="flex-shrink:0;">'+it.icon+'</span>'+
         '<span style="color:'+(it.color||C.body)+';line-height:1.5;">'+esc(it.text)+'</span>'+
         (it.act?'<span style="margin-left:auto;color:'+C.faint+';font-size:10px;flex-shrink:0;">→</span>':'')+
@@ -1005,7 +1005,6 @@ function wireCharts(){
 //================================================================ actions
 function toast(msg){ S.toast=msg; S.announce=msg; render(); clearTimeout(toast._t); toast._t=setTimeout(()=>{ S.toast=''; render(); }, 3200); }
 function setView(v){ S.view=v; S.hoverIdx=null; S.confirmDelTx=null; render(); if(v==='ledger') reloadTxns(); }
-function stage(side,sym,qty,otype,limit){ S.side=side; S.tSym=(sym||'').toUpperCase(); S.tQty=String(qty); S.otype=otype||'market'; S.tLimit=limit!=null?String(limit):''; S.dockOpen=true; }
 // The order ticket is a BASKET: stage many, then PLACE ALL. Every "stage" path
 // — position STAGE buttons, command bar, analyst, alerts, manual compose —
 // accumulates here. Same symbol+side+type+limit merges (qty summed).
@@ -1085,7 +1084,7 @@ async function act(name, arg){
     case 'dismissAlert': try{ await japi('POST','/api/alerts/'+arg+'/dismiss'); await refreshSilent(); }catch(e){ toast(e.message); } break;
     case 'rearmAlert': try{ await japi('POST','/api/alerts/'+arg+'/rearm'); await refreshSilent(); }catch(e){ toast(e.message); } break;
     case 'reviewAlert': { const a=M.alerts.find(x=>x.id==arg); if(a&&a.draft){ if(addToBasket(a.draft.side,a.sym,a.draft.qty,a.draft.order_type,a.draft.limit_price)) toast('STAGED '+a.sym+' FROM ALERT → ticket basket'); render(); } break; }
-    case 'stageRec': { const r=M.recs.find(x=>x.id==arg); if(r){ const side=r.action==='BUY'?'buy':'sell'; if(addToBasket(side,r.sym,r.action==='TRIM'?10:5,'market')) toast('STAGED '+r.sym+' FROM ANALYST → ticket basket'); render(); try{ await japi('POST','/api/recommendations/'+arg+'/accept'); }catch(e){} } break; }
+    case 'stageRec': { const r=M.recs.find(x=>x.id==arg); if(r){ const side=['BUY','ADD'].includes(r.action)?'buy':'sell'; if(addToBasket(side,r.sym,r.action==='TRIM'?10:5,'market')) toast('STAGED '+r.sym+' FROM ANALYST → ticket basket'); render(); try{ await japi('POST','/api/recommendations/'+arg+'/accept'); }catch(e){} } break; }
     case 'dropRec': try{ await japi('POST','/api/recommendations/'+arg+'/dismiss'); M.recs=M.recs.filter(r=>r.id!=arg); render(); }catch(e){ toast(e.message); } break;
     case 'importOpen': S.importOpen=true; S.importPreview=null; S.importErr=''; render(); break;
     case 'importClose': S.importOpen=false; render(); break;
@@ -1169,7 +1168,7 @@ document.addEventListener('input', (e)=>{
 });
 document.addEventListener('change', (e)=>{
   if(e.target.getAttribute && e.target.getAttribute('data-act')==='taxYear'){ M.taxYear=Number(e.target.value); reloadTax(); return; }
-  if(e.target.id==='pfsel'){ const v=e.target.value; if(v==='__new__'){ e.target.value=M.activePortfolio; newPortfolio(); } else { switchPortfolio(v); } return; }
+  if(e.target.id==='pfsel'){ const v=e.target.value; if(v==='__new__'){ e.target.value=M.activePortfolio||(M.portfolios[0]&&M.portfolios[0].name)||''; newPortfolio(); } else { switchPortfolio(v); } return; }
   if(e.target.id==='importfmt'){ S.importFmt=e.target.value; S.importPreview=null; S.importErr=''; render(); return; }
   if(e.target.id==='importfile'){
     const f=e.target.files && e.target.files[0];

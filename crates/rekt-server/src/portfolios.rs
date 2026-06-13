@@ -253,7 +253,14 @@ pub async fn create(
     Json(input): Json<NameInput>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let name = validate_name(&input.name).map_err(|m| err(StatusCode::BAD_REQUEST, m))?;
+    // Serialize registry mutations so two concurrent creates can't lose an
+    // entry (load → push → save is read-modify-write).
+    let _guard = state.mutations.lock().await;
     let mut reg = load(&state.data_dir);
+    let slug = slugify(&name);
+    // Reject on either a name OR a slug collision: distinct names can slugify
+    // to the same file (e.g. "growth test" and "growth-test" both → growth-test),
+    // which would silently make two portfolios share one DB.
     if reg
         .portfolios
         .iter()
@@ -264,7 +271,15 @@ pub async fn create(
             format!("a portfolio named {name:?} already exists"),
         ));
     }
-    let slug = slugify(&name);
+    if let Some(clash) = reg.portfolios.iter().find(|p| slugify(&p.name) == slug) {
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!(
+                "{name:?} maps to the same file as the existing portfolio {:?} — pick a more distinct name",
+                clash.name
+            ),
+        ));
+    }
     let db = format!("portfolios/{slug}.db");
     let entry = PortfolioEntry {
         name: name.clone(),
@@ -298,6 +313,13 @@ pub async fn switch(
     if reg.active == name {
         return Ok(Json(json!({ "switching": name, "noop": true })));
     }
+
+    // Hold the mutations lock across the whole flip so no transaction/order can
+    // interleave between the open-order check and the pool close (otherwise a
+    // write could land in a DB the registry no longer points at, or an order
+    // could be submitted to the broker with no local record after re-exec).
+    let _guard = state.mutations.lock().await;
+
     // Don't switch out from under a working order.
     let open: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM orders
@@ -317,15 +339,19 @@ pub async fn switch(
     save(&state.data_dir, &reg).map_err(internal)?;
     tracing::info!(to = %name, "switching active portfolio — re-exec");
 
-    // Re-exec AFTER this response flushes: fold the WAL back into the file and
-    // drain the pool first (exec runs no destructors), then replace the image.
-    let st = state.clone();
+    // Fold the WAL back into the file and drain the pool NOW, while we still
+    // hold the lock — once the pool is closed no later write can land in the
+    // stale (old) DB even though the registry already names the new one. (exec
+    // runs no destructors, so this must happen before the image is replaced.)
+    let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(&state.db)
+        .await;
+    state.db.close().await;
+
+    // Re-exec only AFTER this response has had a moment to flush: the pool is
+    // already closed, so the brief window is safe (further writes just error).
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&st.db)
-            .await;
-        st.db.close().await;
         let e = reexec();
         tracing::error!(error = %e, "re-exec failed — exiting for a supervisor to restart");
         std::process::exit(1);
@@ -344,6 +370,16 @@ mod tests {
         assert_eq!(slugify("My Test 2!"), "my-test-2");
         assert_eq!(slugify("  a  b  "), "a-b");
         assert_eq!(slugify("___"), "");
+    }
+
+    #[test]
+    fn distinct_names_can_collide_on_slug() {
+        // The create handler must reject the second of these (same DB file).
+        assert_eq!(slugify("growth test"), slugify("growth-test"));
+        assert_eq!(slugify("growth test"), slugify("growth_test"));
+        assert_eq!(slugify("growth test"), "growth-test");
+        // ...but genuinely distinct names keep distinct slugs.
+        assert_ne!(slugify("real"), slugify("test"));
     }
 
     #[test]

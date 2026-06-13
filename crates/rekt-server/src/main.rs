@@ -511,7 +511,24 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let listener = tokio::net::TcpListener::bind(&listen).await?;
+    // A portfolio switch re-execs this binary in place; the old listener fd is
+    // CLOEXEC and closes on exec, but the new image can momentarily race a
+    // socket still in TIME_WAIT. Retry the bind briefly so a switch never
+    // crash-loops on a transient "address in use".
+    let listener = {
+        let mut attempt = 0u32;
+        loop {
+            match tokio::net::TcpListener::bind(&listen).await {
+                Ok(l) => break l,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempt < 20 => {
+                    attempt += 1;
+                    tracing::warn!(addr = %listen, attempt, "address in use — retrying bind");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    };
     tracing::info!(addr = %listen, "REKT listening — how rekt are you today?");
     axum::serve(listener, app(state))
         .with_graceful_shutdown(async {
