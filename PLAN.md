@@ -463,9 +463,17 @@ watchlist     (instrument_id, added_ts)
   boot. Consolidate, not expand.
 - `docs/OPERATIONS.md`: systemd deployment, reverse-proxy + TLS, the
   SQLite WAL backup/restore procedure (`VACUUM INTO`, safe while live),
-  upgrades, monitoring, security posture, and the **live-trading
-  enablement design** (separate creds, explicit opt-in, kill-switch + real
-  fee ingestion, soak-first) — wiring deferred by design, not unfinished.
+  upgrades, monitoring, security posture, the **live-trading enablement
+  design** (separate creds, explicit opt-in, kill-switch + real fee
+  ingestion, soak-first), and the info/debug/trace log-level scheme.
+- Debug/trace logging across every I/O code path (data providers, broker,
+  analyst transport + loop, server handlers, repo mutations, schedulers,
+  live pipeline) — never logging secrets; `rekt-core` stays I/O-free and
+  is observed from its callers' debug logs.
+- End-to-end consistency tests through the real router: the portfolio
+  engine and the independent tax engine agree on realized P&L (and history
+  totals) when there's no wash sale, and diverge by exactly the disallowed
+  amount when there is; CSV import → portfolio → taxes seam.
 
 ### Backlog (post-v1, demand-validated by research)
 - Options tracking (expands the locked stocks-&-ETFs scope — needs its own

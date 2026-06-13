@@ -1771,4 +1771,153 @@ Trades,Data,Order,Equity and Index Options,USD,AAPL 240920C,\"2026-06-10, 10:30:
         // With no transactions, the only offered year is the current one.
         assert_eq!(json["years"].as_array().unwrap().len(), 1);
     }
+
+    /// Post a transaction and assert it was created. The end-to-end tests
+    /// below build a realistic log through the real router, then check that
+    /// independent subsystems derive a consistent view of it.
+    async fn post_tx(state: &AppState, body: serde_json::Value) {
+        let (status, json) = request(state.clone(), "POST", "/api/transactions", Some(body)).await;
+        assert_eq!(status, StatusCode::CREATED, "{json}");
+    }
+
+    #[tokio::test]
+    async fn portfolio_taxes_and_history_agree_on_realized_pnl() {
+        // The portfolio engine and the (independent) tax engine replay the
+        // same log; with no wash sales and no fees their realized number is
+        // the SAME 4000, and history's totals must match too. This is the
+        // cross-subsystem invariant no single-module test can catch.
+        let state = test_state().await;
+        for body in [
+            serde_json::json!({"kind": "deposit", "price": "50000",
+                "ts": "2025-01-01T15:00:00Z"}),
+            serde_json::json!({"kind": "buy", "symbol": "AAPL", "qty": "100", "price": "150",
+                "ts": "2025-02-02T15:00:00Z"}),
+            serde_json::json!({"kind": "buy", "symbol": "AAPL", "qty": "50", "price": "160",
+                "ts": "2025-09-01T15:00:00Z"}),
+            // FIFO sells 80 from the first lot — held >1yr, so long-term.
+            serde_json::json!({"kind": "sell", "symbol": "AAPL", "qty": "80", "price": "200",
+                "ts": "2026-03-02T15:00:00Z"}),
+            serde_json::json!({"kind": "dividend", "symbol": "AAPL", "price": "120",
+                "ts": "2026-04-01T15:00:00Z"}),
+        ] {
+            post_tx(&state, body).await;
+        }
+
+        let (_, portfolio) = request(state.clone(), "GET", "/api/portfolio", None).await;
+        let p = &portfolio["portfolio"];
+        // 50000 − 15000 − 8000 + 16000 + 120.
+        assert_eq!(p["cash"], "43120");
+        assert_eq!(p["positions"][0]["qty"], "70"); // 100 + 50 − 80
+        assert_eq!(p["realized_pnl"], "4000"); // 80 × (200 − 150)
+        assert_eq!(p["dividends"], "120");
+
+        let (_, taxes) = request(state.clone(), "GET", "/api/taxes?year=2026", None).await;
+        assert_eq!(taxes["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(taxes["rows"][0]["long_term"], true);
+        assert_eq!(taxes["long"]["gain"], "4000");
+        assert_eq!(taxes["short"]["gain"], "0");
+        assert_eq!(taxes["long"]["disallowed"], "0"); // no rebuy → no wash
+
+        let (_, history) = request(state.clone(), "GET", "/api/history?range=all", None).await;
+
+        // The invariant: economic realized P&L (portfolio) == capital gain
+        // (taxes, no wash) == history totals — all 4000, all derived from
+        // one transaction log by three independent paths.
+        let dec = |v: &serde_json::Value| {
+            v.as_str()
+                .unwrap()
+                .parse::<rust_decimal::Decimal>()
+                .unwrap()
+        };
+        let realized = dec(&p["realized_pnl"]);
+        assert_eq!(
+            realized,
+            dec(&taxes["short"]["gain"]) + dec(&taxes["long"]["gain"])
+        );
+        assert_eq!(realized, dec(&history["totals"]["realized_pnl"]));
+        assert_eq!(dec(&history["totals"]["dividends"]), dec(&p["dividends"]));
+    }
+
+    #[tokio::test]
+    async fn a_wash_sale_makes_economic_and_taxable_pnl_diverge() {
+        // The two engines must NOT always agree: a wash sale means the
+        // portfolio still shows the economic loss while the tax engine
+        // defers it (§1091). The divergence is exactly the disallowed amount.
+        let state = test_state().await;
+        for body in [
+            serde_json::json!({"kind": "deposit", "price": "10000",
+                "ts": "2026-01-01T15:00:00Z"}),
+            serde_json::json!({"kind": "buy", "symbol": "TSLA", "qty": "10", "price": "300",
+                "ts": "2026-01-05T15:00:00Z"}),
+            serde_json::json!({"kind": "sell", "symbol": "TSLA", "qty": "10", "price": "250",
+                "ts": "2026-03-02T15:00:00Z"}),
+            // Rebuy within 30 days → the loss is washed.
+            serde_json::json!({"kind": "buy", "symbol": "TSLA", "qty": "10", "price": "240",
+                "ts": "2026-03-20T15:00:00Z"}),
+        ] {
+            post_tx(&state, body).await;
+        }
+
+        let (_, portfolio) = request(state.clone(), "GET", "/api/portfolio", None).await;
+        // The portfolio tracks the real economic loss, untouched by §1091.
+        assert_eq!(portfolio["portfolio"]["realized_pnl"], "-500");
+
+        let (_, taxes) = request(state.clone(), "GET", "/api/taxes?year=2026", None).await;
+        assert_eq!(taxes["rows"][0]["code"], "W");
+        assert_eq!(taxes["short"]["gain"], "-500"); // raw loss matches the engine
+        assert_eq!(taxes["short"]["disallowed"], "500"); // …but fully disallowed
+        assert_eq!(taxes["short"]["reportable"], "0"); // so nothing lands this year
+
+        let dec = |v: &serde_json::Value| {
+            v.as_str()
+                .unwrap()
+                .parse::<rust_decimal::Decimal>()
+                .unwrap()
+        };
+        // reportable = economic gain + disallowed: the engines reconcile.
+        assert_eq!(
+            dec(&taxes["short"]["reportable"]),
+            dec(&portfolio["portfolio"]["realized_pnl"]) + dec(&taxes["short"]["disallowed"])
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_csv_import_flows_into_portfolio_and_taxes() {
+        // Exercise the import → validate → insert → derive seam end to end:
+        // a CSV the user uploads must feed both the portfolio and the tax
+        // report consistently.
+        let state = test_state().await;
+        let csv = "kind,symbol,qty,price,fees,taxes,ts,note\n\
+                   deposit,,0,10000,,,2025-01-01T15:00:00Z,\n\
+                   buy,MSFT,10,400,,,2025-02-02T15:00:00Z,\n\
+                   sell,MSFT,10,500,,,2026-03-02T15:00:00Z,\n";
+        let response = app(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/import/csv?format=generic")
+                    .header("content-type", "text/csv")
+                    .body(axum::body::Body::from(csv))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let imported: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(imported["imported"], 3);
+
+        let (_, portfolio) = request(state.clone(), "GET", "/api/portfolio", None).await;
+        let p = &portfolio["portfolio"];
+        assert_eq!(p["cash"], "11000"); // 10000 − 4000 + 5000
+        assert_eq!(p["realized_pnl"], "1000"); // 10 × (500 − 400)
+        assert!(p["positions"].as_array().unwrap().is_empty()); // MSFT flat
+
+        let (_, taxes) = request(state.clone(), "GET", "/api/taxes?year=2026", None).await;
+        assert_eq!(taxes["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(taxes["rows"][0]["long_term"], true); // held >1yr
+        assert_eq!(taxes["long"]["gain"], "1000");
+        // Same number, two engines, fed from one uploaded CSV.
+        assert_eq!(p["realized_pnl"], taxes["long"]["gain"]);
+    }
 }
