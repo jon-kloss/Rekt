@@ -637,7 +637,7 @@ function importModal(){
   if(!S.importOpen) return '';
   const fmts=[['generic','Generic (REKT native)'],['fidelity','Fidelity'],['schwab','Schwab'],['robinhood','Robinhood'],['ibkr','Interactive Brokers']];
   const fmtOpts=fmts.map(f=>'<option value="'+f[0]+'"'+(f[0]===S.importFmt?' selected':'')+'>'+esc(f[1])+'</option>').join('');
-  const pv=S.importPreview, busy=S.importBusy;
+  const pv=S.importPreview, busy=S.importBusy, wi=pv?(Number(pv.would_import)||0):0;
   let result='';
   if(S.importErr){ result+='<div style="margin-top:12px;font-size:11.5px;color:'+DN+';white-space:pre-wrap;">'+esc(S.importErr)+'</div>'; }
   if(pv){
@@ -645,7 +645,7 @@ function importModal(){
     const rows=sample.map(r=>'<div style="display:grid;grid-template-columns:0.8fr 0.6fr 0.6fr 0.7fr 0.9fr;gap:8px;padding:5px 0;border-top:1px solid '+C.hairline+';font-size:11px;font-variant-numeric:tabular-nums;"><span style="color:'+C.body+';">'+esc(r.kind)+'</span><span style="color:'+C.bright+';">'+esc(r.symbol||'—')+'</span><span style="text-align:right;color:'+C.body+';">'+esc(String(r.qty??''))+'</span><span style="text-align:right;color:'+C.body+';">'+esc(String(r.price??''))+'</span><span style="color:'+C.label+';">'+esc(String(r.ts||'').slice(0,10))+'</span></div>').join('');
     const skipBlock = skips.length ? '<div style="margin-top:10px;font-size:11px;color:'+C.amber+';">Skipping '+skips.length+' row'+(skips.length===1?'':'s')+' (not portfolio transactions):</div><div style="max-height:90px;overflow:auto;font-size:10.5px;color:'+C.label+';margin-top:4px;">'+skips.slice(0,50).map(s=>'<div>'+esc(s)+'</div>').join('')+(skips.length>50?'<div>… +'+(skips.length-50)+' more</div>':'')+'</div>' : '';
     result+='<div style="margin-top:14px;padding-top:10px;border-top:1px solid '+C.border+';">'+
-      '<div style="font-size:12.5px;color:'+C.bright+';">Will import <b style="color:'+UP+';">'+pv.would_import+'</b> transaction'+(pv.would_import===1?'':'s')+'.</div>'+
+      '<div style="font-size:12.5px;color:'+C.bright+';">Will import <b style="color:'+UP+';">'+wi+'</b> transaction'+(wi===1?'':'s')+'.</div>'+
       skipBlock+
       (rows?'<div style="margin-top:10px;font-size:9.5px;letter-spacing:0.5px;color:'+C.label+';">PREVIEW (first '+sample.length+')</div>'+rows:'')+
       '</div>';
@@ -662,7 +662,7 @@ function importModal(){
     result+
     '<div style="display:flex;gap:8px;margin-top:16px;justify-content:flex-end;">'+
       '<button data-act="importPreview"'+(busy?' disabled':'')+' style="font-family:inherit;font-size:11px;color:'+C.text+';background:transparent;border:1px solid '+C.border+';border-radius:4px;padding:8px 16px;cursor:'+(busy?'default':'pointer')+';opacity:'+(busy?'0.5':'1')+';">'+(busy?'WORKING…':'PREVIEW')+'</button>'+
-      (pv?'<button data-act="importConfirm"'+(busy?' disabled':'')+' style="font-family:inherit;font-size:11px;font-weight:600;color:'+UP+';background:rgba(47,191,113,0.1);border:1px solid rgba(47,191,113,0.4);border-radius:4px;padding:8px 16px;cursor:'+(busy?'default':'pointer')+';">CONFIRM IMPORT ('+pv.would_import+')</button>':'')+
+      (pv?'<button data-act="importConfirm"'+(busy?' disabled':'')+' style="font-family:inherit;font-size:11px;font-weight:600;color:'+UP+';background:rgba(47,191,113,0.1);border:1px solid rgba(47,191,113,0.4);border-radius:4px;padding:8px 16px;cursor:'+(busy?'default':'pointer')+';">CONFIRM IMPORT ('+wi+')</button>':'')+
     '</div></div></div>';
 }
 
@@ -837,9 +837,13 @@ async function doImportConfirm(){
   S.importBusy=true; S.importErr=''; render();
   try{
     const r=await jcsv(S.importFmt, text, false);
-    toast('IMPORTED '+r.imported+' TRANSACTION'+(r.imported===1?'':'S'));
+    const n=Number(r.imported)||0;
+    toast('IMPORTED '+n+' TRANSACTION'+(n===1?'':'S'));
     S.importOpen=false; S.importPreview=null; S.importText=''; S.importBusy=false;
-    await loadAll(); // import flows into positions, performance, taxes
+    // Imports land in positions/perf/taxes, not the Blotter (orders) — switch
+    // there so the effect is visible from where the action was triggered.
+    S.view='positions';
+    await loadAll();
   }catch(e){ S.importErr=e.message; S.importBusy=false; render(); }
 }
 async function reloadAnalyst(){ try{ applyAnalyst(await jget('/api/analyst')); render(); }catch(e){} }
@@ -861,7 +865,7 @@ document.addEventListener('input', (e)=>{
   if(id==='tSym'){ S.tSym=e.target.value.toUpperCase(); patchTicket(); return; }
   if(id==='tQty'){ S.tQty=e.target.value; patchTicket(); return; }
   if(id==='tLimit'){ S.tLimit=e.target.value; patchTicket(); return; }
-  if(id==='importtext'){ S.importText=e.target.value; return; } // stored; no render (keeps caret)
+  if(id==='importtext'){ S.importText=e.target.value; if(S.importPreview){ S.importPreview=null; render(); } return; } // editing invalidates a prior preview
   if(id==='__taxyear'){ }
 });
 document.addEventListener('change', (e)=>{

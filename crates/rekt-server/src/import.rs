@@ -155,7 +155,9 @@ static ROBINHOOD: BrokerPreset = BrokerPreset {
             // ONE code for both directions — route by the amount's sign
             // (deposits credit +, withdrawals debit −). Missing/zero → deposit.
             "ACH" => Some(match amount {
-                Some(a) if a.is_sign_negative() => "withdrawal",
+                // `-0.00` is sign-negative but not a debit — guard it so a
+                // zero-value transfer stays a deposit, per the rule below.
+                Some(a) if a.is_sign_negative() && !a.is_zero() => "withdrawal",
                 _ => "deposit",
             }),
             // Everything else is reported as a skip, not silently dropped:
@@ -283,10 +285,14 @@ fn parse_broker(body: &str, preset: &BrokerPreset) -> Result<PresetParse, String
             parse_money(field(idx)).map_err(|m| format!("line {line}: {what}: {m}"))
         };
 
-        // Parse the SIGNED amount first: classify sees it so a one-code-fits-
-        // both-directions broker (Robinhood ACH) can route by sign.
-        let amount_signed = money(col_amount, "amount")?;
-        let Some(kind) = (preset.classify)(action, amount_signed) else {
+        // Classify on a LENIENT amount (parse errors → None): classify sees the
+        // sign so a one-code-both-directions broker (Robinhood ACH) can route
+        // by it, but a non-transaction row whose amount cell is junk ("--",
+        // "N/A") must still be skippable, not hard-fail the whole file. Rows we
+        // keep re-parse the amount strictly below, so a real transaction with a
+        // malformed amount still fails loudly.
+        let amount_for_class = parse_money(field(col_amount)).ok().flatten();
+        let Some(kind) = (preset.classify)(action, amount_for_class) else {
             skipped.push(format!(
                 "line {line}: \"{action}\" (not a portfolio transaction)"
             ));
@@ -296,7 +302,7 @@ fn parse_broker(body: &str, preset: &BrokerPreset) -> Result<PresetParse, String
 
         let qty = money(col_qty, "quantity")?.map(|d| d.abs()); // sells export negative qty
         let price = money(col_price, "price")?;
-        let amount = amount_signed.map(|d| d.abs());
+        let amount = money(col_amount, "amount")?.map(|d| d.abs());
         let fees = Some(
             money(col_fees, "fees")?.unwrap_or_default()
                 + money(col_commission, "commission")?.unwrap_or_default(),
@@ -898,6 +904,34 @@ Run Date,Action,Symbol,Description,Type,Quantity,Price ($),Commission ($),Fees (
         assert_eq!(parse.skipped.len(), 2, "{:?}", parse.skipped);
         assert!(parse.skipped.iter().any(|s| s.contains("BTO")));
         assert!(parse.skipped.iter().any(|s| s.contains("INT")));
+    }
+
+    #[test]
+    fn skippable_row_with_junk_amount_does_not_fail_the_file() {
+        // An unmapped action whose Amount cell is unparseable ("--") must be
+        // reported as a skip, not abort the whole import (regression guard:
+        // classify runs on a lenient amount, before the strict value parse).
+        let csv = "\
+\"Activity Date\",\"Process Date\",\"Settle Date\",\"Instrument\",\"Description\",\"Trans Code\",\"Quantity\",\"Price\",\"Amount\"\n\
+\"6/06/2026\",\"6/06/2026\",\"6/06/2026\",\"\",\"Gold fee\",\"GOLD\",\"\",\"\",\"--\"\n\
+\"6/10/2026\",\"6/10/2026\",\"6/12/2026\",\"AAPL\",\"Apple\",\"Buy\",\"10\",\"$150.25\",\"($1502.50)\"\n";
+        let parse = parse_preset("robinhood", csv).unwrap();
+        assert_eq!(parse.rows.len(), 1);
+        assert_eq!(parse.rows[0].1.kind, "buy");
+        assert_eq!(parse.skipped.len(), 1);
+        assert!(parse.skipped[0].contains("GOLD"));
+    }
+
+    #[test]
+    fn zero_value_ach_is_a_deposit_not_a_withdrawal() {
+        // `($0.00)` parses to -0.00 (sign-negative) — it must NOT route to
+        // withdrawal; only a true debit does.
+        let csv = "\
+\"Activity Date\",\"Process Date\",\"Settle Date\",\"Instrument\",\"Description\",\"Trans Code\",\"Quantity\",\"Price\",\"Amount\"\n\
+\"6/08/2026\",\"6/08/2026\",\"6/08/2026\",\"\",\"Zero transfer\",\"ACH\",\"\",\"\",\"($0.00)\"\n";
+        let parse = parse_preset("robinhood", csv).unwrap();
+        assert_eq!(parse.rows.len(), 1);
+        assert_eq!(parse.rows[0].1.kind, "deposit");
     }
 
     #[test]
