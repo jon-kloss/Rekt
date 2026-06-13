@@ -157,6 +157,90 @@ async fn validate_with(
     })
 }
 
+/// Reconcile a CSV import against the existing live log: replay everything and,
+/// when a CANDIDATE sell can't be backed by held shares at its point in time,
+/// DROP that row and report it rather than aborting the whole import. Real
+/// brokerage exports routinely contain sells of positions opened before the
+/// export window, or whose share counts were changed by splits/mergers/
+/// spin-offs this tracker doesn't model — those sells are un-backable through
+/// no fault of the user. This matches the importer's standing policy: skip and
+/// report, never silently drop, and never fabricate an opening lot.
+///
+/// Genuine bad rows (missing symbol, non-positive qty) still hard-fail with
+/// their line, exactly as before. Returns the candidate indices to KEEP plus
+/// human-readable drop reasons to fold into the skip report.
+async fn reconcile_import(
+    state: &AppState,
+    candidates: &[repo::NewTx],
+    lines: &[usize],
+) -> Result<(Vec<usize>, Vec<String>), ApiError> {
+    use rekt_core::portfolio::{PortfolioError, Tx};
+    let existing = repo::fetch_mode_txs(&state.db, "live")
+        .await
+        .map_err(internal)?;
+    // If the existing log is already inconsistent, fall back to the
+    // repair-friendly rule (keep everything) — same as validate_with.
+    if compute_basis(&existing).is_err() {
+        return Ok(((0..candidates.len()).collect(), Vec::new()));
+    }
+
+    let mut kept: Vec<usize> = (0..candidates.len()).collect();
+    let mut dropped = Vec::new();
+    loop {
+        let mut txs = existing.clone();
+        for &i in &kept {
+            let c = &candidates[i];
+            txs.push(Tx {
+                id: CANDIDATE_ID_BASE + i as i64,
+                kind: c.kind,
+                symbol: c.symbol.clone(),
+                qty: c.qty,
+                price: c.price,
+                fees: c.fees,
+                taxes: c.taxes,
+                ts: c.ts,
+                note: c.note.clone(),
+            });
+        }
+        txs.sort_by(|a, b| a.ts.cmp(&b.ts).then(a.id.cmp(&b.id)));
+        let Err(e) = compute_basis(&txs) else {
+            break;
+        };
+        let id = e.tx_id();
+        // An EXISTING tx broke (not a candidate) — can't repair by dropping
+        // imports; let validate_with's repair-friendly path handle it.
+        if id < CANDIDATE_ID_BASE {
+            break;
+        }
+        let idx = (id - CANDIDATE_ID_BASE) as usize;
+        let line = lines.get(idx).copied().unwrap_or(0);
+        match &e {
+            PortfolioError::Oversell {
+                symbol, have, want, ..
+            } => {
+                dropped.push(format!(
+                    "line {line}: sell {want} {symbol} skipped — only {have} held in this import. \
+                     {symbol} may still show shares here that you actually sold, and this sale's \
+                     proceeds and realized P&L are NOT recorded. Cause: the opening lot predates \
+                     this export, or a split/merger this importer doesn't model changed the share \
+                     count. Fix by adding an opening lot (or adjusting {symbol}) manually."
+                ));
+                kept.retain(|&k| k != idx);
+            }
+            // A genuinely malformed row — surface it loudly, as before.
+            other => {
+                let msg = other.to_string();
+                let detail = msg.split_once(": ").map(|(_, m)| m).unwrap_or(&msg);
+                return Err(err(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("line {line}: {detail}"),
+                ));
+            }
+        }
+    }
+    Ok((kept, dropped))
+}
+
 pub async fn create_tx(
     State(state): State<AppState>,
     Json(input): Json<TxInput>,
@@ -235,7 +319,7 @@ pub async fn import_csv(
     // both parse and validation errors point at the same line the user
     // sees in their editor (header = line 1 for generic; presets track
     // their own offsets past preamble lines).
-    let (inputs, skipped) = if format == "generic" {
+    let (inputs, mut skipped) = if format == "generic" {
         let mut reader = csv::ReaderBuilder::new()
             .trim(csv::Trim::All)
             .from_reader(body.as_bytes());
@@ -279,9 +363,81 @@ pub async fn import_csv(
             },
         ));
     }
+    // Bound the reconcile replay (O(n²) worst case on all-oversell input).
+    const MAX_IMPORT_ROWS: usize = 10_000;
+    if new_txs.len() > MAX_IMPORT_ROWS {
+        return Err(err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "import has {} mapped rows; the limit is {MAX_IMPORT_ROWS} — split the file",
+                new_txs.len()
+            ),
+        ));
+    }
+
+    // Replay order is (ts, id) everywhere and ids are assigned at INSERT time,
+    // so insert order decides same-timestamp tie-breaks. Brokerage exports are
+    // newest-first and don't guarantee buy-before-sell within a day (Robinhood
+    // normalizes every row to 4pm NY, collapsing a same-day round-trip to one
+    // timestamp). Sort so that for any timestamp, acquisitions/credits land
+    // before disposals — otherwise a same-day sell could spuriously oversell a
+    // same-day buy and be dropped. Stable on the original file order otherwise.
+    {
+        use rekt_core::portfolio::TxKind;
+        let rank = |k: TxKind| matches!(k, TxKind::Sell | TxKind::Withdrawal) as u8;
+        let mut order: Vec<usize> = (0..new_txs.len()).collect();
+        order.sort_by(|&a, &b| {
+            new_txs[a]
+                .ts
+                .cmp(&new_txs[b].ts)
+                .then(rank(new_txs[a].kind).cmp(&rank(new_txs[b].kind)))
+                .then(a.cmp(&b))
+        });
+        new_txs = order.iter().map(|&i| new_txs[i].clone()).collect();
+        new_tx_lines = order.iter().map(|&i| new_tx_lines[i]).collect();
+    }
 
     let _guard = state.mutations.lock().await;
-    validate_with(&state, &new_txs, Some(&new_tx_lines)).await?;
+    // Replay-validate; drop (and report) candidate sells that can't be backed
+    // by held shares — pre-window or corporate-action-orphaned positions — so a
+    // real brokerage history imports instead of aborting on the first one.
+    let (keep, dropped) = reconcile_import(&state, &new_txs, &new_tx_lines).await?;
+    if keep.len() != new_txs.len() {
+        new_txs = keep.iter().map(|&i| new_txs[i].clone()).collect();
+        // NOTE: new_tx_lines is intentionally NOT re-filtered here — it has
+        // already served reconcile_import and nothing past this point reads it.
+        // If a future validation step needs line numbers, filter it in parallel.
+    }
+    skipped.extend(dropped);
+    if new_txs.is_empty() {
+        return Err(err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "no importable rows remain after reconciliation — every mapped trade was an \
+             un-backable sell (positions opened before this export's window)"
+                .to_string(),
+        ));
+    }
+
+    // Corporate actions (splits/mergers/spin-offs) are skipped, but unlike an
+    // un-backable sell they can leave a position's share count silently WRONG
+    // without ever tripping an oversell (e.g. a reverse split that isn't
+    // applied). Surface a reconcile-risk caveat so the user knows to verify.
+    const CORP_ACTION_CODES: &[&str] = &["SPR", "MRGS", "SOFF", "SDIV", "BCXL", "SPL"];
+    let corp_actions = skipped
+        .iter()
+        .filter(|s| {
+            CORP_ACTION_CODES
+                .iter()
+                .any(|c| s.contains(&format!("\"{c}\"")))
+        })
+        .count();
+    if corp_actions > 0 {
+        skipped.push(format!(
+            "NOTE: {corp_actions} corporate-action row(s) (splits / mergers / spin-offs) were \
+             skipped — affected positions' imported share counts may not match your broker. \
+             Verify those positions and adjust the quantity manually if needed."
+        ));
+    }
 
     // Preview: everything is parsed and the full ledger replay validated, but
     // nothing is written. Return a sample so the UI can show what will land.

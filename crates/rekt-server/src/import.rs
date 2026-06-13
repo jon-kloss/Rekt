@@ -152,18 +152,25 @@ static ROBINHOOD: BrokerPreset = BrokerPreset {
             "BUY" => Some("buy"),
             "SELL" => Some("sell"),
             "CDIV" => Some("dividend"), // cash dividend
-            // ONE code for both directions — route by the amount's sign
-            // (deposits credit +, withdrawals debit −). Missing/zero → deposit.
-            "ACH" => Some(match amount {
-                // `-0.00` is sign-negative but not a debit — guard it so a
-                // zero-value transfer stays a deposit, per the rule below.
+            // Capital transfers — route by the amount's sign (credit + = money
+            // in, debit − = money out). `ACH`/`RTP` are bank transfers; `ITRF`
+            // is an account-to-account transfer (e.g. Brokerage → Roth IRA),
+            // which for THIS account is a real withdrawal/deposit of capital.
+            // Missing/zero amount → deposit (a `-0.00` is sign-negative but not
+            // a debit, so it must not flip to a withdrawal).
+            "ACH" | "RTP" | "ITRF" => Some(match amount {
                 Some(a) if a.is_sign_negative() && !a.is_zero() => "withdrawal",
                 _ => "deposit",
             }),
-            // Everything else is reported as a skip, not silently dropped:
-            // options (BTO/STO/BTC/STC/OEXP), interest (INT), Gold fees
-            // (GOLD), tax withholding (DTAX), and splits (SPL) — RH reports a
-            // share delta, not a ratio, so splits are deferred like IBKR's.
+            // Everything else is reported as a skip, not silently dropped.
+            // Deliberately NOT mapped as capital: interest (INT), Gold deposit
+            // boosts (GDBP), credit-card cashback (XENT_CC), plan credits/
+            // adjustments (GMPC/IADJ), and Gold fees (GOLD) are income/expense,
+            // not contributed capital — importing them as deposits/withdrawals
+            // would distort the `deposited` basis and the TWR/IRR built on it.
+            // Also skipped: options (BTO/STO/BTC/STC/OEXP), tax withholding
+            // (DTAX), and corporate actions (SPR/MRGS/SOFF/SDIV/BCXL/SPL) — RH
+            // reports a share delta, not a ratio, so splits are deferred.
             _ => None,
         }
     },
@@ -904,6 +911,31 @@ Run Date,Action,Symbol,Description,Type,Quantity,Price ($),Commission ($),Fees (
         assert_eq!(parse.skipped.len(), 2, "{:?}", parse.skipped);
         assert!(parse.skipped.iter().any(|s| s.contains("BTO")));
         assert!(parse.skipped.iter().any(|s| s.contains("INT")));
+    }
+
+    #[test]
+    fn robinhood_routes_rtp_and_itrf_transfers_by_sign() {
+        // RTP (instant bank transfer) and ITRF (account-to-account transfer)
+        // are real capital flows, routed by sign like ACH. Income/fee codes
+        // (GDBP boost, GOLD fee) stay reported, NOT mapped as capital.
+        let csv = "\
+\"Activity Date\",\"Process Date\",\"Settle Date\",\"Instrument\",\"Description\",\"Trans Code\",\"Quantity\",\"Price\",\"Amount\"\n\
+\"11/12/2024\",\"11/12/2024\",\"11/12/2024\",\"\",\"Instant bank transfer\",\"RTP\",\"\",\"\",\"$15,000.00\"\n\
+\"7/17/2025\",\"7/17/2025\",\"7/17/2025\",\"\",\"Transfer from Brokerage to Roth IRA\",\"ITRF\",\"\",\"\",\"($1,000.00)\"\n\
+\"6/01/2025\",\"6/01/2025\",\"6/01/2025\",\"\",\"Gold Deposit Boost Payment\",\"GDBP\",\"\",\"\",\"$5.46\"\n\
+\"6/16/2025\",\"6/16/2025\",\"6/16/2025\",\"\",\"Gold Subscription Fee\",\"GOLD\",\"\",\"\",\"($5.00)\"\n";
+        let parse = parse_preset("robinhood", csv).unwrap();
+        assert_eq!(parse.rows.len(), 2, "skipped: {:?}", parse.skipped);
+
+        assert_eq!(parse.rows[0].1.kind, "deposit"); // RTP +
+        assert_eq!(parse.rows[0].1.price.unwrap().to_string(), "15000.00");
+        assert_eq!(parse.rows[1].1.kind, "withdrawal"); // ITRF −
+        assert_eq!(parse.rows[1].1.price.unwrap().to_string(), "1000.00");
+
+        // Promo credit and fee are income/expense — reported, never capital.
+        assert_eq!(parse.skipped.len(), 2, "{:?}", parse.skipped);
+        assert!(parse.skipped.iter().any(|s| s.contains("GDBP")));
+        assert!(parse.skipped.iter().any(|s| s.contains("GOLD")));
     }
 
     #[test]

@@ -189,6 +189,7 @@ pub async fn ensure_instrument(conn: &mut SqliteConnection, symbol: &str) -> Res
     Ok(row.get("id"))
 }
 
+#[derive(Clone)]
 pub struct NewTx {
     pub kind: TxKind,
     pub symbol: Option<String>,

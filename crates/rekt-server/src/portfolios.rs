@@ -13,7 +13,11 @@
 
 use std::path::{Path, PathBuf};
 
-use axum::{extract::State, http::StatusCode, response::Json};
+use axum::{
+    extract::{Path as AxumPath, State},
+    http::StatusCode,
+    response::Json,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -358,6 +362,68 @@ pub async fn switch(
     });
 
     Ok(Json(json!({ "switching": name })))
+}
+
+/// DELETE /api/portfolios/{name} — remove a portfolio and (unless another
+/// entry still points at the same file) delete its DB. Refuses the active
+/// portfolio (switch away first) and the last remaining one.
+pub async fn delete(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let name = name.trim().to_string();
+    // Serialize against create/switch/other deletes (read-modify-write).
+    let _guard = state.mutations.lock().await;
+    let mut reg = load(&state.data_dir);
+    let Some(idx) = reg.portfolios.iter().position(|p| p.name == name) else {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            format!("no portfolio named {name:?}"),
+        ));
+    };
+    if reg.active == name {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "switch to another portfolio before deleting this one",
+        ));
+    }
+    if reg.portfolios.len() <= 1 {
+        return Err(err(StatusCode::CONFLICT, "can't delete the only portfolio"));
+    }
+
+    let entry = reg.portfolios.remove(idx);
+    // Persist the registry BEFORE touching the file. A crash between the two
+    // then leaves at worst an orphaned DB file (harmless, recoverable) rather
+    // than a registry that still names a portfolio whose file is gone (which
+    // would fail to open on next boot).
+    save(&state.data_dir, &reg).map_err(internal)?;
+
+    // Only delete the file if no remaining entry references it (defends against
+    // a legacy registry where two names mapped to the same DB) — never delete a
+    // file another portfolio, or the active pool, still uses.
+    let still_referenced = reg.portfolios.iter().any(|p| p.db == entry.db);
+    if !still_referenced {
+        if let Ok(db_path) = db_path_for(&state.data_dir, &entry) {
+            // Drop the DB and its WAL/SHM sidecars so re-creating the same name
+            // yields a fresh dataset, never stale rows. Best-effort: a file that
+            // was never opened simply isn't there.
+            for suffix in ["", "-wal", "-shm"] {
+                let mut os = db_path.clone().into_os_string();
+                os.push(suffix);
+                let p = PathBuf::from(os);
+                match std::fs::remove_file(&p) {
+                    Ok(()) => tracing::info!(path = %p.display(), "deleted portfolio db file"),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        tracing::warn!(path = %p.display(), error = %e, "could not delete db file")
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::info!(name = %name, "portfolio deleted");
+    Ok(Json(json!({ "deleted": name })))
 }
 
 #[cfg(test)]
