@@ -128,6 +128,10 @@ function aiSummaryCard(){
 function analystBadge(){
   return M.analystBackend==='cli' ? 'CLAUDE CODE · CLI' : M.analystBackend==='http' ? 'CLAUDE API' : 'CLAUDE';
 }
+// Spend is a real charge on the HTTP/API backend, but only an ESTIMATE on the
+// CLI backend (it runs under your Claude subscription; we price token usage as
+// a proxy). Mark CLI figures with a ~ so they're not read as an actual bill.
+function analystCost(usd){ return (M.analystBackend==='cli'?'~':'')+money(usd); }
 // The report body with the lead TL;DR/bottom-line section removed — the card
 // above already shows it, so don't repeat it below.
 function mdStripSummary(src){
@@ -216,7 +220,7 @@ function applyAnalyst(a){
   M.track = a.track_record || {favorable:0,tested:0};
   const lat = a.latest;
   if(lat && lat.report_md){ M.briefing = lat.report_md;
-    M.briefingHead = (lat.kind||'').replace('_',' ') + ' · ' + (lat.started_ts||'').slice(0,16).replace('T',' ') + ' · ' + money(lat.cost_usd); }
+    M.briefingHead = (lat.kind||'').replace('_',' ') + ' · ' + (lat.started_ts||'').slice(0,16).replace('T',' ') + ' · ' + analystCost(lat.cost_usd); }
   else { M.briefing = a.enabled ? 'No analysis yet — trigger a briefing or weekly review.' : 'AI analyst disabled — the HTTP backend needs ANTHROPIC_API_KEY. Unset REKT_ANALYST_BACKEND to use the local Claude Code CLI (the default) instead.'; M.briefingHead = ''; }
   M.recs = (a.recommendations||[]).filter(r=>r.status==='open'||r.status==='accepted').map(r => {
     const oc = r.outcome;
@@ -680,7 +684,7 @@ function analystView(){
       '<div style="font-size:12.5px;line-height:1.6;color:'+C.body+';">'+aiSummaryCard()+mdToHtml(mdStripSummary(M.briefing))+'</div></div>'+
     '<div style="width:200px;padding:14px 16px;"><div style="font-size:9.5px;letter-spacing:1px;color:'+C.label+';">TRACK RECORD</div><div style="font-size:26px;font-weight:600;color:'+C.bright+';margin-top:6px;">'+hit+'</div>'+
       '<div style="font-size:10px;color:'+C.label+';margin-top:3px;">'+M.track.favorable+'/'+M.track.tested+' FAVORABLE</div>'+
-      '<div style="font-size:9.5px;letter-spacing:1px;color:'+C.label+';margin-top:14px;">TODAY SPEND</div><div style="font-size:15px;font-weight:600;color:'+C.text+';margin-top:5px;">'+money(M.todayCost)+' <span style="font-size:11px;color:'+C.label+';">/ '+money(M.budget)+'</span></div>'+
+      '<div style="font-size:9.5px;letter-spacing:1px;color:'+C.label+';margin-top:14px;">TODAY SPEND'+(M.analystBackend==='cli'?' <span style="color:'+C.faint+';">(est.)</span>':'')+'</div><div style="font-size:15px;font-weight:600;color:'+C.text+';margin-top:5px;">'+analystCost(M.todayCost)+' <span style="font-size:11px;color:'+C.label+';">/ '+money(M.budget)+'</span></div>'+
       '<div style="display:flex;gap:6px;margin-top:14px;"><button data-act="briefingRun" style="flex:1;font-family:inherit;font-size:9px;color:'+C.body+';background:transparent;border:1px solid '+C.border+';border-radius:3px;padding:6px;cursor:pointer;">☀ BRIEF</button><button data-act="reviewRun" style="flex:1;font-family:inherit;font-size:9px;color:'+C.body+';background:transparent;border:1px solid '+C.border+';border-radius:3px;padding:6px;cursor:pointer;">🔍 REVIEW</button></div></div></div>';
   // Only BUY/SELL/TRIM are actionable (a STAGE button means something). HOLD /
   // WATCH are situational reads — surfaced separately as FYI, no action button.
