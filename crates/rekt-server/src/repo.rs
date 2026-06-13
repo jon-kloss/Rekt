@@ -306,6 +306,22 @@ pub async fn last_candle_date(pool: &SqlitePool, symbol: &str) -> Result<Option<
     Ok(date.as_deref().and_then(|s| s.parse().ok()))
 }
 
+/// Earliest cached candle date for a symbol. Pairs with [`last_candle_date`]
+/// so backfill can tell when its cached window starts LATER than the range
+/// now needed (older transactions added after the symbol was first cached at
+/// a shorter window) and fill the earlier gap.
+pub async fn first_candle_date(pool: &SqlitePool, symbol: &str) -> Result<Option<NaiveDate>> {
+    let row = sqlx::query(
+        r#"SELECT MIN(c.date) AS d FROM candles c
+           JOIN instruments i ON i.id = c.instrument_id WHERE i.symbol = ?"#,
+    )
+    .bind(symbol)
+    .fetch_one(pool)
+    .await?;
+    let date: Option<String> = row.get("d");
+    Ok(date.as_deref().and_then(|s| s.parse().ok()))
+}
+
 /// All cached closes for the given symbols, keyed by symbol.
 pub async fn closes_map(pool: &SqlitePool, symbols: &[String]) -> Result<HashMap<String, Closes>> {
     closes_map_since(pool, symbols, None).await

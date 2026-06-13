@@ -109,6 +109,12 @@ impl Live {
         self.mark_dirty();
     }
 
+    /// Current transaction revision — gates caches keyed on the tx log
+    /// (e.g. the paper-positions cache in the trading snapshot block).
+    pub fn tx_revision(&self) -> u64 {
+        self.tx_revision.load(Ordering::Relaxed)
+    }
+
     /// Call when new candles land (daily backfill).
     pub fn bump_candles_revision(&self) {
         self.candles_revision.fetch_add(1, Ordering::Relaxed);

@@ -173,6 +173,11 @@ pub async fn create_tx(
         .map_err(internal)?;
     state.live.bump_tx_revision();
     live::refresh_symbols(&state).await.map_err(internal)?;
+    // A newly-held symbol needs candle history for its chart + the equity
+    // curve / signals; pull it now instead of waiting for the 30-min tick.
+    if new_tx.symbol.is_some() {
+        crate::history::spawn_backfill(&state);
+    }
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({ "id": ids[0] })),
@@ -307,6 +312,11 @@ pub async fn import_csv(
         .map_err(internal)?;
     state.live.bump_tx_revision();
     live::refresh_symbols(&state).await.map_err(internal)?;
+    // Pull candle history for any newly-imported symbols now (chart, equity
+    // curve, signals) rather than waiting for the next scheduler tick.
+    if new_txs.iter().any(|t| t.symbol.is_some()) {
+        crate::history::spawn_backfill(&state);
+    }
     tracing::debug!(
         format,
         imported = new_txs.len(),
@@ -337,12 +347,7 @@ pub async fn watchlist_add(
     // Pull candles for a NEW symbol soon (signals); idempotent + resumable,
     // and serialized against the scheduler by the backfill lock.
     if added {
-        let bg = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = crate::history::backfill_candles(&bg).await {
-                tracing::warn!(error = %e, "watchlist candle backfill failed");
-            }
-        });
+        crate::history::spawn_backfill(&state);
     }
     Ok((
         if added {

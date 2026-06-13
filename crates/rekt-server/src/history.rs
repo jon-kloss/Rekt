@@ -52,33 +52,83 @@ pub async fn backfill_candles(state: &AppState) -> anyhow::Result<()> {
         // concurrent run (watchlist-add spawn vs scheduler) would re-fetch
         // the same range and contend for SQLite's single writer. Per-symbol
         // scope so a waiter is blocked for one fetch, not a whole run —
-        // the loser re-reads last_candle_date and no-ops.
+        // the loser re-reads the cached bounds and no-ops.
         let _guard = state.backfill_lock.lock().await;
-        // Resume after the last cached candle; a small overlap re-fetches
-        // the most recent bar in case it was written intraday.
-        let from = match repo::last_candle_date(&state.db, &symbol).await? {
-            Some(last) => last - Duration::days(3),
-            None => default_from,
-        };
-        if from >= today {
-            continue;
-        }
-        match bars.daily_candles(&symbol, from, today).await {
-            Ok(candles) if !candles.is_empty() => {
-                let written = repo::upsert_candles(&state.db, &symbol, &candles).await?;
-                if written > 0 {
-                    fetched_any = true;
-                    tracing::info!(symbol, bars = written, "candles backfilled");
+        let last_cached = repo::last_candle_date(&state.db, &symbol).await?;
+        let first_cached = repo::first_candle_date(&state.db, &symbol).await?;
+        // Forward tail (resume after the last bar) AND, when older
+        // transactions now need earlier data than was first cached, the
+        // backward head — so the equity curve + SPY benchmark reach back to
+        // the first transaction instead of stalling at the startup window.
+        for (from, to) in backfill_ranges(default_from, last_cached, first_cached, today) {
+            match bars.daily_candles(&symbol, from, to).await {
+                Ok(candles) if !candles.is_empty() => {
+                    let written = repo::upsert_candles(&state.db, &symbol, &candles).await?;
+                    if written > 0 {
+                        fetched_any = true;
+                        tracing::info!(symbol, bars = written, from = %from, "candles backfilled");
+                    }
                 }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(symbol, error = %e, "candle backfill failed"),
             }
-            Ok(_) => {}
-            Err(e) => tracing::warn!(symbol, error = %e, "candle backfill failed"),
         }
     }
     if fetched_any {
         state.live.bump_candles_revision();
     }
     Ok(())
+}
+
+/// Background candle backfill for any newly-seen symbols. Idempotent,
+/// resumable, and serialized by the backfill lock, so any mutation that may
+/// introduce a symbol (transaction create, CSV import, watchlist add) can
+/// fire it without duplicating work or blocking the request.
+pub fn spawn_backfill(state: &AppState) {
+    let bg = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = backfill_candles(&bg).await {
+            tracing::warn!(error = %e, "background candle backfill failed");
+        }
+    });
+}
+
+/// The (from, to) ranges to fetch for one symbol given the default window,
+/// the symbol's currently-cached bounds, and today. Returns 0–2 ranges: the
+/// forward tail (newest bars) and/or the backward head (older bars a
+/// later-added transaction now needs). Pure so the gap logic is unit-tested.
+fn backfill_ranges(
+    default_from: NaiveDate,
+    last_cached: Option<NaiveDate>,
+    first_cached: Option<NaiveDate>,
+    today: NaiveDate,
+) -> Vec<(NaiveDate, NaiveDate)> {
+    let mut ranges = Vec::new();
+    match last_cached {
+        // Nothing cached yet: one fetch over the whole default window.
+        None => {
+            if default_from < today {
+                ranges.push((default_from, today));
+            }
+        }
+        Some(last) => {
+            // Forward tail: resume after the last cached bar; a 3-day overlap
+            // re-fetches the most recent bar in case it was written intraday.
+            let fwd = last - Duration::days(3);
+            if fwd < today {
+                ranges.push((fwd, today));
+            }
+            // Backward head: the cached window starts later than now needed
+            // (older tx added after the symbol was first cached) — fill the
+            // earlier gap, overlapping the existing start by a few days.
+            if let Some(first) = first_cached {
+                if default_from < first {
+                    ranges.push((default_from, first + Duration::days(3)));
+                }
+            }
+        }
+    }
+    ranges
 }
 
 /// Write today's EOD snapshots (one per mode) once the market has closed
@@ -344,4 +394,78 @@ async fn build_series(
     let points = Arc::new(points);
     *state.live.history_cache.write().await = Some((key, points.clone(), meta.clone()));
     Ok((points, meta))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::backfill_ranges;
+    use chrono::NaiveDate;
+
+    fn d(s: &str) -> NaiveDate {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn nothing_cached_fetches_whole_window() {
+        let r = backfill_ranges(d("2024-01-01"), None, None, d("2026-06-13"));
+        assert_eq!(r, vec![(d("2024-01-01"), d("2026-06-13"))]);
+    }
+
+    #[test]
+    fn up_to_date_symbol_only_refetches_forward_overlap() {
+        // last cached two days ago: just the 3-day forward overlap tail.
+        let r = backfill_ranges(
+            d("2024-01-01"),
+            Some(d("2026-06-11")),
+            Some(d("2024-01-01")),
+            d("2026-06-13"),
+        );
+        assert_eq!(r, vec![(d("2026-06-08"), d("2026-06-13"))]);
+    }
+
+    #[test]
+    fn older_tx_added_later_triggers_backward_fill() {
+        // The bug behind F2: SPY was cached only from the startup signal
+        // window (2025-05-29). A transaction back to 2024-01-01 is then
+        // added, so default_from moves earlier than first_cached and the
+        // earlier gap must be fetched, not just the forward tail.
+        let r = backfill_ranges(
+            d("2024-01-01"),
+            Some(d("2026-06-12")),
+            Some(d("2025-05-29")),
+            d("2026-06-13"),
+        );
+        assert_eq!(
+            r,
+            vec![
+                (d("2026-06-09"), d("2026-06-13")), // forward tail
+                (d("2024-01-01"), d("2025-06-01")), // backward head (+3d overlap)
+            ]
+        );
+    }
+
+    #[test]
+    fn no_backward_fill_when_cache_already_covers_window() {
+        // first_cached already at/earlier than default_from: forward only.
+        let r = backfill_ranges(
+            d("2024-01-01"),
+            Some(d("2026-06-12")),
+            Some(d("2023-12-25")),
+            d("2026-06-13"),
+        );
+        assert_eq!(r, vec![(d("2026-06-09"), d("2026-06-13"))]);
+    }
+
+    #[test]
+    fn fully_current_symbol_yields_no_ranges() {
+        // last cached today; forward tail (today-3) is still < today so a
+        // tiny overlap fetch is expected, but no backward gap.
+        let r = backfill_ranges(
+            d("2024-01-01"),
+            Some(d("2026-06-13")),
+            Some(d("2024-01-01")),
+            d("2026-06-13"),
+        );
+        assert_eq!(r, vec![(d("2026-06-10"), d("2026-06-13"))]);
+    }
 }

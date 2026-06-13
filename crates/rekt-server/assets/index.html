@@ -73,6 +73,7 @@ const S = {
 const M = {
   ready:false, cash:0, equity:0, dayPnl:0, dayPct:0, unreal:0, realized:0, dividends:0,
   market:'closed', liveFeed:false, tradingEnabled:false,
+  paperCash:null, paperEquity:null, paperBuyingPower:null, paperPositions:{},
   positions:[], watchlist:[], alerts:[], orders:[], txns:[], recs:[], track:{favorable:0,tested:0},
   briefing:'', briefingHead:'', analystEnabled:false, analystBackend:null, todayCost:0, budget:0,
   hist:[], metrics:{}, totals:{}, tax:null, taxYear:null, taxYears:[],
@@ -98,6 +99,14 @@ function applyPortfolio(p){
   M.liveFeed = !!p.live_feed;
   M.tradingEnabled = !!(p.trading && p.trading.enabled);
   S.halted = !!(p.trading && p.trading.paused);
+  // Paper account/holdings — what the order ticket can actually trade
+  // (segregated from the tracked live portfolio above).
+  const tr = p.trading || {}, acct = tr.account || null;
+  M.paperCash = acct && has(acct.cash) ? num(acct.cash) : null;
+  M.paperEquity = acct && has(acct.equity) ? num(acct.equity) : null;
+  M.paperBuyingPower = acct && has(acct.buying_power) ? num(acct.buying_power) : null;
+  M.paperPositions = {};
+  if(tr.positions && typeof tr.positions === 'object'){ for(const k in tr.positions){ M.paperPositions[k] = num(tr.positions[k]); } }
   M.positions = (pf.positions || []).map(pos => {
     const prev = M.lastPrices[pos.symbol];
     const price = has(pos.price) ? num(pos.price) : null;
@@ -271,23 +280,33 @@ function buildDonut(slices, size){
 const MAX_NOTIONAL=10000, MAX_POS_PCT=25;
 function ticket(){
   const symU=(S.tSym||'').toUpperCase();
-  const held=M.positions.find(p=>p.sym===symU);
+  const livePos=M.positions.find(p=>p.sym===symU);
   const watched=M.watchlist.find(w=>w.sym===symU);
-  const refPx = held&&held.price!=null ? held.price : (watched&&watched.price!=null ? watched.price : 0);
+  // Price is a global quote (live feed/last close); cost basis comes from
+  // whichever ledger we trade against, but the reference price is the same.
+  const refPx = livePos&&livePos.price!=null ? livePos.price : (watched&&watched.price!=null ? watched.price : 0);
   const qty=parseFloat(S.tQty)||0;
   const px = S.otype==='limit' && S.tLimit ? (parseFloat(S.tLimit)||0) : refPx;
   const estCost=qty*px;
-  const heldQty=held?held.qty:0, heldVal=held&&held.value!=null?held.value:(held?held.qty*(held.price||held.avg):0);
+  // Orders execute on the PAPER account, which is segregated from the tracked
+  // (live) portfolio — so size buying power / oversell / position cap against
+  // it. Fall back to the live portfolio only before the paper account loads.
+  const paperKnown = M.paperBuyingPower!=null || (M.paperPositions && Object.keys(M.paperPositions).length>0);
+  const cash = M.paperBuyingPower!=null ? M.paperBuyingPower : M.cash;
+  const equity = M.paperEquity!=null ? M.paperEquity : M.equity;
+  const heldQty = (M.paperPositions && has(M.paperPositions[symU])) ? num(M.paperPositions[symU]) : (paperKnown ? 0 : (livePos?livePos.qty:0));
+  const heldVal = heldQty*refPx;
+  const held = heldQty>0 ? { qty:heldQty, avg:(paperKnown?null:(livePos?livePos.avg:0)) } : null;
   const warns=[]; let canPlace=qty>0 && px>0, blockMsg='';
   if(qty<=0) canPlace=false;
   if(S.side==='sell'){
     if(qty>heldQty){ canPlace=false; blockMsg='Oversell: only '+qtyFmt(heldQty)+' held'; warns.push({text:'✕ exceeds held qty ('+qtyFmt(heldQty)+')',color:DN}); }
   } else {
-    if(estCost>M.cash){ canPlace=false; warns.push({text:'✕ over buying power by '+money(estCost-M.cash),color:DN}); }
+    if(estCost>cash){ canPlace=false; warns.push({text:'✕ over buying power by '+money(estCost-cash),color:DN}); }
     if(estCost>MAX_NOTIONAL) warns.push({text:'⚠ exceeds max notional '+money(MAX_NOTIONAL),color:AM});
-    if(M.equity>0 && (heldVal+estCost)/M.equity>MAX_POS_PCT/100) warns.push({text:'⚠ position would exceed '+MAX_POS_PCT+'% cap',color:AM});
+    if(equity>0 && (heldVal+estCost)/equity>MAX_POS_PCT/100) warns.push({text:'⚠ position would exceed '+MAX_POS_PCT+'% cap',color:AM});
   }
-  const bpAfter = S.side==='buy' ? M.cash-estCost : M.cash+estCost;
+  const bpAfter = S.side==='buy' ? cash-estCost : cash+estCost;
   return { symU, held, heldQty, qty, px, estCost, bpAfter, warns, canPlace, blockMsg };
 }
 
@@ -437,10 +456,14 @@ function candleHoverTip(arr, top){
 
 function eqHoverTip(){
   if(S.eqHoverIdx==null || !M.hist[S.eqHoverIdx]) return '';
-  const hp=M.hist[S.eqHoverIdx], left=(S.eqHoverIdx/(M.hist.length-1)*100).toFixed(1)+'%';
+  const hp=M.hist[S.eqHoverIdx];
+  // Match buildEquity's x() mapping exactly (PAD=8 inset in a 1000-wide
+  // viewBox scaled to fill width) so the tooltip lands on the in-chart
+  // crosshair + marker. The crosshair line itself is drawn ONCE, inside the
+  // SVG — no second overlay line here (that caused the split-line artifact).
+  const n=M.hist.length, fx=8+(n>1?S.eqHoverIdx/(n-1):0)*(1000-16), left=(fx/1000*100).toFixed(2)+'%';
   const row=(l,v,c1,c2)=>'<div style="display:flex;justify-content:space-between;gap:16px;font-size:10.5px;line-height:1.6;"><span style="color:'+c1+';">'+l+'</span><span style="color:'+(c2||C.text)+';">'+v+'</span></div>';
-  return '<div style="position:absolute;top:0;bottom:0;left:'+left+';width:1px;background:#9BA5B4;opacity:0.4;pointer-events:none;"></div>'+
-    '<div style="position:absolute;top:4px;left:'+left+';transform:translateX(-50%);pointer-events:none;z-index:6;background:'+C.bg+';border:1px solid #2A323E;border-radius:5px;padding:7px 10px;min-width:132px;box-shadow:0 8px 24px rgba(0,0,0,0.6);">'+
+  return '<div style="position:absolute;top:4px;left:'+left+';transform:translateX(-50%);pointer-events:none;z-index:6;background:'+C.bg+';border:1px solid #2A323E;border-radius:5px;padding:7px 10px;min-width:132px;box-shadow:0 8px 24px rgba(0,0,0,0.6);">'+
     '<div style="font-size:10px;color:'+C.body+';margin-bottom:5px;">'+esc(hp.date||'')+'</div>'+row('EQUITY',money(hp.equity),C.amber)+row('SPY',hp.benchmark!=null?money(hp.benchmark):'—','#8A93A6')+row('DEPOSITED',money(hp.net_deposited),C.gray,'#9BA5B4')+'</div>';
 }
 
@@ -608,7 +631,7 @@ function dock(){
   const input=(id,val,label,ph)=>'<div><div style="font-size:9.5px;letter-spacing:1px;color:'+C.label+';margin-bottom:5px;">'+label+'</div><input id="'+id+'" value="'+esc(val)+'"'+(ph?' placeholder="'+ph+'"':'')+' style="width:100%;background:'+C.bg+';border:1px solid '+C.border+';border-radius:4px;color:'+C.bright+';font-family:inherit;font-size:13px;padding:9px 10px;outline:none;"></div>';
 
   let ticketHtml='<div style="padding:14px 16px;border-bottom:1px solid '+C.border+';">'+
-    '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;"><span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">ORDER TICKET</span><span style="font-size:10px;color:'+C.faint+';">'+(t.held?'HOLD '+qtyFmt(t.held.qty)+' @ '+money(t.held.avg):'NO POSITION')+'</span></div>'+
+    '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;"><span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">ORDER TICKET</span><span style="font-size:10px;color:'+C.faint+';">'+(t.held?'HOLD '+qtyFmt(t.held.qty)+(t.held.avg!=null?' @ '+money(t.held.avg):''):'NO POSITION')+'</span></div>'+
     '<div style="display:grid;grid-template-columns:1fr 1fr;border:1px solid '+C.border+';border-radius:4px;overflow:hidden;margin-bottom:8px;">'+segBtn('setBuy','BUY',buyOn)+segBtn('setSell','SELL',sellOn,null,null,'border-left:1px solid '+C.border+';')+'</div>'+
     '<div style="display:grid;grid-template-columns:1fr 1fr;border:1px solid '+C.border+';border-radius:4px;overflow:hidden;margin-bottom:12px;">'+segBtn('setMkt','MARKET',mktOn,null,8)+segBtn('setLim','LIMIT',limOn,null,8,'border-left:1px solid '+C.border+';')+'</div>'+
     '<div style="display:grid;grid-template-columns:1.4fr 1fr;gap:8px;margin-bottom:8px;">'+input('tSym',S.tSym,'SYMBOL')+input('tQty',S.tQty,'QTY')+'</div>'+
@@ -750,14 +773,26 @@ function render(){
 }
 
 //================================================================ chart hover wiring (post-render)
+// Both the inline AND the expanded overlay chart share id="eqchart" /
+// "candlechart", so wire EVERY instance (getElementById would only catch the
+// first/inline one — that's why the expanded chart's crosshair didn't track
+// the mouse). Index math mirrors the SVG x() mapping (PAD=8 inset in a
+// 1000-wide viewBox) so the crosshair lands under the cursor.
+const CHART_W=1000, CHART_PAD=8, CHART_INNER=CHART_W-2*CHART_PAD;
 function wireCharts(){
-  const eq=$('eqchart');
-  if(eq){ eq.onmousemove=(e)=>{ const r=eq.getBoundingClientRect(); let i=Math.round((e.clientX-r.left)/r.width*(M.hist.length-1)); i=Math.max(0,Math.min(M.hist.length-1,i)); if(i!==S.eqHoverIdx){ S.eqHoverIdx=i; render(); } };
-    eq.onmouseleave=()=>{ if(S.eqHoverIdx!=null){ S.eqHoverIdx=null; render(); } }; }
-  const cc=$('candlechart');
-  if(cc){ const arr=selectedCandles(); const n=(Array.isArray(arr)?arr.length:0);
-    cc.onmousemove=(e)=>{ const r=cc.getBoundingClientRect(); let i=Math.floor((e.clientX-r.left)/r.width*n); i=Math.max(0,Math.min(n-1,i)); if(i!==S.hoverIdx){ S.hoverIdx=i; render(); } };
-    cc.onmouseleave=()=>{ if(S.hoverIdx!=null){ S.hoverIdx=null; render(); } }; }
+  document.querySelectorAll('[id="eqchart"]').forEach(eq=>{
+    eq.onmousemove=(e)=>{ const r=eq.getBoundingClientRect(); const f=(e.clientX-r.left)/r.width;
+      let i=Math.round((f*CHART_W-CHART_PAD)/CHART_INNER*(M.hist.length-1)); i=Math.max(0,Math.min(M.hist.length-1,i));
+      if(i!==S.eqHoverIdx){ S.eqHoverIdx=i; render(); } };
+    eq.onmouseleave=()=>{ if(S.eqHoverIdx!=null){ S.eqHoverIdx=null; render(); } };
+  });
+  const arr=selectedCandles(); const n=(Array.isArray(arr)?arr.length:0);
+  document.querySelectorAll('[id="candlechart"]').forEach(cc=>{
+    cc.onmousemove=(e)=>{ const r=cc.getBoundingClientRect(); const f=(e.clientX-r.left)/r.width;
+      let i=Math.floor((f*CHART_W-CHART_PAD)/CHART_INNER*n); i=Math.max(0,Math.min(n-1,i));
+      if(i!==S.hoverIdx){ S.hoverIdx=i; render(); } };
+    cc.onmouseleave=()=>{ if(S.hoverIdx!=null){ S.hoverIdx=null; render(); } };
+  });
 }
 
 //================================================================ actions
