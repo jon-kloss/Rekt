@@ -294,6 +294,23 @@ impl CliTransport {
     pub fn with_bin(bin: String) -> Self {
         Self { bin, ..Self::new() }
     }
+
+    /// Whether the CLI is actually runnable (`<bin> --version` exits 0). Lets
+    /// the caller disable the analyst honestly at startup instead of
+    /// advertising a backend that fails to spawn on every run.
+    pub async fn is_available(&self) -> bool {
+        use std::process::Stdio;
+        let probe = tokio::process::Command::new(&self.bin)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        matches!(
+            tokio::time::timeout(Duration::from_secs(10), probe).await,
+            Ok(Ok(status)) if status.success()
+        )
+    }
 }
 
 impl Default for CliTransport {
@@ -345,8 +362,14 @@ impl Transport for CliTransport {
         let mut child = cmd
             .spawn()
             .map_err(|e| AnalystError::Network(format!("could not launch `{}`: {e}", self.bin)))?;
+        // Feed stdin from a separate task so the parent keeps draining stdout
+        // and stderr while it writes: writing the whole prompt before reading
+        // output would deadlock if the child fills its (undrained) output pipe
+        // mid-write — a real risk for a large weekly-review prompt.
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(prompt.as_bytes()).await; // drop closes → EOF
+            tokio::spawn(async move {
+                let _ = stdin.write_all(prompt.as_bytes()).await; // drop closes → EOF
+            });
         }
         let out = tokio::time::timeout(self.timeout, child.wait_with_output())
             .await

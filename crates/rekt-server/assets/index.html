@@ -426,7 +426,7 @@ function positionsView(){
 
 function candleHoverTip(arr, top){
   if(arr==null || arr==='loading' || !arr.length || S.hoverIdx==null || !arr[S.hoverIdx]) return '';
-  const hc=arr[S.hoverIdx], prev=arr[S.hoverIdx-1], base=prev?prev.c:hc.o, chg=(hc.c/base-1)*100, n=arr.length;
+  const hc=arr[S.hoverIdx], prev=arr[S.hoverIdx-1], base=prev?prev.c:hc.o, chg=base?(hc.c/base-1)*100:0, n=arr.length;
   const left=Math.max(13,Math.min(87,(S.hoverIdx+0.5)/n*100)).toFixed(1)+'%';
   const row=(l,v,c)=>'<div style="display:flex;justify-content:space-between;gap:16px;font-size:10.5px;line-height:1.65;"><span style="color:'+C.label+';">'+l+'</span><span style="color:'+(c||C.text)+';">'+v+'</span></div>';
   return '<div style="position:absolute;top:'+top+'px;left:'+left+';transform:translateX(-50%);pointer-events:none;z-index:6;background:'+C.bg+';border:1px solid #2A323E;border-radius:5px;padding:8px 10px;min-width:124px;box-shadow:0 8px 24px rgba(0,0,0,0.6);">'+

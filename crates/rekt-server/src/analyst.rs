@@ -250,24 +250,26 @@ fn cli_review_json_instruction() -> &'static str {
 /// Extract a JSON object from model output. The HTTP backend's strict output
 /// schema returns clean JSON (the trivial case), but the CLI backend returns
 /// free text that may wrap the object in ```json fences or surround it with
-/// prose, so fall back to slicing the outermost `{…}`. Returns `None` only
-/// when no parseable object is present — an honest signal to the caller.
+/// prose. Returns `None` only when no parseable object is present — an honest
+/// signal to the caller.
 fn extract_json_object(text: &str) -> Option<Value> {
     let trimmed = text.trim();
     if let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(trimmed) {
         return Some(v);
     }
-    // Slice from the first '{' to the last '}' — covers fenced blocks and
-    // any leading/trailing prose around a single object.
-    let start = trimmed.find('{')?;
-    let end = trimmed.rfind('}')?;
-    if end <= start {
-        return None;
+    // Try to read the first complete JSON value starting at each '{'. A naive
+    // first-'{'..last-'}' slice breaks when prose contains a stray brace (e.g.
+    // "(note: {AAPL} concentration): {\"report_md\":…}") — it would splice the
+    // text between the braces and fail to parse, silently dropping the whole
+    // result. StreamDeserializer reads one value and tolerates trailing prose,
+    // so we skip non-JSON '{'s and take the first that yields an object.
+    for (start, _) in trimmed.match_indices('{') {
+        let mut stream = serde_json::Deserializer::from_str(&trimmed[start..]).into_iter::<Value>();
+        if let Some(Ok(v @ Value::Object(_))) = stream.next() {
+            return Some(v);
+        }
     }
-    match serde_json::from_str::<Value>(&trimmed[start..=end]) {
-        Ok(v @ Value::Object(_)) => Some(v),
-        _ => None,
-    }
+    None
 }
 
 /// "Today is …" line for every user turn (volatile data lives after the
@@ -878,7 +880,7 @@ pub async fn maybe_scheduled_runs(state: &AppState) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_json_object;
+    use super::{cli_review_json_instruction, extract_json_object, review_schema};
 
     #[test]
     fn extracts_clean_json_object() {
@@ -899,10 +901,41 @@ mod tests {
     }
 
     #[test]
+    fn extracts_json_past_a_stray_brace_in_the_preamble() {
+        // A stray '{' in the prose before the object must not break extraction
+        // (the old first-'{'..last-'}' slice dropped the whole result here).
+        let out = "Here's the review (note: {AAPL} concentration is high):\n\n\
+                   {\"report_md\":\"r\",\"recommendations\":[]}\nThanks!";
+        let v = extract_json_object(out).unwrap();
+        assert_eq!(v["report_md"], "r");
+    }
+
+    #[test]
     fn no_object_present_is_none() {
         assert!(extract_json_object("just prose, no json here").is_none());
         assert!(extract_json_object("").is_none());
         // A bare JSON array is not the object shape we persist.
         assert!(extract_json_object("[1, 2, 3]").is_none());
+    }
+
+    #[test]
+    fn cli_instruction_mentions_every_schema_field() {
+        // Drift guard: the CLI backend asks for the recommendation shape in
+        // prose, the HTTP backend via review_schema(). If the schema grows a
+        // field, the prose must too — or CLI reviews silently lose data.
+        let schema = review_schema();
+        let item = &schema["schema"]["properties"]["recommendations"]["items"];
+        let required = item["required"]
+            .as_array()
+            .expect("schema lists required fields");
+        let instruction = cli_review_json_instruction();
+        for field in required {
+            let name = field.as_str().unwrap();
+            assert!(
+                instruction.contains(name),
+                "cli_review_json_instruction() is missing schema field `{name}`"
+            );
+        }
+        assert!(instruction.contains("report_md"));
     }
 }

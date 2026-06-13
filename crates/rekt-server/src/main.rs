@@ -329,10 +329,22 @@ async fn main() -> anyhow::Result<()> {
         _ => true, // default: local Claude Code CLI
     };
     let analyst: Option<Arc<dyn rekt_analyst::Transport>> = if analyst_cli {
-        tracing::info!(
-            "AI analyst enabled via Claude Code CLI (claude -p; advisory only, no tools)"
-        );
-        Some(Arc::new(rekt_analyst::CliTransport::new()) as Arc<dyn rekt_analyst::Transport>)
+        // Probe the binary so a host without Claude Code degrades honestly
+        // (disabled) rather than advertising a backend that fails every run.
+        let cli = rekt_analyst::CliTransport::new();
+        if cli.is_available().await {
+            tracing::info!(
+                "AI analyst enabled via Claude Code CLI (claude -p; advisory only, no tools)"
+            );
+            Some(Arc::new(cli) as Arc<dyn rekt_analyst::Transport>)
+        } else {
+            tracing::warn!(
+                "REKT_ANALYST_BACKEND=cli (the default) but `claude` is not runnable on PATH \
+                 — AI analyst disabled. Install Claude Code, or set REKT_ANALYST_BACKEND=http \
+                 with ANTHROPIC_API_KEY."
+            );
+            None
+        }
     } else {
         let t = std::env::var("ANTHROPIC_API_KEY")
             .ok()
