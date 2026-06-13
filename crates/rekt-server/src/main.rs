@@ -1553,6 +1553,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recommendation_outcomes_surface_in_the_summary() {
+        let state = test_state().await;
+        let analysis_id = repo::insert_analysis(&state.db, "weekly_review", "m", None)
+            .await
+            .unwrap();
+        let rec_id = repo::insert_recommendation(
+            &state.db,
+            repo::NewRecommendation {
+                analysis_id,
+                symbol: "NVDA",
+                action: "buy",
+                sizing: "1 share",
+                rationale: "up and to the right",
+                confidence: "high",
+                expires_ts: chrono::Utc::now() + chrono::Duration::days(7),
+            },
+        )
+        .await
+        .unwrap();
+        // Closes: baseline on the recommendation's NY date at 100, then a
+        // later close at 110 → +10%, favorable for a buy call. The base
+        // date comes from the STORED row, not a second Utc::now() — the
+        // two could land on opposite sides of NY midnight.
+        let stored = repo::list_recommendations(&state.db, 1).await.unwrap();
+        let created = chrono::DateTime::parse_from_rfc3339(&stored[0].created_ts).unwrap();
+        let base = rekt_core::taxes::ny_date(created.to_utc());
+        let dec = |s: &str| s.parse::<rust_decimal::Decimal>().unwrap();
+        let candle = |date, close: &str| rekt_core::Candle {
+            date,
+            open: dec(close),
+            high: dec(close),
+            low: dec(close),
+            close: dec(close),
+            volume: 0,
+        };
+        repo::upsert_candles(
+            &state.db,
+            "NVDA",
+            &[
+                candle(base, "100"),
+                candle(base + chrono::Duration::days(1), "110"),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let (status, json) = request(state, "GET", "/api/analyst", None).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let rec = &json["recommendations"][0];
+        assert_eq!(rec["id"].as_i64().unwrap(), rec_id);
+        let outcome = &rec["outcome"];
+        assert_eq!(dec(outcome["return_pct"].as_str().unwrap()), dec("10"));
+        assert_eq!(outcome["favorable"], true);
+        assert_eq!(json["track_record"]["favorable"], 1);
+        assert_eq!(json["track_record"]["tested"], 1);
+    }
+
+    #[tokio::test]
     async fn tax_report_flags_wash_sales_and_exports_csv() {
         let state = test_state().await;
         for body in [

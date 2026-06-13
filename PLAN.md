@@ -431,9 +431,25 @@ watchlist     (instrument_id, added_ts)
 - Replacement capacities are split-adjusted (pre-split buys scale with
   the ratio), closing the earlier split-scale caveat.
 
+### Phase 8 — Recommendation outcome tracking
+- Outcomes are DERIVED, never stored (`rekt-core::outcomes`): baseline =
+  first daily close on/after the recommendation's NY date vs the latest
+  close, direction-adjusted per action (sell/trim calls are favorable when
+  the price falls; hold/watch have no testable direction). No close yet →
+  no outcome, honestly.
+- Recommended symbols join the candle backfill set, so history arrives
+  automatically and outcomes fill in over time.
+- The analyst sees its own track record (last 10 calls + hit rate) in
+  every run's user turn — volatile data after the cached prefix — and the
+  weekly review is told to weigh calls that aged badly.
+- UI: outcome column on the recommendations table (colored by verdict,
+  not raw direction) + hit rate in the analyst header; `/api/analyst`
+  carries per-recommendation outcomes and the aggregate.
+
 ### Backlog (post-v1, demand-validated by research)
-- Options tracking; full net-worth aggregation (other accounts, cash, real
-  estate); recommendation outcome tracking fed back into future analyses.
+- Options tracking (expands the locked stocks-&-ETFs scope — needs its own
+  planning pass: data sources, OCC symbology, exercise/assignment flows).
+- Full net-worth aggregation (other accounts, cash, real estate).
 - Additional cost-basis strategies (average, specific-lot, ACB) and broker
   CSV preset plugins.
 

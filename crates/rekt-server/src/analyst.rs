@@ -20,6 +20,7 @@ use chrono::{DateTime, Duration, Utc};
 use chrono_tz::America::New_York;
 use rekt_analyst::runner::{run, RunConfig, RunOutcome};
 use rekt_analyst::{pricing, ToolExecutor, UsageTotals, ANALYST_MODEL, BRIEFING_MODEL};
+use rust_decimal::Decimal;
 use serde_json::{json, Value};
 
 use crate::api::{err, internal, validate_symbol, ApiError};
@@ -28,6 +29,9 @@ use crate::{repo, AppState};
 
 /// Recommendations lapse after a week — stale advice must expire honestly.
 const RECOMMENDATION_TTL_DAYS: i64 = 7;
+/// One window for BOTH hit-rate computations (the model's prompt and the
+/// UI header) — the feedback loop breaks if they quietly diverge.
+const TRACK_RECORD_RECS: i64 = 20;
 /// Generous cap on loop iterations (each is one API call).
 const MAX_ITERATIONS: usize = 12;
 
@@ -228,6 +232,97 @@ fn date_line() -> String {
     )
 }
 
+/// Outcomes for a batch of recommendations, keyed by recommendation id.
+/// Derived from cached closes — a symbol with no candle on/after the
+/// recommendation date simply has no entry yet (backfill will catch up).
+async fn recommendation_outcomes(
+    state: &AppState,
+    recommendations: &[repo::RecommendationRecord],
+) -> anyhow::Result<std::collections::HashMap<i64, rekt_core::outcomes::RecOutcome>> {
+    let mut symbols: Vec<String> = recommendations.iter().map(|r| r.symbol.clone()).collect();
+    symbols.sort();
+    symbols.dedup();
+    // Bound the fetch to the oldest listed recommendation: this helper is
+    // on the UI's 3-second poll path during runs, and outcomes never look
+    // at closes before a rec date.
+    let oldest = recommendations
+        .iter()
+        .filter_map(|rec| DateTime::parse_from_rfc3339(&rec.created_ts).ok())
+        .map(|created| rekt_core::taxes::ny_date(created.to_utc()))
+        .min();
+    let closes = repo::closes_map_since(&state.db, &symbols, oldest).await?;
+    Ok(recommendations
+        .iter()
+        .filter_map(|rec| {
+            let created = DateTime::parse_from_rfc3339(&rec.created_ts).ok()?;
+            let rec_date = rekt_core::taxes::ny_date(created.to_utc());
+            let outcome = rekt_core::outcomes::recommendation_outcome(
+                &rec.action,
+                rec_date,
+                closes.get(&rec.symbol)?,
+            )?;
+            Some((rec.id, outcome))
+        })
+        .collect())
+}
+
+/// Compact track record for analyst prompts: the model sees how its
+/// previous calls aged before making new ones. Failures degrade to an
+/// honest one-liner — a broken track record must not block an analysis.
+async fn track_record(state: &AppState) -> String {
+    let recommendations = match repo::list_recommendations(&state.db, TRACK_RECORD_RECS).await {
+        Ok(recommendations) if !recommendations.is_empty() => recommendations,
+        Ok(_) => return "No prior recommendations on record.".to_string(),
+        Err(e) => return format!("Track record unavailable: {e}"),
+    };
+    let outcomes = match recommendation_outcomes(state, &recommendations).await {
+        Ok(outcomes) => outcomes,
+        Err(e) => return format!("Track record unavailable: {e}"),
+    };
+    let mut lines = vec!["Your recent recommendations and how they aged:".to_string()];
+    let (mut hits, mut tested) = (0u32, 0u32);
+    for rec in &recommendations {
+        let verdict = match outcomes.get(&rec.id) {
+            Some(o) => {
+                let direction = match o.favorable {
+                    Some(true) => {
+                        hits += 1;
+                        tested += 1;
+                        " — favorable"
+                    }
+                    Some(false) => {
+                        tested += 1;
+                        " — unfavorable"
+                    }
+                    None => " — no testable direction",
+                };
+                // Strictly positive only: "+0%" next to "unfavorable"
+                // would hand the model a contradictory signal.
+                let sign = if o.return_pct > Decimal::ZERO {
+                    "+"
+                } else {
+                    ""
+                };
+                format!("{sign}{}% since{direction}", o.return_pct)
+            }
+            None => "no price data yet".to_string(),
+        };
+        lines.push(format!(
+            "- {} {} {} ({}): {verdict}",
+            &rec.created_ts[..10.min(rec.created_ts.len())],
+            rec.action,
+            rec.symbol,
+            rec.status,
+        ));
+    }
+    if tested > 0 {
+        lines.push(format!(
+            "Hit rate: {hits} of {tested} directional calls favorable."
+        ));
+    }
+    lines.join("\n")
+}
+
 /// Full portfolio context injected into the BRIEFING user turn (the
 /// briefing is the tool-less, single-call kind — review/ask fetch fresh
 /// data through get_portfolio instead of carrying a pre-baked copy).
@@ -352,13 +447,16 @@ async fn run_analysis_inner(
         return Err(fail("no ANTHROPIC_API_KEY configured".into()));
     };
     let date = date_line();
+    // Past calls and how they aged — volatile data, so it lives in the
+    // user turn (after the cached prefix), never in the system prompt.
+    let track = track_record(state).await;
 
     let (user_content, use_tools, server_tools, output_schema) = match kind {
         "briefing" => (
             format!(
-                "{date}\n\nCurrent state:\n{}\n\nWrite this morning's briefing: 1) portfolio \
-                 state in two sentences, 2) the signals that deserve attention today, \
-                 3) anything to watch. Under 250 words.",
+                "{date}\n\nCurrent state:\n{}\n\n{track}\n\nWrite this morning's briefing: \
+                 1) portfolio state in two sentences, 2) the signals that deserve attention \
+                 today, 3) anything to watch. Under 250 words.",
                 portfolio_context(state).await
             ),
             false,
@@ -367,10 +465,12 @@ async fn run_analysis_inner(
         ),
         "weekly_review" => (
             format!(
-                "{date}\n\nDo the weekly deep review: performance vs the SPY benchmark, \
-                 position-by-position assessment using signals and recent price action, \
-                 concentration and cash posture, and what changed this week in the market that \
-                 affects these holdings (use web_search). End with concrete recommendations."
+                "{date}\n\n{track}\n\nDo the weekly deep review: performance vs the SPY \
+                 benchmark, position-by-position assessment using signals and recent price \
+                 action, concentration and cash posture, and what changed this week in the \
+                 market that affects these holdings (use web_search). Weigh your track record \
+                 above: revisit calls that aged badly before repeating them. End with concrete \
+                 recommendations."
             ),
             true,
             vec![json!({"type": "web_search_20260209", "name": "web_search", "max_uses": 6})],
@@ -378,7 +478,7 @@ async fn run_analysis_inner(
         ),
         _ => (
             format!(
-                "{date}\n\nQuestion from the user:\n{}",
+                "{date}\n\n{track}\n\nQuestion from the user:\n{}",
                 question.unwrap_or("Analyze my portfolio.")
             ),
             true,
@@ -569,9 +669,34 @@ pub async fn summary(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
             .map_err(internal)?,
         None => None,
     };
-    let recommendations = repo::list_recommendations(&state.db, 20)
+    let recommendations = repo::list_recommendations(&state.db, TRACK_RECORD_RECS)
         .await
         .map_err(internal)?;
+    let outcomes = recommendation_outcomes(&state, &recommendations)
+        .await
+        .map_err(internal)?;
+    let (mut hits, mut tested) = (0u32, 0u32);
+    for outcome in outcomes.values() {
+        match outcome.favorable {
+            Some(true) => {
+                hits += 1;
+                tested += 1;
+            }
+            Some(false) => tested += 1,
+            None => {}
+        }
+    }
+    let recommendations: Vec<Value> = recommendations
+        .iter()
+        .map(|rec| {
+            let mut value = serde_json::to_value(rec).unwrap_or_default();
+            value["outcome"] = outcomes
+                .get(&rec.id)
+                .map(|o| json!(o))
+                .unwrap_or(Value::Null);
+            value
+        })
+        .collect();
     Ok(Json(json!({
         "enabled": state.analyst.is_some(),
         "running": state.analyst_running.load(Ordering::Relaxed),
@@ -580,6 +705,7 @@ pub async fn summary(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
         "latest": latest,
         "analyses": analyses,
         "recommendations": recommendations,
+        "track_record": { "favorable": hits, "tested": tested },
     })))
 }
 

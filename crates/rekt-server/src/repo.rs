@@ -116,6 +116,23 @@ pub async fn watchlist_symbols(pool: &SqlitePool) -> Result<Vec<String>> {
     Ok(rows.into_iter().map(|r| r.get("symbol")).collect())
 }
 
+/// Symbols from RECENT recommendations — outcome tracking needs their
+/// closes, so they join the candle backfill set. Bounded to 90 days so
+/// the set can't grow forever: that covers everything the track record
+/// and UI display, and older rows keep scoring from already-cached bars.
+pub async fn recommendation_symbols(pool: &SqlitePool) -> Result<Vec<String>> {
+    let cutoff = (Utc::now() - chrono::Duration::days(90)).to_rfc3339();
+    let rows = sqlx::query(
+        r#"SELECT DISTINCT i.symbol FROM recommendations r
+           JOIN instruments i ON i.id = r.instrument_id
+           WHERE r.created_ts >= ?"#,
+    )
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.get("symbol")).collect())
+}
+
 /// Symbols with active alerts (their conditions need data to evaluate).
 pub async fn alert_symbols(pool: &SqlitePool) -> Result<Vec<String>> {
     let rows = sqlx::query(
@@ -277,14 +294,27 @@ pub async fn last_candle_date(pool: &SqlitePool, symbol: &str) -> Result<Option<
 
 /// All cached closes for the given symbols, keyed by symbol.
 pub async fn closes_map(pool: &SqlitePool, symbols: &[String]) -> Result<HashMap<String, Closes>> {
+    closes_map_since(pool, symbols, None).await
+}
+
+/// Like [`closes_map`] but bounded below — outcome scoring only needs
+/// closes from the oldest recommendation onward, and this endpoint sits
+/// on the UI's 3-second poll path during analyst runs.
+pub async fn closes_map_since(
+    pool: &SqlitePool,
+    symbols: &[String],
+    from: Option<NaiveDate>,
+) -> Result<HashMap<String, Closes>> {
+    let from = from.map(|d| d.to_string()).unwrap_or_default();
     let mut map: HashMap<String, Closes> = HashMap::new();
     for symbol in symbols {
         let rows = sqlx::query(
             r#"SELECT c.date, c.close FROM candles c
                JOIN instruments i ON i.id = c.instrument_id
-               WHERE i.symbol = ? ORDER BY c.date"#,
+               WHERE i.symbol = ? AND c.date >= ? ORDER BY c.date"#,
         )
         .bind(symbol)
+        .bind(&from)
         .fetch_all(pool)
         .await?;
         let mut closes = Closes::new();
