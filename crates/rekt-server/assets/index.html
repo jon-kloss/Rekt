@@ -944,7 +944,12 @@ function manageModal(){
     let action;
     if(isActive){ action='<span style="font-size:9px;letter-spacing:0.5px;color:'+C.amber+';border:1px solid #3A2F18;border-radius:3px;padding:2px 6px;">ACTIVE</span>'; }
     else if(only){ action='<span style="font-size:10px;color:'+C.faint+';">—</span>'; }
-    else { action='<button data-act="delPortfolio" data-arg="'+esc(p.name)+'" style="font-family:inherit;font-size:'+(armed?'9':'10')+'px;font-weight:'+(armed?'600':'400')+';letter-spacing:'+(armed?'0.5px':'0')+';color:'+DN+';background:'+(armed?'rgba(255,92,87,0.15)':'transparent')+';border:1px solid '+(armed?DN:'#1A212B')+';border-radius:3px;padding:5px 10px;cursor:pointer;white-space:nowrap;">'+(armed?'CONFIRM DELETE':'DELETE')+'</button>'; }
+    else if(armed){
+      action='<span style="display:flex;align-items:center;gap:8px;"><span style="font-size:10.5px;color:'+DN+';white-space:nowrap;">Delete &ldquo;'+esc(p.name)+'&rdquo;?</span>'+
+        '<button data-act="delPortfolio" data-arg="'+esc(p.name)+'" style="font-family:inherit;font-size:9.5px;font-weight:600;letter-spacing:0.5px;color:#fff;background:'+DN+';border:1px solid '+DN+';border-radius:3px;padding:5px 10px;cursor:pointer;white-space:nowrap;">YES, DELETE</button>'+
+        '<button data-act="cancelDelPf" style="font-family:inherit;font-size:9.5px;color:'+C.label+';background:transparent;border:1px solid #1A212B;border-radius:3px;padding:5px 10px;cursor:pointer;">cancel</button></span>';
+    }
+    else { action='<button data-act="delPortfolio" data-arg="'+esc(p.name)+'" style="font-family:inherit;font-size:10px;color:'+DN+';background:transparent;border:1px solid #1A212B;border-radius:3px;padding:5px 10px;cursor:pointer;white-space:nowrap;">DELETE</button>'; }
     return '<div style="display:flex;align-items:center;gap:10px;padding:11px 0;border-top:1px solid '+C.hairline+';"><span style="font-size:13px;color:'+C.bright+';min-width:110px;">'+esc(p.name)+'</span><span style="display:flex;align-items:center;">'+badges+'</span><span style="margin-left:auto;">'+action+'</span></div>';
   }).join('');
   const warn = '<div style="margin-top:8px;font-size:10.5px;color:'+C.faint+';line-height:1.5;">Deleting a portfolio permanently removes its dataset — holdings, transactions, orders, analyses — and erases its database file. This cannot be undone. To delete the one you\'re on, switch to another with the dropdown (top-right) first.</div>';
@@ -1169,6 +1174,7 @@ async function act(name, arg){
     case 'manageClose': S.manageOpen=false; S.confirmDelPf=null; render(); break;
     case 'newPortfolio': newPortfolio(); break;
     case 'delPortfolio': if(S.confirmDelPf===arg){ deletePortfolio(arg); } else { S.confirmDelPf=arg; render(); } break;
+    case 'cancelDelPf': S.confirmDelPf=null; render(); break;
     case 'importPreview': doImportPreview(); break;
     case 'importConfirm': doImportConfirm(); break;
     case 'briefingRun': try{ await japi('POST','/api/analyst/briefing'); toast('BRIEFING REQUESTED…'); setTimeout(reloadAnalyst,1500); }catch(e){ toast(e.message); } break;
