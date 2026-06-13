@@ -65,7 +65,7 @@ const dirColor = (n) => num(n) > 0 ? UP : num(n) < 0 ? DN : C.label;
 const VIEWS = ['overview','positions','performance','analyst','alerts','blotter','taxes'];
 const S = {
   view:'positions', selSym:null, cmd:'', showHelp:false, expanded:null, candleRange:'6m',
-  briefOpen:true, hoverIdx:null, eqHoverIdx:null, toast:'', halted:false,
+  briefOpen:true, hoverIdx:null, eqHoverIdx:null, toast:'', halted:false, dockOpen:true,
   side:'buy', otype:'market', tSym:'', tQty:'5', tLimit:'',
   importOpen:false, importFmt:'generic', importText:'', importPreview:null, importErr:'', importBusy:false,
 };
@@ -617,6 +617,19 @@ function taxesView(){
 }
 
 function dock(){
+  // Collapsed: a slim rail on the right edge with the working-order count and
+  // a one-click / hotkey (T) reopen.
+  if(!S.dockOpen){
+    const openN=M.orders.filter(o=>['accepted','partially_filled','pending_submit'].includes(o.status)).length;
+    return '<aside aria-label="Order ticket (collapsed)" style="display:flex;flex-direction:column;align-items:center;background:'+C.panel2+';border-left:1px solid '+C.border+';min-height:0;">'+
+      '<button data-act="toggleDock" title="Open order ticket (T)" aria-label="Open order ticket" aria-expanded="false" style="width:100%;padding:11px 0;background:transparent;border:none;border-bottom:1px solid '+C.border+';color:'+C.amber+';font-size:15px;cursor:pointer;">‹</button>'+
+      '<button data-act="toggleDock" title="Open order ticket (T)" style="flex:1;width:100%;display:flex;align-items:center;justify-content:center;gap:10px;background:transparent;border:none;cursor:pointer;">'+
+        '<span style="writing-mode:vertical-rl;font-size:10px;letter-spacing:2px;color:'+C.label+';white-space:nowrap;">ORDER TICKET</span>'+
+        (openN?'<span style="writing-mode:vertical-rl;font-size:10px;letter-spacing:1px;color:'+C.amber+';">'+openN+' WORKING</span>':'')+
+      '</button>'+
+      '<div style="padding:10px 0;font-size:9px;letter-spacing:1px;color:'+C.faint+';">T</div>'+
+    '</aside>';
+  }
   const t=ticket();
   const segBtn=(act,label,on,onColor,size,extra)=>'<button data-act="'+act+'" style="padding:'+(size||9)+'px;font-family:inherit;font-size:'+(size===8?10:11)+'px;font-weight:600;letter-spacing:1px;border:none;cursor:pointer;background:'+(on.bg)+';color:'+(on.color)+';'+(extra||'')+'">'+label+'</button>';
   const buyOn={ bg:S.side==='buy'?'rgba(47,191,113,0.16)':'transparent', color:S.side==='buy'?UP:C.label };
@@ -631,7 +644,7 @@ function dock(){
   const input=(id,val,label,ph)=>'<div><div style="font-size:9.5px;letter-spacing:1px;color:'+C.label+';margin-bottom:5px;">'+label+'</div><input id="'+id+'" value="'+esc(val)+'"'+(ph?' placeholder="'+ph+'"':'')+' style="width:100%;background:'+C.bg+';border:1px solid '+C.border+';border-radius:4px;color:'+C.bright+';font-family:inherit;font-size:13px;padding:9px 10px;outline:none;"></div>';
 
   let ticketHtml='<div style="padding:14px 16px;border-bottom:1px solid '+C.border+';">'+
-    '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;"><span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">ORDER TICKET</span><span style="font-size:10px;color:'+C.faint+';">'+(t.held?'HOLD '+qtyFmt(t.held.qty)+(t.held.avg!=null?' @ '+money(t.held.avg):''):'NO POSITION')+'</span></div>'+
+    '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:8px;"><span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">ORDER TICKET</span><span style="display:flex;align-items:center;gap:8px;"><span style="font-size:10px;color:'+C.faint+';">'+(t.held?'HOLD '+qtyFmt(t.held.qty)+(t.held.avg!=null?' @ '+money(t.held.avg):''):'NO POSITION')+'</span><button data-act="toggleDock" title="Collapse order ticket (T)" aria-label="Collapse order ticket" aria-expanded="true" style="background:transparent;border:1px solid #1A212B;border-radius:3px;color:'+C.label+';font-size:12px;line-height:1;padding:2px 7px;cursor:pointer;">›</button></span></div>'+
     '<div style="display:grid;grid-template-columns:1fr 1fr;border:1px solid '+C.border+';border-radius:4px;overflow:hidden;margin-bottom:8px;">'+segBtn('setBuy','BUY',buyOn)+segBtn('setSell','SELL',sellOn,null,null,'border-left:1px solid '+C.border+';')+'</div>'+
     '<div style="display:grid;grid-template-columns:1fr 1fr;border:1px solid '+C.border+';border-radius:4px;overflow:hidden;margin-bottom:12px;">'+segBtn('setMkt','MARKET',mktOn,null,8)+segBtn('setLim','LIMIT',limOn,null,8,'border-left:1px solid '+C.border+';')+'</div>'+
     '<div style="display:grid;grid-template-columns:1.4fr 1fr;gap:8px;margin-bottom:8px;">'+input('tSym',S.tSym,'SYMBOL')+input('tQty',S.tQty,'QTY')+'</div>'+
@@ -693,7 +706,7 @@ function overlays(){
   let html='';
   html += importModal();
   if(S.showHelp){
-    const rows=[['Focus command bar','/'],['Stage order from command','b 10 nvda ↵'],['Set ticket side','B / S'],['Switch view','1 – 7'],['Move position selection','↑ ↓  or  j k'],['Load selected into ticket','↵'],['Toggle this help','?'],['Clear / blur','Esc']];
+    const rows=[['Focus command bar','/'],['Stage order from command','b 10 nvda ↵'],['Set ticket side','B / S'],['Toggle order ticket','T'],['Switch view','1 – 7'],['Move position selection','↑ ↓  or  j k'],['Load selected into ticket','↵'],['Toggle this help','?'],['Clear / blur','Esc']];
     html += '<div data-act="closeHelp" style="position:fixed;inset:0;z-index:60;background:rgba(3,5,8,0.8);display:flex;align-items:center;justify-content:center;"><div style="background:'+C.panel+';border:1px solid #1A212B;border-radius:8px;padding:26px 30px;width:460px;max-width:90vw;"><div style="font-size:13px;letter-spacing:1px;color:'+C.amber+';margin-bottom:18px;">KEYBOARD SHORTCUTS</div><div style="display:flex;flex-direction:column;gap:11px;font-size:12.5px;">'+
       rows.map(r=>'<div style="display:flex;justify-content:space-between;gap:16px;"><span style="color:'+C.body+';">'+esc(r[0])+'</span><span style="color:'+C.amber+';font-weight:600;">'+esc(r[1])+'</span></div>').join('')+
       '</div><div style="margin-top:20px;font-size:11px;color:'+C.faint+';">esc or click anywhere to close</div></div></div>';
@@ -748,7 +761,7 @@ function render(){
         '<button data-act="halt" aria-pressed="'+S.halted+'" style="font-family:inherit;font-size:10px;letter-spacing:0.5px;color:'+haltColor+';background:'+haltBg+';border:1px solid '+haltColor+';padding:5px 10px;border-radius:4px;cursor:pointer;">'+haltLabel+'</button>'+
       '</div></header>'+
     // body grid
-    '<div style="flex:1;display:grid;grid-template-columns:1fr 332px;min-height:0;">'+
+    '<div style="flex:1;display:grid;grid-template-columns:1fr '+(S.dockOpen?'332px':'40px')+';min-height:0;">'+
       '<div style="display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden;border-right:1px solid '+C.border+';">'+
         '<div role="tablist" aria-label="Views" style="display:flex;gap:2px;padding:7px 14px;border-bottom:1px solid '+C.border+';background:'+C.panel2+';flex-shrink:0;">'+navTabs()+'</div>'+
         kpiStrip()+ alertBanner()+
@@ -760,7 +773,7 @@ function render(){
     '<footer style="display:flex;align-items:center;gap:16px;padding:6px 14px;border-top:1px solid '+C.border+';background:'+C.panel2+';flex-shrink:0;font-size:10.5px;color:'+C.label+';">'+
       '<span style="color:'+(M.tradingEnabled?UP:C.label)+';">● '+(M.tradingEnabled?'RECONCILED':'TRACK-ONLY')+'</span>'+
       '<span>'+(M.liveFeed?'FEED LIVE':'FEED IDLE')+'</span><span style="color:'+C.faint+';">|</span>'+
-      '<span><span style="color:'+C.body+';">/</span> command</span><span><span style="color:'+C.body+';">B/S</span> side</span><span><span style="color:'+C.body+';">1–7</span> views</span><span><span style="color:'+C.body+';">↑↓</span> select</span><span><span style="color:'+C.body+';">↵</span> load ticket</span>'+
+      '<span><span style="color:'+C.body+';">/</span> command</span><span><span style="color:'+C.body+';">B/S</span> side</span><span><span style="color:'+C.body+';">T</span> ticket</span><span><span style="color:'+C.body+';">1–7</span> views</span><span><span style="color:'+C.body+';">↑↓</span> select</span><span><span style="color:'+C.body+';">↵</span> load ticket</span>'+
       '<button data-act="help" style="margin-left:auto;font-family:inherit;font-size:10.5px;color:'+C.label+';background:transparent;border:1px solid #1A212B;border-radius:3px;padding:3px 9px;cursor:pointer;">? shortcuts</button>'+
     '</footer>'+
   '</div>'+ overlays();
@@ -798,7 +811,7 @@ function wireCharts(){
 //================================================================ actions
 function toast(msg){ S.toast=msg; S.announce=msg; render(); clearTimeout(toast._t); toast._t=setTimeout(()=>{ S.toast=''; render(); }, 3200); }
 function setView(v){ S.view=v; S.hoverIdx=null; render(); }
-function stage(side,sym,qty,otype,limit){ S.side=side; S.tSym=(sym||'').toUpperCase(); S.tQty=String(qty); S.otype=otype||'market'; S.tLimit=limit!=null?String(limit):''; }
+function stage(side,sym,qty,otype,limit){ S.side=side; S.tSym=(sym||'').toUpperCase(); S.tQty=String(qty); S.otype=otype||'market'; S.tLimit=limit!=null?String(limit):''; S.dockOpen=true; }
 function quickAdd(sym){ const p=M.positions.find(x=>x.sym===sym); stage('buy',sym, p?Math.max(1,Math.round(p.qty*0.25)):1, 'market'); toast('STAGED BUY '+sym); }
 function quickTrim(sym){ const p=M.positions.find(x=>x.sym===sym); if(!p) return; stage('sell',sym, Math.max(0.0001,Math.round(p.qty*0.25*10000)/10000), 'market'); toast('STAGED TRIM '+sym); }
 function loadSym(sym){ sym=(sym||'').toUpperCase(); S.tSym=sym; S.view='positions'; if(M.positions.find(p=>p.sym===sym)) S.selSym=sym; toast('LOADED '+sym+' INTO TICKET'); }
@@ -824,6 +837,7 @@ async function act(name, arg){
     case 'view': setView(arg); break;
     case 'help': S.showHelp=!S.showHelp; render(); break;
     case 'closeHelp': S.showHelp=false; render(); break;
+    case 'toggleDock': S.dockOpen=!S.dockOpen; render(); break;
     case 'brief': S.briefOpen=!S.briefOpen; render(); break;
     case 'expand': S.expanded=arg; render(); break;
     case 'closeExpand': S.expanded=null; render(); break;
@@ -924,6 +938,7 @@ document.addEventListener('keydown', (e)=>{
   if(e.key==='?'){ e.preventDefault(); S.showHelp=!S.showHelp; render(); return; }
   if(e.key>='1' && e.key<='7'){ setView(VIEWS[+e.key-1]); return; }
   const k=e.key.toLowerCase();
+  if(k==='t'){ S.dockOpen=!S.dockOpen; render(); return; }
   if(k==='b'){ S.side='buy'; render(); return; }
   if(k==='s'){ S.side='sell'; render(); return; }
   if(S.view==='positions' && M.positions.length){
