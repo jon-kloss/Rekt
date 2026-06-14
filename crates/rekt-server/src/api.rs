@@ -576,6 +576,9 @@ pub async fn watchlist_create(
             "name must be 1–40 characters",
         ));
     }
+    // Serialize list mutations (FK enforcement is off; the lock prevents a
+    // concurrent delete from racing a check-then-act and orphaning rows).
+    let _guard = state.mutations.lock().await;
     let lists = repo::list_watchlists(&state.db).await.map_err(internal)?;
     if lists.iter().any(|l| l.name.eq_ignore_ascii_case(&name)) {
         return Err(err(
@@ -597,6 +600,7 @@ pub async fn watchlist_delete(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
+    let _guard = state.mutations.lock().await;
     let lists = repo::list_watchlists(&state.db).await.map_err(internal)?;
     if lists.len() <= 1 {
         return Err(err(
@@ -653,6 +657,7 @@ pub async fn watchlist_add_symbols(
             "no valid symbols in the input",
         ));
     }
+    let _guard = state.mutations.lock().await;
     let lists = repo::list_watchlists(&state.db).await.map_err(internal)?;
     if !lists.iter().any(|l| l.id == id) {
         return Err(err(StatusCode::NOT_FOUND, format!("no watchlist {id}")));
@@ -676,6 +681,7 @@ pub async fn watchlist_remove_symbol(
     State(state): State<AppState>,
     Path((id, symbol)): Path<(i64, String)>,
 ) -> Result<StatusCode, ApiError> {
+    let _guard = state.mutations.lock().await;
     let removed = repo::watchlist_member_remove(&state.db, id, &symbol)
         .await
         .map_err(internal)?;
