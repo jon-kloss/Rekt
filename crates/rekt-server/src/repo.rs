@@ -106,14 +106,140 @@ pub async fn all_symbols(pool: &SqlitePool) -> Result<Vec<String>> {
     Ok(rows.into_iter().map(|r| r.get("symbol")).collect())
 }
 
-/// Symbols on the watchlist (for stream subscriptions).
+/// Every watched symbol, across ALL named lists (for stream subscriptions and
+/// signal backfill — the union preserves the old flat-watchlist behavior).
 pub async fn watchlist_symbols(pool: &SqlitePool) -> Result<Vec<String>> {
     let rows = sqlx::query(
-        r#"SELECT i.symbol FROM watchlist w JOIN instruments i ON i.id = w.instrument_id"#,
+        r#"SELECT DISTINCT i.symbol FROM watchlist_members m
+           JOIN instruments i ON i.id = m.instrument_id"#,
     )
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(|r| r.get("symbol")).collect())
+}
+
+/// One named watchlist, with its member count (for the list picker).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WatchlistRow {
+    pub id: i64,
+    pub name: String,
+    pub count: i64,
+}
+
+/// All named lists, oldest first, each with its member count.
+pub async fn list_watchlists(pool: &SqlitePool) -> Result<Vec<WatchlistRow>> {
+    let rows = sqlx::query(
+        r#"SELECT w.id, w.name, COUNT(m.instrument_id) AS count
+           FROM watchlists w
+           LEFT JOIN watchlist_members m ON m.list_id = w.id
+           GROUP BY w.id, w.name ORDER BY w.id"#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| WatchlistRow {
+            id: r.get("id"),
+            name: r.get("name"),
+            count: r.get("count"),
+        })
+        .collect())
+}
+
+/// The default list id (the oldest one) — backs the flat add/remove helpers.
+async fn default_watchlist_id(pool: &SqlitePool) -> Result<i64> {
+    let row = sqlx::query("SELECT id FROM watchlists ORDER BY id LIMIT 1")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.get("id"))
+}
+
+/// Create a named list; errors (UNIQUE) if the name already exists.
+pub async fn create_watchlist(pool: &SqlitePool, name: &str) -> Result<i64> {
+    let row = sqlx::query("INSERT INTO watchlists (name, created_ts) VALUES (?, ?) RETURNING id")
+        .bind(name)
+        .bind(Utc::now().to_rfc3339())
+        .fetch_one(pool)
+        .await?;
+    Ok(row.get("id"))
+}
+
+/// Delete a list and its memberships. Returns false if the list didn't exist.
+pub async fn delete_watchlist(pool: &SqlitePool, id: i64) -> Result<bool> {
+    let mut dbtx = pool.begin().await?;
+    sqlx::query("DELETE FROM watchlist_members WHERE list_id = ?")
+        .bind(id)
+        .execute(&mut *dbtx)
+        .await?;
+    let result = sqlx::query("DELETE FROM watchlists WHERE id = ?")
+        .bind(id)
+        .execute(&mut *dbtx)
+        .await?;
+    dbtx.commit().await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Member symbols of one list, alphabetical.
+pub async fn watchlist_members(pool: &SqlitePool, list_id: i64) -> Result<Vec<String>> {
+    let rows = sqlx::query(
+        r#"SELECT i.symbol FROM watchlist_members m
+           JOIN instruments i ON i.id = m.instrument_id
+           WHERE m.list_id = ? ORDER BY i.symbol"#,
+    )
+    .bind(list_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.get("symbol")).collect())
+}
+
+/// Bulk-add symbols to a list. Returns how many were newly added (idempotent
+/// on duplicates). Errors if the list doesn't exist.
+pub async fn watchlist_add_bulk(
+    pool: &SqlitePool,
+    list_id: i64,
+    symbols: &[String],
+) -> Result<usize> {
+    let now = Utc::now().to_rfc3339();
+    let mut added = 0usize;
+    let mut dbtx = pool.begin().await?;
+    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM watchlists WHERE id = ?")
+        .bind(list_id)
+        .fetch_optional(&mut *dbtx)
+        .await?;
+    if exists.is_none() {
+        return Err(anyhow::anyhow!("no watchlist {list_id}"));
+    }
+    for symbol in symbols {
+        let instrument_id = ensure_instrument(&mut dbtx, symbol).await?;
+        let r = sqlx::query(
+            "INSERT OR IGNORE INTO watchlist_members (list_id, instrument_id, added_ts) VALUES (?, ?, ?)",
+        )
+        .bind(list_id)
+        .bind(instrument_id)
+        .bind(&now)
+        .execute(&mut *dbtx)
+        .await?;
+        added += r.rows_affected() as usize;
+    }
+    dbtx.commit().await?;
+    Ok(added)
+}
+
+/// Remove one symbol from one list. Returns false if it wasn't a member.
+pub async fn watchlist_member_remove(
+    pool: &SqlitePool,
+    list_id: i64,
+    symbol: &str,
+) -> Result<bool> {
+    let result = sqlx::query(
+        r#"DELETE FROM watchlist_members WHERE list_id = ? AND instrument_id IN
+           (SELECT id FROM instruments WHERE symbol = ?)"#,
+    )
+    .bind(list_id)
+    .bind(symbol.to_uppercase())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Symbols from RECENT recommendations — outcome tracking needs their
@@ -145,26 +271,21 @@ pub async fn alert_symbols(pool: &SqlitePool) -> Result<Vec<String>> {
     Ok(rows.into_iter().map(|r| r.get("symbol")).collect())
 }
 
-/// Add a symbol to the watchlist. Returns false if it was already there.
+/// Add a symbol to the DEFAULT list. Returns false if it was already there.
+/// (Flat helper for the legacy single-symbol endpoint; named-list callers use
+/// `watchlist_add_bulk`.)
 pub async fn watchlist_add(pool: &SqlitePool, symbol: &str) -> Result<bool> {
-    let mut dbtx = pool.begin().await?;
-    let instrument_id = ensure_instrument(&mut dbtx, symbol).await?;
-    let result =
-        sqlx::query("INSERT OR IGNORE INTO watchlist (instrument_id, added_ts) VALUES (?, ?)")
-            .bind(instrument_id)
-            .bind(Utc::now().to_rfc3339())
-            .execute(&mut *dbtx)
-            .await?;
-    dbtx.commit().await?;
-    let added = result.rows_affected() > 0;
+    let list_id = default_watchlist_id(pool).await?;
+    let added =
+        watchlist_add_bulk(pool, list_id, std::slice::from_ref(&symbol.to_string())).await?;
     tracing::debug!(symbol, added, "watchlist_add");
-    Ok(added)
+    Ok(added > 0)
 }
 
-/// Remove a symbol from the watchlist. Returns false if it wasn't there.
+/// Remove a symbol from ALL lists. Returns false if it wasn't on any.
 pub async fn watchlist_remove(pool: &SqlitePool, symbol: &str) -> Result<bool> {
     let result = sqlx::query(
-        r#"DELETE FROM watchlist WHERE instrument_id IN
+        r#"DELETE FROM watchlist_members WHERE instrument_id IN
            (SELECT id FROM instruments WHERE symbol = ?)"#,
     )
     .bind(symbol.to_uppercase())

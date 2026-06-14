@@ -541,6 +541,161 @@ pub async fn watchlist_list(State(state): State<AppState>) -> Result<Json<Vec<St
     ))
 }
 
+// ---- named watchlists (themed universes; each screened separately) --------
+
+#[derive(Debug, Deserialize)]
+pub struct ListNameInput {
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BulkSymbolsInput {
+    /// Free-form: comma / whitespace / newline separated, so a user can paste
+    /// a big list at once.
+    pub symbols: String,
+}
+
+/// GET /api/watchlists — named lists with member counts.
+pub async fn watchlists_list(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<repo::WatchlistRow>>, ApiError> {
+    Ok(Json(
+        repo::list_watchlists(&state.db).await.map_err(internal)?,
+    ))
+}
+
+/// POST /api/watchlists {name} — create a named list (409 if the name exists).
+pub async fn watchlist_create(
+    State(state): State<AppState>,
+    Json(input): Json<ListNameInput>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let name = input.name.trim().to_string();
+    if name.is_empty() || name.chars().count() > 40 {
+        return Err(err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "name must be 1–40 characters",
+        ));
+    }
+    // Serialize list mutations (FK enforcement is off; the lock prevents a
+    // concurrent delete from racing a check-then-act and orphaning rows).
+    let _guard = state.mutations.lock().await;
+    let lists = repo::list_watchlists(&state.db).await.map_err(internal)?;
+    if lists.iter().any(|l| l.name.eq_ignore_ascii_case(&name)) {
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!("a list named {name:?} already exists"),
+        ));
+    }
+    let id = repo::create_watchlist(&state.db, &name)
+        .await
+        .map_err(internal)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "id": id, "name": name })),
+    ))
+}
+
+/// DELETE /api/watchlists/{id} — remove a list (refuses the last one).
+pub async fn watchlist_delete(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let _guard = state.mutations.lock().await;
+    let lists = repo::list_watchlists(&state.db).await.map_err(internal)?;
+    if lists.len() <= 1 {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "can't delete the only watchlist — create another first",
+        ));
+    }
+    let deleted = repo::delete_watchlist(&state.db, id)
+        .await
+        .map_err(internal)?;
+    if !deleted {
+        return Err(err(StatusCode::NOT_FOUND, format!("no watchlist {id}")));
+    }
+    state.live.bump_watchlist_revision();
+    live::refresh_symbols(&state).await.map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET /api/watchlists/{id} — the list's member symbols.
+pub async fn watchlist_member_list(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<String>>, ApiError> {
+    Ok(Json(
+        repo::watchlist_members(&state.db, id)
+            .await
+            .map_err(internal)?,
+    ))
+}
+
+/// POST /api/watchlists/{id}/symbols {symbols} — bulk-add (parses a pasted
+/// list); reports how many landed, plus any tokens that weren't valid symbols.
+pub async fn watchlist_add_symbols(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(input): Json<BulkSymbolsInput>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut syms: Vec<String> = Vec::new();
+    let mut invalid: Vec<String> = Vec::new();
+    for tok in input.symbols.split(|c: char| c == ',' || c.is_whitespace()) {
+        let t = tok.trim();
+        if t.is_empty() {
+            continue;
+        }
+        match validate_symbol(t) {
+            Ok(s) if !syms.contains(&s) => syms.push(s),
+            Ok(_) => {}
+            Err(_) => invalid.push(t.to_uppercase()),
+        }
+    }
+    if syms.is_empty() {
+        return Err(err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "no valid symbols in the input",
+        ));
+    }
+    let _guard = state.mutations.lock().await;
+    let lists = repo::list_watchlists(&state.db).await.map_err(internal)?;
+    if !lists.iter().any(|l| l.id == id) {
+        return Err(err(StatusCode::NOT_FOUND, format!("no watchlist {id}")));
+    }
+    let added = repo::watchlist_add_bulk(&state.db, id, &syms)
+        .await
+        .map_err(internal)?;
+    state.live.bump_watchlist_revision();
+    live::refresh_symbols(&state).await.map_err(internal)?;
+    // Pull candles for the newly-watched names (signals/screening need them).
+    crate::history::spawn_backfill(&state);
+    Ok(Json(serde_json::json!({
+        "added": added,
+        "submitted": syms.len(),
+        "invalid": invalid,
+    })))
+}
+
+/// DELETE /api/watchlists/{id}/symbols/{symbol} — remove one member.
+pub async fn watchlist_remove_symbol(
+    State(state): State<AppState>,
+    Path((id, symbol)): Path<(i64, String)>,
+) -> Result<StatusCode, ApiError> {
+    let _guard = state.mutations.lock().await;
+    let removed = repo::watchlist_member_remove(&state.db, id, &symbol)
+        .await
+        .map_err(internal)?;
+    if !removed {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            format!("{} is not in list {id}", symbol.to_uppercase()),
+        ));
+    }
+    state.live.bump_watchlist_revision();
+    live::refresh_symbols(&state).await.map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// One-shot portfolio snapshot (same payload as the websocket pushes).
 /// Seeds REST quotes for any unpriced held symbols so the dashboard isn't
 /// blank before (or without) the live stream.
