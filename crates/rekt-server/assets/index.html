@@ -815,7 +815,7 @@ function marketIdeasSection(){
       '<div><span style="font-size:9px;font-weight:700;letter-spacing:0.5px;color:'+(buy?UP:DN)+';border:1px solid '+(buy?UP:DN)+';border-radius:3px;padding:2px 6px;">'+(buy?'BUY':'SELL')+'</span></div>'+
       '<div style="font-weight:600;color:'+C.bright+';">'+esc(it.symbol)+' <span title="screener score" style="font-size:9px;color:'+C.faint+';">'+esc(String(it.score))+'</span></div>'+
       '<div style="color:'+C.body+';line-height:1.4;">'+reasons+'</div>'+
-      '<div style="text-align:right;"><button data-act="stageIdea" data-arg="'+esc(it.symbol)+':'+it.action+'" title="Stage a PAPER '+it.action+' of '+esc(it.symbol)+'" style="font-family:inherit;font-size:9.5px;font-weight:600;color:'+(buy?UP:DN)+';background:'+(buy?'rgba(47,191,113,0.1)':'rgba(255,92,87,0.1)')+';border:1px solid '+(buy?'rgba(47,191,113,0.35)':'rgba(255,92,87,0.35)')+';border-radius:3px;padding:4px 9px;cursor:pointer;white-space:nowrap;">STAGE '+(buy?'BUY':'SELL')+'</button></div>'+
+      '<div style="text-align:right;"><button data-act="stageIdea" data-arg="'+esc(it.symbol)+':'+esc(it.action)+'" title="Stage a PAPER '+esc(it.action)+' of '+esc(it.symbol)+'" style="font-family:inherit;font-size:9.5px;font-weight:600;color:'+(buy?UP:DN)+';background:'+(buy?'rgba(47,191,113,0.1)':'rgba(255,92,87,0.1)')+';border:1px solid '+(buy?'rgba(47,191,113,0.35)':'rgba(255,92,87,0.35)')+';border-radius:3px;padding:4px 9px;cursor:pointer;white-space:nowrap;">STAGE '+(buy?'BUY':'SELL')+'</button></div>'+
     '</div>';
   }).join('');
   return html;
@@ -824,7 +824,10 @@ async function loadWatchlists(){
   try{
     const lists = await jget('/api/watchlists'); M.watchlists = lists||[];
     if(!M.watchlists.some(l=>l.id===M.wlActive)) M.wlActive = M.watchlists[0]?M.watchlists[0].id:null;
-    await loadWlMembers(); await loadScreener();
+    await loadWlMembers();
+    // Screening (a server-side engine pass) is deferred to when WATCH is open,
+    // so it doesn't add round-trips to every boot. Refresh it if already there.
+    if(S.view==='watchlist') await loadScreener();
   }catch(e){}
 }
 async function loadWlMembers(){
@@ -844,7 +847,13 @@ async function setAggr(kind, level){
 }
 function stageIdea(sym, action){
   const side=action==='buy'?'buy':'sell';
-  if(addToBasket(side, sym, 5, 'market')) toast('STAGED '+side.toUpperCase()+' '+sym+' → ticket basket'); render();
+  if(side==='sell'){
+    // A sell idea is a technical SIGNAL on a name you likely don't hold in
+    // paper — don't stage a doomed order (same guard as quickTrim).
+    const ph=(M.paperPositions && has(M.paperPositions[sym]))?num(M.paperPositions[sym]):0;
+    if(ph<=0){ toast('SELL SIGNAL · PAPER holds 0 '+sym+' — nothing to sell (your tracked holding is untouched)'); render(); return; }
+  }
+  if(addToBasket(side, sym, 1, 'market')) toast('STAGED '+side.toUpperCase()+' '+sym+' → ticket basket (adjust qty)'); render();
 }
 async function wlAddSymbols(){
   if(M.wlActive==null){ toast('No list selected'); return; }
@@ -1222,7 +1231,7 @@ function wireCharts(){
 
 //================================================================ actions
 function toast(msg){ S.toast=msg; S.announce=msg; render(); clearTimeout(toast._t); toast._t=setTimeout(()=>{ S.toast=''; render(); }, 3200); }
-function setView(v){ S.view=v; S.hoverIdx=null; S.confirmDelTx=null; render(); if(v==='ledger') reloadTxns(); }
+function setView(v){ S.view=v; S.hoverIdx=null; S.confirmDelTx=null; render(); if(v==='ledger') reloadTxns(); if(v==='watchlist') loadScreener().then(render); }
 // The order ticket is a BASKET: stage many, then PLACE ALL. Every "stage" path
 // — position STAGE buttons, command bar, analyst, alerts, manual compose —
 // accumulates here. Same symbol+side+type+limit merges (qty summed).

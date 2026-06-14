@@ -69,6 +69,13 @@ impl Aggressiveness {
     fn momentum_ok(&self) -> bool {
         !matches!(self, Self::Conservative)
     }
+
+    /// Upper RSI for a momentum buy — FIXED, deliberately decoupled from
+    /// `sell_rsi`. If it tracked `sell_rsi`, raising aggressiveness (which
+    /// lowers `sell_rsi`) could flip a momentum buy into an overbought sell.
+    fn momentum_rsi_cap(&self) -> Decimal {
+        Decimal::from(68)
+    }
 }
 
 /// A screened idea: which side, a score for ranking, and the plain-signal
@@ -98,7 +105,9 @@ pub fn screen(s: &SignalSummary, aggr: Aggressiveness) -> Option<Candidate> {
 
     // --- BUY side ---
     if let Some(r) = rsi {
-        if r <= aggr.buy_rsi() {
+        // strict `<` so a name exactly at the threshold (zero contribution)
+        // doesn't claim a reason it didn't earn
+        if r < aggr.buy_rsi() {
             buy += aggr.buy_rsi() - r;
             buy_reasons.push(format!("RSI {} oversold", whole(r)));
         }
@@ -116,22 +125,22 @@ pub fn screen(s: &SignalSummary, aggr: Aggressiveness) -> Option<Candidate> {
     }
     if aggr.momentum_ok() {
         if let (Some(a), Some(b), Some(r)) = (v50, v200, rsi) {
-            if a > zero && b > zero && r >= Decimal::from(50) && r < aggr.sell_rsi() {
+            if a > zero && b > zero && r >= Decimal::from(50) && r < aggr.momentum_rsi_cap() {
                 buy += Decimal::from(6);
                 buy_reasons.push(format!("uptrend (above 50d & 200d), RSI {}", whole(r)));
             }
         }
     }
 
-    // --- SELL side ---
+    // --- SELL side --- (strict `>` for the same zero-contribution reason)
     if let Some(r) = rsi {
-        if r >= aggr.sell_rsi() {
+        if r > aggr.sell_rsi() {
             sell += r - aggr.sell_rsi();
             sell_reasons.push(format!("RSI {} overbought", whole(r)));
         }
     }
     if let Some(a) = v50 {
-        if a >= aggr.extended_pct() {
+        if a > aggr.extended_pct() {
             sell += a - aggr.extended_pct();
             sell_reasons.push(format!("{}% above 50d (extended)", whole(a)));
         }
@@ -227,6 +236,26 @@ mod tests {
         // RSI 45 (not oversold, below the 50 momentum line), barely above the
         // MAs (no dip), shallow drawdown — nothing to say.
         assert!(screen(&sig(45, 1, 2, 8), Aggressiveness::Balanced).is_none());
+    }
+
+    #[test]
+    fn aggressiveness_never_flips_direction() {
+        // RSI 63 in a clean uptrend was a momentum BUY at Balanced but flipped
+        // to SELL at Aggressive when the momentum cap tracked sell_rsi.
+        let s = sig(63, 8, 15, 3);
+        let dirs: Vec<&str> = [
+            Aggressiveness::Conservative,
+            Aggressiveness::Balanced,
+            Aggressiveness::Aggressive,
+        ]
+        .iter()
+        .filter_map(|a| screen(&s, *a).map(|c| c.action))
+        .collect();
+        // Whatever surfaces, it must never disagree on direction.
+        assert!(
+            dirs.windows(2).all(|w| w[0] == w[1]),
+            "direction flipped across aggressiveness: {dirs:?}"
+        );
     }
 
     #[test]
