@@ -954,6 +954,9 @@ pub struct RecommendationRecord {
     pub status: String,
     pub created_ts: String,
     pub expires_ts: Option<String>,
+    /// The analysis kind that produced it (e.g. 'weekly_review', 'market_ideas')
+    /// — lets the UI attach a market-ideas thesis only to market-ideas recs.
+    pub analysis_kind: String,
 }
 
 pub struct NewRecommendation<'a> {
@@ -1006,11 +1009,14 @@ pub async fn list_recommendations(
 ) -> Result<Vec<RecommendationRecord>> {
     let rows = sqlx::query(
         r#"SELECT r.id, r.analysis_id, i.symbol, r.action, r.sizing, r.rationale,
-                  r.confidence, r.created_ts, r.expires_ts,
+                  r.confidence, r.created_ts, r.expires_ts, a.kind AS analysis_kind,
                   CASE WHEN r.status = 'open' AND r.expires_ts IS NOT NULL AND r.expires_ts < ?1
                        THEN 'expired' ELSE r.status END AS status
-           FROM recommendations r JOIN instruments i ON i.id = r.instrument_id
-           ORDER BY (status = 'open') DESC, r.id DESC LIMIT ?2"#,
+           FROM recommendations r
+           JOIN instruments i ON i.id = r.instrument_id
+           JOIN analyses a ON a.id = r.analysis_id
+           ORDER BY (CASE WHEN r.status = 'open' AND r.expires_ts IS NOT NULL AND r.expires_ts < ?1
+                          THEN 'expired' ELSE r.status END = 'open') DESC, r.id DESC LIMIT ?2"#,
     )
     .bind(Utc::now().to_rfc3339())
     .bind(limit)
@@ -1029,6 +1035,7 @@ pub async fn list_recommendations(
             status: row.get("status"),
             created_ts: row.get("created_ts"),
             expires_ts: row.get("expires_ts"),
+            analysis_kind: row.get("analysis_kind"),
         })
         .collect())
 }

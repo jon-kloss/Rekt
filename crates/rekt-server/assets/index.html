@@ -228,7 +228,7 @@ function applyAnalyst(a){
   else { M.briefing = a.enabled ? 'No analysis yet — trigger a briefing or weekly review.' : 'AI analyst disabled — the HTTP backend needs ANTHROPIC_API_KEY. Unset REKT_ANALYST_BACKEND to use the local Claude Code CLI (the default) instead.'; M.briefingHead = ''; }
   M.recs = (a.recommendations||[]).filter(r=>r.status==='open'||r.status==='accepted').map(r => {
     const oc = r.outcome;
-    return { id:r.id, action:(r.action||'').toUpperCase(), sym:r.symbol, conf:r.confidence, sizing:r.sizing,
+    return { id:r.id, action:(r.action||'').toUpperCase(), sym:r.symbol, conf:r.confidence, sizing:r.sizing, kind:r.analysis_kind||'',
       headline:r.rationale ? r.rationale.split('. ')[0] : '', reason:r.rationale||'', citations:[],
       verdict: oc ? (oc.favorable===true?'favorable':oc.favorable===false?'unfavorable':'pending') : 'pending',
       move: oc && has(oc.return_pct) ? signedPct(oc.return_pct) : '—' };
@@ -813,7 +813,7 @@ function marketIdeasSection(){
   }
   const cols='0.5fr 0.95fr 2.4fr 0.7fr';
   html+=ideas.map(it=>{ const buy=it.action==='buy'; const reasons=(it.reasons||[]).map(r=>esc(r)).join(' · ');
-    const rec=(M.recs||[]).find(r=>r.sym===it.symbol);
+    const rec=(M.recs||[]).find(r=>r.sym===it.symbol && r.kind==='market_ideas');
     const thesis=(rec&&rec.reason)?'<div style="margin-top:5px;font-size:11px;color:'+C.body+';line-height:1.45;"><span style="color:'+C.blue+';font-size:8.5px;font-weight:700;letter-spacing:0.5px;">AI</span> '+esc(rec.reason)+'</div>':'';
     return '<div style="display:grid;grid-template-columns:'+cols+';gap:10px;align-items:start;padding:9px 16px;border-bottom:1px solid '+C.hairline+';font-size:12px;">'+
       '<div style="padding-top:1px;"><span style="font-size:9px;font-weight:700;letter-spacing:0.5px;color:'+(buy?UP:DN)+';border:1px solid '+(buy?UP:DN)+';border-radius:3px;padding:2px 6px;">'+(buy?'BUY':'SELL')+'</span></div>'+

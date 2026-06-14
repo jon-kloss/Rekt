@@ -434,7 +434,7 @@ pub async fn run_analysis(state: AppState, id: i64, kind: String, question: Opti
     let _running = RunningGuard(state.analyst_running.clone());
 
     match run_analysis_inner(&state, &kind, question.as_deref()).await {
-        Ok((outcome, model)) => {
+        Ok((outcome, model, allowlist)) => {
             let tool_log = serde_json::to_string(&outcome.tool_log).ok();
             let cost = pricing::cost_usd(model, &outcome.usage);
             // The weekly review answers in structured JSON; split it into
@@ -444,27 +444,35 @@ pub async fn run_analysis(state: AppState, id: i64, kind: String, question: Opti
             // tolerates fences/prose the CLI may add). A parse failure is an
             // honest error (with the tokens we PAID for still accounted),
             // never a silently-mangled report.
-            let (report, error): (String, Option<String>) =
-                if kind == "weekly_review" || kind == "market_ideas" {
-                    match extract_json_object(&outcome.text) {
-                        Some(parsed) => {
+            let (report, error): (String, Option<String>) = if kind == "weekly_review"
+                || kind == "market_ideas"
+            {
+                match extract_json_object(&outcome.text) {
+                    Some(parsed) => {
+                        // market_ideas is GROUNDED: persist only recs the
+                        // screener actually surfaced, with the screen's
+                        // action — the AI can't add or flip names.
+                        if kind == "market_ideas" {
+                            store_grounded_recommendations(&state, id, &parsed, &allowlist).await;
+                        } else {
                             store_recommendations(&state, id, &parsed).await;
-                            (
-                                parsed["report_md"]
-                                    .as_str()
-                                    .unwrap_or(&outcome.text)
-                                    .to_string(),
-                                None,
-                            )
                         }
-                        None => (
-                            outcome.text.clone(), // keep the raw output for debugging
-                            Some("structured output did not contain a JSON object".to_string()),
-                        ),
+                        (
+                            parsed["report_md"]
+                                .as_str()
+                                .unwrap_or(&outcome.text)
+                                .to_string(),
+                            None,
+                        )
                     }
-                } else {
-                    (outcome.text.clone(), None)
-                };
+                    None => (
+                        outcome.text.clone(), // keep the raw output for debugging
+                        Some("structured output did not contain a JSON object".to_string()),
+                    ),
+                }
+            } else {
+                (outcome.text.clone(), None)
+            };
             let row = repo::AnalysisOutcome {
                 input_tokens: outcome.usage.input_tokens as i64,
                 output_tokens: outcome.usage.output_tokens as i64,
@@ -517,7 +525,7 @@ async fn run_analysis_inner(
     state: &AppState,
     kind: &str,
     question: Option<&str>,
-) -> Result<(RunOutcome, &'static str), RunFailureDetails> {
+) -> Result<(RunOutcome, &'static str, Vec<(String, &'static str)>), RunFailureDetails> {
     // Kind split: the BRIEFING is the inject-and-answer kind — portfolio
     // context in the user turn, NO tools, one cheap Haiku call. Review/ask
     // get the tool surface instead and fetch fresh data exactly once.
@@ -535,6 +543,35 @@ async fn run_analysis_inner(
     // Past calls and how they aged — volatile data, so it lives in the
     // user turn (after the cached prefix), never in the system prompt.
     let track = track_record(state).await;
+
+    // market_ideas screens deterministically UP FRONT: screen errors stay
+    // honest (not swallowed into an empty prompt that still bills), and the
+    // SAME candidate set drives both the prompt and the post-hoc grounding
+    // filter (so the AI can't add or flip names — the screen is authoritative).
+    let market_screen = if kind == "market_ideas" {
+        let list_id: i64 = question
+            .and_then(|q| q.parse().ok())
+            .ok_or_else(|| fail("market_ideas run missing a valid list id".into()))?;
+        let lists = repo::list_watchlists(&state.db)
+            .await
+            .map_err(|e| fail(format!("watchlist lookup failed: {e}")))?;
+        let list_name = lists
+            .iter()
+            .find(|l| l.id == list_id)
+            .map(|l| l.name.clone())
+            .ok_or_else(|| fail(format!("no watchlist {list_id}")))?;
+        let (scored, _, _) = crate::screener::scored_candidates(state, list_id)
+            .await
+            .map_err(|e| fail(format!("screen failed: {e}")))?;
+        if scored.is_empty() {
+            return Err(fail(
+                "no screened candidates at run time (the screen may have changed)".into(),
+            ));
+        }
+        Some((list_name, scored))
+    } else {
+        None
+    };
 
     let (mut user_content, mut use_tools, mut server_tools, mut output_schema) = match kind {
         "briefing" => (
@@ -580,19 +617,12 @@ async fn run_analysis_inner(
             Some(review_schema()),
         ),
         "market_ideas" => {
-            // The screener already found + ranked the candidates; the AI only
-            // narrates them. question carries the list id.
-            let list_id: i64 = question.and_then(|q| q.parse().ok()).unwrap_or(0);
-            let lists = repo::list_watchlists(&state.db).await.unwrap_or_default();
-            let list_name = lists
-                .iter()
-                .find(|l| l.id == list_id)
-                .map(|l| l.name.clone())
-                .unwrap_or_else(|| "watchlist".into());
-            let (scored, _, _) = crate::screener::scored_candidates(state, list_id)
-                .await
-                .unwrap_or_default();
-            let block = crate::screener::candidates_prompt_block(&list_name, &scored);
+            // Candidates were screened up front (see market_screen); the AI
+            // only narrates them.
+            let (list_name, scored) = market_screen
+                .as_ref()
+                .expect("market_screen is Some for market_ideas");
+            let block = crate::screener::candidates_prompt_block(list_name, scored);
             (
                 format!(
                     "{date}\n\n{track}\n\n{block}\n\nFor EACH candidate above, return a \
@@ -665,7 +695,17 @@ async fn run_analysis_inner(
         tool_log: failure.tool_log,
         model,
     })?;
-    Ok((outcome, model))
+    // The screened (symbol, action) set — the ground truth the persisted
+    // market_ideas recs are filtered against (empty for other kinds).
+    let allowlist: Vec<(String, &'static str)> = market_screen
+        .map(|(_, scored)| {
+            scored
+                .into_iter()
+                .map(|s| (s.symbol, s.candidate.action))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((outcome, model, allowlist))
 }
 
 /// Model + max_tokens per kind — shared by the run path and the budget
@@ -712,6 +752,50 @@ async fn store_recommendations(state: &AppState, analysis_id: i64, parsed: &Valu
         .await;
         if let Err(e) = result {
             tracing::error!(error = %e, symbol, "failed to store recommendation");
+        }
+    }
+}
+
+/// Persist market-ideas recommendations GROUNDED against the screen: a rec for
+/// a symbol the screener didn't surface is dropped, and the action is forced to
+/// the screen's (not the AI's) — so a hallucinated ticker or a flipped
+/// buy/sell can never become a tracked, stage-able recommendation.
+async fn store_grounded_recommendations(
+    state: &AppState,
+    analysis_id: i64,
+    parsed: &Value,
+    allowlist: &[(String, &'static str)],
+) {
+    let Some(recommendations) = parsed["recommendations"].as_array() else {
+        return;
+    };
+    let expires = Utc::now() + Duration::days(RECOMMENDATION_TTL_DAYS);
+    for recommendation in recommendations {
+        let raw_symbol = recommendation["symbol"].as_str().unwrap_or("");
+        let Ok(symbol) = validate_symbol(raw_symbol) else {
+            continue;
+        };
+        // The screen is authoritative: skip anything it didn't surface, and use
+        // ITS action regardless of what the model returned.
+        let Some((_, screen_action)) = allowlist.iter().find(|(s, _)| *s == symbol) else {
+            tracing::warn!(symbol, "dropping market-idea rec not in the screen");
+            continue;
+        };
+        let result = repo::insert_recommendation(
+            &state.db,
+            repo::NewRecommendation {
+                analysis_id,
+                symbol: &symbol,
+                action: screen_action,
+                sizing: recommendation["sizing"].as_str().unwrap_or(""),
+                rationale: recommendation["rationale"].as_str().unwrap_or(""),
+                confidence: recommendation["confidence"].as_str().unwrap_or(""),
+                expires_ts: expires,
+            },
+        )
+        .await;
+        if let Err(e) = result {
+            tracing::error!(error = %e, symbol, "failed to store grounded recommendation");
         }
     }
 }

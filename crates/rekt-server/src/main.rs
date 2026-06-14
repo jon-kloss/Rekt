@@ -1712,6 +1712,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn market_ideas_kind_accepted_and_carries_through() {
+        // Migration 0007 widened the analyses.kind CHECK (would fail pre-0007),
+        // and recommendations carry their analysis kind for the UI thesis filter.
+        let state = test_state().await;
+        use sqlx::Row;
+        let analysis_id: i64 = sqlx::query(
+            "INSERT INTO analyses (kind, model, started_ts) VALUES ('market_ideas', 'test', ?) RETURNING id",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&state.db)
+        .await
+        .expect("widened CHECK accepts market_ideas")
+        .get("id");
+        repo::insert_recommendation(
+            &state.db,
+            repo::NewRecommendation {
+                analysis_id, // FK-linked — proves the rebuilt table resolves
+                symbol: "NVDA",
+                action: "buy",
+                sizing: "",
+                rationale: "oversold dip",
+                confidence: "medium",
+                expires_ts: chrono::Utc::now() + chrono::Duration::days(7),
+            },
+        )
+        .await
+        .unwrap();
+        let recs = repo::list_recommendations(&state.db, 10).await.unwrap();
+        let r = recs.iter().find(|r| r.symbol == "NVDA").unwrap();
+        assert_eq!(r.analysis_kind, "market_ideas");
+    }
+
+    #[tokio::test]
     async fn broker_preset_csv_imports_and_reports_skips() {
         let state = test_state().await;
         let schwab = "\
