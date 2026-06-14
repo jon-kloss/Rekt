@@ -427,16 +427,21 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "http://localhost:11434".into());
             let model = std::env::var("REKT_OLLAMA_MODEL").unwrap_or_else(|_| "llama3.1".into());
             let ollama = rekt_analyst::OllamaTransport::new(url.clone(), model.clone());
-            if ollama.is_available().await {
-                tracing::info!(model = %model, url = %url, "AI analyst enabled via local Ollama (free, advisory only, no tools)");
-                Some(Arc::new(ollama) as Arc<dyn rekt_analyst::Transport>)
-            } else {
-                tracing::warn!(
-                    model = %model, url = %url,
-                    "REKT_ANALYST_BACKEND=ollama but Ollama isn't reachable or the model isn't \
-                     pulled — AI analyst disabled. Start Ollama and run `ollama pull {model}`."
-                );
-                None
+            // resolve() probes AND pins the exact pulled tag (so a bare
+            // `llama3.1` can't 404 at run time when only `llama3.1:8b` exists).
+            match ollama.resolve().await {
+                Some(t) => {
+                    tracing::info!(model = %t.model(), url = %url, "AI analyst enabled via local Ollama (free, advisory only, no tools)");
+                    Some(Arc::new(t) as Arc<dyn rekt_analyst::Transport>)
+                }
+                None => {
+                    tracing::warn!(
+                        model = %model, url = %url,
+                        "REKT_ANALYST_BACKEND=ollama but Ollama isn't reachable or the model isn't \
+                         pulled — AI analyst disabled. Start Ollama and run `ollama pull {model}`."
+                    );
+                    None
+                }
             }
         }
         _ => {

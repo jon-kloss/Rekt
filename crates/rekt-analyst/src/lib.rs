@@ -412,37 +412,42 @@ impl OllamaTransport {
         }
     }
 
-    /// Whether Ollama is reachable AND has the model pulled — so the analyst
-    /// degrades honestly (disabled) instead of failing every run.
-    pub async fn is_available(&self) -> bool {
-        let Ok(resp) = self
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Probe Ollama and resolve the configured model to an EXACT pulled tag,
+    /// returning the transport ready to use — or `None` if Ollama is
+    /// unreachable or the model isn't pulled (so the analyst degrades honestly
+    /// instead of failing every run). Resolving the exact tag matters: a bare
+    /// `llama3.1` passed to `/api/chat` can 404 when only `llama3.1:8b` is
+    /// pulled, even though `/api/tags` lists it.
+    pub async fn resolve(mut self) -> Option<Self> {
+        let resp = self
             .client
             .get(format!("{}/api/tags", self.base_url))
             .timeout(Duration::from_secs(5))
             .send()
             .await
-        else {
-            return false;
-        };
+            .ok()?;
         if !resp.status().is_success() {
-            return false;
+            return None;
         }
-        // Match the model name with or without an explicit ":latest" tag.
-        let want = self.model.split(':').next().unwrap_or(&self.model);
-        match resp.json::<serde_json::Value>().await {
-            Ok(v) => v["models"]
-                .as_array()
-                .map(|ms| {
-                    ms.iter().any(|m| {
-                        m["name"]
-                            .as_str()
-                            .map(|n| n.split(':').next() == Some(want))
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false),
-            Err(_) => false,
-        }
+        let v = resp.json::<serde_json::Value>().await.ok()?;
+        // Prefer an exact name match; else the first variant of the family
+        // (so a configured `llama3.1` resolves to the pulled `llama3.1:8b`).
+        let want = self
+            .model
+            .split(':')
+            .next()
+            .unwrap_or(&self.model)
+            .to_string();
+        let exact = v["models"].as_array()?.iter().find_map(|m| {
+            let n = m["name"].as_str()?;
+            (n == self.model || n.split(':').next() == Some(want.as_str())).then(|| n.to_string())
+        })?;
+        self.model = exact;
+        Some(self)
     }
 }
 

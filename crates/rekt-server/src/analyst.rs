@@ -823,31 +823,30 @@ pub(crate) async fn start_run(
             "AI analyst disabled — set ANTHROPIC_API_KEY",
         ));
     }
-    // Budget gate (NY day, like the scheduler): the gate requires headroom
-    // for this run's WORST-CASE output cost, so a run can't sail
-    // arbitrarily far past the ceiling. Input cost (web search results) is
-    // unbounded by nature and stays post-hoc — a run in flight may finish
-    // somewhat past the budget; the next run is then blocked.
-    let spent = repo::analyses_cost_since(&state.db, ny_day_start())
-        .await
-        .map_err(internal)?;
     let (model, max_tokens) = kind_params(kind);
-    // Ollama is free — no budget reservation; the daily ceiling is for $ backends.
-    let headroom = if state.analyst_backend == "ollama" {
+    // Budget gate (NY day, like the scheduler): requires headroom for this
+    // run's WORST-CASE output cost, so a run can't sail arbitrarily far past the
+    // ceiling. SKIPPED for Ollama — it bills $0, and a $0-headroom gate would
+    // still wrongly block on prior paid-backend spend.
+    let spent = if state.analyst_backend == "ollama" {
         Decimal::ZERO
     } else {
-        pricing::max_output_cost(model, max_tokens)
+        let spent = repo::analyses_cost_since(&state.db, ny_day_start())
+            .await
+            .map_err(internal)?;
+        let headroom = pricing::max_output_cost(model, max_tokens);
+        if spent + headroom > state.ai_budget {
+            return Err(err(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "daily AI budget would be exceeded (${spent} spent of ${}, this run reserves \
+                     ${headroom} — raise REKT_AI_DAILY_BUDGET)",
+                    state.ai_budget
+                ),
+            ));
+        }
+        spent
     };
-    if spent + headroom > state.ai_budget {
-        return Err(err(
-            StatusCode::TOO_MANY_REQUESTS,
-            format!(
-                "daily AI budget would be exceeded (${spent} spent of ${}, this run reserves \
-                 ${headroom} — raise REKT_AI_DAILY_BUDGET)",
-                state.ai_budget
-            ),
-        ));
-    }
     // One analysis at a time: they share the price cache and the budget.
     if state
         .analyst_running
