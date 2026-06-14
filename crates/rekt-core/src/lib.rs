@@ -10,6 +10,7 @@ pub mod market;
 pub mod orders;
 pub mod outcomes;
 pub mod portfolio;
+pub mod screener;
 pub mod signals;
 pub mod taxes;
 

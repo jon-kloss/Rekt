@@ -192,6 +192,26 @@ pub async fn watchlist_members(pool: &SqlitePool, list_id: i64) -> Result<Vec<St
     Ok(rows.into_iter().map(|r| r.get("symbol")).collect())
 }
 
+/// Members of one list as (symbol, kind) — kind is 'stock' or 'etf', used to
+/// pick the per-equity-type aggressiveness when screening.
+pub async fn watchlist_members_detail(
+    pool: &SqlitePool,
+    list_id: i64,
+) -> Result<Vec<(String, String)>> {
+    let rows = sqlx::query(
+        r#"SELECT i.symbol, i.kind FROM watchlist_members m
+           JOIN instruments i ON i.id = m.instrument_id
+           WHERE m.list_id = ? ORDER BY i.symbol"#,
+    )
+    .bind(list_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get("symbol"), r.get("kind")))
+        .collect())
+}
+
 /// Bulk-add symbols to a list. Returns how many were newly added (idempotent
 /// on duplicates). Errors if the list doesn't exist.
 pub async fn watchlist_add_bulk(

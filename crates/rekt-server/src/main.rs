@@ -14,6 +14,7 @@ mod import;
 mod live;
 mod portfolios;
 mod repo;
+mod screener;
 mod taxes;
 mod trading;
 
@@ -104,6 +105,11 @@ fn app(state: AppState) -> Router {
             "/api/watchlists/{id}/symbols/{symbol}",
             delete(api::watchlist_remove_symbol),
         )
+        .route(
+            "/api/screener/settings",
+            get(screener::get_settings).put(screener::put_settings),
+        )
+        .route("/api/screener/{list_id}", get(screener::screen_list))
         .route(
             "/api/alerts",
             get(alerts::list_alerts).post(alerts::create_alert),
@@ -1643,6 +1649,51 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn screener_settings_and_screen_endpoint() {
+        let state = test_state().await;
+
+        // Defaults are Balanced for both equity types.
+        let (_, s) = request(state.clone(), "GET", "/api/screener/settings", None).await;
+        assert_eq!(s["stock"], "balanced");
+        assert_eq!(s["etf"], "balanced");
+
+        // Set + normalize: a bogus level falls back to balanced, valid sticks.
+        let (status, s) = request(
+            state.clone(),
+            "PUT",
+            "/api/screener/settings",
+            Some(serde_json::json!({ "stock": "AGGRESSIVE", "etf": "bogus" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(s["stock"], "aggressive");
+        assert_eq!(s["etf"], "balanced");
+        let (_, s) = request(state.clone(), "GET", "/api/screener/settings", None).await;
+        assert_eq!(s["stock"], "aggressive"); // persisted
+
+        // Screening an unknown list 404s.
+        let (status, _) = request(state.clone(), "GET", "/api/screener/9999", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Screening a list whose member has no candle history yet returns no
+        // ideas (honest) and reports it as awaiting_data.
+        let (_, lists) = request(state.clone(), "GET", "/api/watchlists", None).await;
+        let id = lists[0]["id"].as_i64().unwrap();
+        request(
+            state.clone(),
+            "POST",
+            &format!("/api/watchlists/{id}/symbols"),
+            Some(serde_json::json!({ "symbols": "AAPL" })),
+        )
+        .await;
+        let (status, res) =
+            request(state.clone(), "GET", &format!("/api/screener/{id}"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(res["ideas"].as_array().unwrap().len(), 0);
+        assert_eq!(res["awaiting_data"], 1); // AAPL has no backfilled candles in-test
     }
 
     #[tokio::test]
