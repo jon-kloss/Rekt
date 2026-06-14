@@ -32,8 +32,10 @@ errors or `None`, never fabricated data.
 | `REKT_LISTEN` | `127.0.0.1:7777` | bind address (loopback by default — see Security) |
 | `FINNHUB_API_KEY` | — | live quotes + trade stream; falls back to Alpaca data |
 | `ALPACA_PAPER_KEY` / `ALPACA_PAPER_SECRET` | — | **paper** trading + daily bars |
-| `REKT_ANALYST_BACKEND` | `cli` | analyst backend. Default `cli` drives the local `claude` CLI (`claude -p`) — reuses its auth, no key needed; runs tool-less (empty allowlist) so it cannot place orders or touch the filesystem. Set to `http` (or `api`) to use the HTTP API instead |
+| `REKT_ANALYST_BACKEND` | `cli` | analyst backend: `cli` (default) drives the local `claude` CLI (`claude -p`) — reuses its auth, no key needed; `http` (or `api`) uses the HTTP API with `ANTHROPIC_API_KEY`; `ollama` (or `local`) uses a local Ollama model — free, private, offline. All run advisory-only (tool-less for cli/ollama; the analyst can never place orders) |
 | `ANTHROPIC_API_KEY` | — | AI analyst via HTTP API (advisory only); required only when `REKT_ANALYST_BACKEND=http` |
+| `REKT_OLLAMA_URL` | `http://localhost:11434` | Ollama server URL (when `REKT_ANALYST_BACKEND=ollama`) |
+| `REKT_OLLAMA_MODEL` | `llama3.1` | Ollama model to use; `ollama pull` it first. Market-idea theses stay grounded because the deterministic screener picks the candidates — a small local model only narrates them, so it bills $0 |
 | `REKT_AI_DAILY_BUDGET` | `2.50` | USD/day ceiling that gates analyst runs |
 | `REKT_AI_AUTO` | enabled (unset) | `0`, `false`, or `off` disable the scheduled briefing/review |
 | `REKT_NTFY_TOPIC` / `REKT_NTFY_URL` | — | alert push (see Security for the topic warning) |

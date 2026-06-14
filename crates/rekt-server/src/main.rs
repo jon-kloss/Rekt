@@ -57,10 +57,12 @@ pub struct AppState {
     /// Claude API transport (ANTHROPIC_API_KEY) — None disables the analyst
     /// honestly. NOTE: the analyst layer never touches `broker` (PLAN.md §5).
     pub analyst: Option<Arc<dyn rekt_analyst::Transport>>,
-    /// True when the analyst transport is the Claude Code CLI (`claude -p`):
-    /// every kind runs tool-lessly with injected context, since the CLI is
-    /// launched with no tools and drives no in-process tool loop.
+    /// True for a TOOL-LESS backend (Claude Code CLI or local Ollama): every
+    /// kind runs with injected context, since these backends drive no
+    /// in-process tool loop.
     pub analyst_cli: bool,
+    /// Which backend is live, for the UI + cost: "cli" | "http" | "ollama".
+    pub analyst_backend: &'static str,
     /// Daily AI spend ceiling (REKT_AI_DAILY_BUDGET, USD).
     pub ai_budget: rust_decimal::Decimal,
     /// Single-flight latch: one analysis at a time.
@@ -386,44 +388,76 @@ async fn main() -> anyhow::Result<()> {
     //   REKT_ANALYST_BACKEND=http (or =api)   → the HTTP API client
     //     (ANTHROPIC_API_KEY), which also produces structured recs.
     // The CLI is the default because REKT is self-hosted alongside Claude
-    // Code; opt into the API explicitly when you'd rather spend a key.
-    let analyst_cli = match std::env::var("REKT_ANALYST_BACKEND") {
+    // Code; opt into the API (a key) or Ollama (local/free) explicitly.
+    let backend = match std::env::var("REKT_ANALYST_BACKEND") {
         Ok(v) if v.trim().eq_ignore_ascii_case("http") || v.trim().eq_ignore_ascii_case("api") => {
-            false
+            "http"
         }
-        _ => true, // default: local Claude Code CLI
+        Ok(v)
+            if v.trim().eq_ignore_ascii_case("ollama")
+                || v.trim().eq_ignore_ascii_case("local") =>
+        {
+            "ollama"
+        }
+        _ => "cli", // default: local Claude Code CLI
     };
-    let analyst: Option<Arc<dyn rekt_analyst::Transport>> = if analyst_cli {
-        // Probe the binary so a host without Claude Code degrades honestly
-        // (disabled) rather than advertising a backend that fails every run.
-        let cli = rekt_analyst::CliTransport::new();
-        if cli.is_available().await {
-            tracing::info!(
-                "AI analyst enabled via Claude Code CLI (claude -p; advisory only, no tools)"
-            );
-            Some(Arc::new(cli) as Arc<dyn rekt_analyst::Transport>)
-        } else {
-            tracing::warn!(
-                "REKT_ANALYST_BACKEND=cli (the default) but `claude` is not runnable on PATH \
-                 — AI analyst disabled. Install Claude Code, or set REKT_ANALYST_BACKEND=http \
-                 with ANTHROPIC_API_KEY."
-            );
-            None
+    // CLI and Ollama are tool-less (no in-process tool loop); HTTP uses tools.
+    let analyst_cli = backend != "http";
+    let analyst: Option<Arc<dyn rekt_analyst::Transport>> = match backend {
+        "cli" => {
+            // Probe the binary so a host without Claude Code degrades honestly
+            // (disabled) rather than advertising a backend that fails every run.
+            let cli = rekt_analyst::CliTransport::new();
+            if cli.is_available().await {
+                tracing::info!(
+                    "AI analyst enabled via Claude Code CLI (claude -p; advisory only, no tools)"
+                );
+                Some(Arc::new(cli) as Arc<dyn rekt_analyst::Transport>)
+            } else {
+                tracing::warn!(
+                    "REKT_ANALYST_BACKEND=cli (the default) but `claude` is not runnable on PATH \
+                     — AI analyst disabled. Install Claude Code, set REKT_ANALYST_BACKEND=http \
+                     with ANTHROPIC_API_KEY, or =ollama for a local model."
+                );
+                None
+            }
         }
-    } else {
-        let t = std::env::var("ANTHROPIC_API_KEY")
-            .ok()
-            .filter(|k| !k.is_empty())
-            .map(|key| {
-                tracing::info!("AI analyst enabled (advisory only — it can never execute orders)");
-                Arc::new(rekt_analyst::HttpTransport::new(key)) as Arc<dyn rekt_analyst::Transport>
-            });
-        if t.is_none() {
-            tracing::warn!(
-                "REKT_ANALYST_BACKEND=http but no ANTHROPIC_API_KEY — AI analyst disabled"
-            );
+        "ollama" => {
+            let url = std::env::var("REKT_OLLAMA_URL")
+                .unwrap_or_else(|_| "http://localhost:11434".into());
+            let model = std::env::var("REKT_OLLAMA_MODEL").unwrap_or_else(|_| "llama3.1".into());
+            let ollama = rekt_analyst::OllamaTransport::new(url.clone(), model.clone());
+            if ollama.is_available().await {
+                tracing::info!(model = %model, url = %url, "AI analyst enabled via local Ollama (free, advisory only, no tools)");
+                Some(Arc::new(ollama) as Arc<dyn rekt_analyst::Transport>)
+            } else {
+                tracing::warn!(
+                    model = %model, url = %url,
+                    "REKT_ANALYST_BACKEND=ollama but Ollama isn't reachable or the model isn't \
+                     pulled — AI analyst disabled. Start Ollama and run `ollama pull {model}`."
+                );
+                None
+            }
         }
-        t
+        _ => {
+            // http
+            let t = std::env::var("ANTHROPIC_API_KEY")
+                .ok()
+                .filter(|k| !k.is_empty())
+                .map(|key| {
+                    tracing::info!(
+                        "AI analyst enabled (advisory only — it can never execute orders)"
+                    );
+                    Arc::new(rekt_analyst::HttpTransport::new(key))
+                        as Arc<dyn rekt_analyst::Transport>
+                });
+            if t.is_none() {
+                tracing::warn!(
+                    "REKT_ANALYST_BACKEND=http but no ANTHROPIC_API_KEY — AI analyst disabled"
+                );
+            }
+            t
+        }
     };
     let ai_budget = std::env::var("REKT_AI_DAILY_BUDGET")
         .ok()
@@ -446,6 +480,7 @@ async fn main() -> anyhow::Result<()> {
         backfill_lock: Arc::new(Mutex::new(())),
         analyst,
         analyst_cli,
+        analyst_backend: backend,
         ai_budget,
         analyst_running: Arc::new(AtomicBool::new(false)),
         active_portfolio,
@@ -606,6 +641,7 @@ mod tests {
             backfill_lock: Arc::new(Mutex::new(())),
             analyst: None,
             analyst_cli: false,
+            analyst_backend: "http",
             ai_budget: rust_decimal::Decimal::new(250, 2),
             analyst_running: Arc::new(AtomicBool::new(false)),
             active_portfolio: "real".into(),

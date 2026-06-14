@@ -126,7 +126,7 @@ function aiSummaryCard(){
 // runs whatever model your Claude Code is set to (NOT necessarily Haiku), so we
 // name the backend, not a hardcoded model.
 function analystBadge(){
-  return M.analystBackend==='cli' ? 'CLAUDE CODE · CLI' : M.analystBackend==='http' ? 'CLAUDE API' : 'CLAUDE';
+  return M.analystBackend==='cli' ? 'CLAUDE CODE · CLI' : M.analystBackend==='http' ? 'CLAUDE API' : M.analystBackend==='ollama' ? 'OLLAMA · LOCAL' : 'AI';
 }
 // Spend is a real charge on the HTTP/API backend, but only an ESTIMATE on the
 // CLI backend (it runs under your Claude subscription; we price token usage as
@@ -225,7 +225,7 @@ function applyAnalyst(a){
   const lat = a.latest;
   if(lat && lat.report_md){ M.briefing = lat.report_md;
     M.briefingHead = (lat.kind||'').replace('_',' ') + ' · ' + (lat.started_ts||'').slice(0,16).replace('T',' ') + ' · ' + analystCost(lat.cost_usd); }
-  else { M.briefing = a.enabled ? 'No analysis yet — trigger a briefing or weekly review.' : 'AI analyst disabled — the HTTP backend needs ANTHROPIC_API_KEY. Unset REKT_ANALYST_BACKEND to use the local Claude Code CLI (the default) instead.'; M.briefingHead = ''; }
+  else { M.briefing = a.enabled ? 'No analysis yet — trigger a briefing or weekly review.' : 'AI analyst disabled. Pick a backend via REKT_ANALYST_BACKEND: cli (default, local Claude Code), http (ANTHROPIC_API_KEY), or ollama (free local model — start Ollama and `ollama pull llama3.1`).'; M.briefingHead = ''; }
   M.recs = (a.recommendations||[]).filter(r=>r.status==='open'||r.status==='accepted').map(r => {
     const oc = r.outcome;
     return { id:r.id, action:(r.action||'').toUpperCase(), sym:r.symbol, conf:r.confidence, sizing:r.sizing, kind:r.analysis_kind||'',

@@ -436,7 +436,12 @@ pub async fn run_analysis(state: AppState, id: i64, kind: String, question: Opti
     match run_analysis_inner(&state, &kind, question.as_deref()).await {
         Ok((outcome, model, allowlist)) => {
             let tool_log = serde_json::to_string(&outcome.tool_log).ok();
-            let cost = pricing::cost_usd(model, &outcome.usage);
+            // Ollama runs locally and bills nothing.
+            let cost = if state.analyst_backend == "ollama" {
+                Decimal::ZERO
+            } else {
+                pricing::cost_usd(model, &outcome.usage)
+            };
             // The weekly review answers in structured JSON; split it into
             // the report + persisted recommendations. Both backends produce
             // the same shape — the HTTP one via the API's output schema, the
@@ -501,7 +506,11 @@ pub async fn run_analysis(state: AppState, id: i64, kind: String, question: Opti
                 output_tokens: failure.usage.output_tokens as i64,
                 cache_read_tokens: failure.usage.cache_read_tokens as i64,
                 cache_write_tokens: failure.usage.cache_write_tokens as i64,
-                cost_usd: pricing::cost_usd(failure.model, &failure.usage),
+                cost_usd: if state.analyst_backend == "ollama" {
+                    Decimal::ZERO
+                } else {
+                    pricing::cost_usd(failure.model, &failure.usage)
+                },
                 report_md: None,
                 tool_log_json: tool_log.as_deref(),
                 error: Some(&failure.message),
@@ -823,7 +832,12 @@ pub(crate) async fn start_run(
         .await
         .map_err(internal)?;
     let (model, max_tokens) = kind_params(kind);
-    let headroom = pricing::max_output_cost(model, max_tokens);
+    // Ollama is free — no budget reservation; the daily ceiling is for $ backends.
+    let headroom = if state.analyst_backend == "ollama" {
+        Decimal::ZERO
+    } else {
+        pricing::max_output_cost(model, max_tokens)
+    };
     if spent + headroom > state.ai_budget {
         return Err(err(
             StatusCode::TOO_MANY_REQUESTS,
@@ -948,10 +962,7 @@ pub async fn summary(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
         })
         .collect();
     // Which backend is live, so the UI can say so (None when disabled).
-    let backend = state
-        .analyst
-        .as_ref()
-        .map(|_| if state.analyst_cli { "cli" } else { "http" });
+    let backend = state.analyst.as_ref().map(|_| state.analyst_backend);
     Ok(Json(json!({
         "enabled": state.analyst.is_some(),
         "backend": backend,
