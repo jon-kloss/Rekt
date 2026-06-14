@@ -444,26 +444,27 @@ pub async fn run_analysis(state: AppState, id: i64, kind: String, question: Opti
             // tolerates fences/prose the CLI may add). A parse failure is an
             // honest error (with the tokens we PAID for still accounted),
             // never a silently-mangled report.
-            let (report, error): (String, Option<String>) = if kind == "weekly_review" {
-                match extract_json_object(&outcome.text) {
-                    Some(parsed) => {
-                        store_recommendations(&state, id, &parsed).await;
-                        (
-                            parsed["report_md"]
-                                .as_str()
-                                .unwrap_or(&outcome.text)
-                                .to_string(),
-                            None,
-                        )
+            let (report, error): (String, Option<String>) =
+                if kind == "weekly_review" || kind == "market_ideas" {
+                    match extract_json_object(&outcome.text) {
+                        Some(parsed) => {
+                            store_recommendations(&state, id, &parsed).await;
+                            (
+                                parsed["report_md"]
+                                    .as_str()
+                                    .unwrap_or(&outcome.text)
+                                    .to_string(),
+                                None,
+                            )
+                        }
+                        None => (
+                            outcome.text.clone(), // keep the raw output for debugging
+                            Some("structured output did not contain a JSON object".to_string()),
+                        ),
                     }
-                    None => (
-                        outcome.text.clone(), // keep the raw output for debugging
-                        Some("structured output did not contain a JSON object".to_string()),
-                    ),
-                }
-            } else {
-                (outcome.text.clone(), None)
-            };
+                } else {
+                    (outcome.text.clone(), None)
+                };
             let row = repo::AnalysisOutcome {
                 input_tokens: outcome.usage.input_tokens as i64,
                 output_tokens: outcome.usage.output_tokens as i64,
@@ -578,6 +579,33 @@ async fn run_analysis_inner(
             vec![json!({"type": "web_search_20260209", "name": "web_search", "max_uses": 6})],
             Some(review_schema()),
         ),
+        "market_ideas" => {
+            // The screener already found + ranked the candidates; the AI only
+            // narrates them. question carries the list id.
+            let list_id: i64 = question.and_then(|q| q.parse().ok()).unwrap_or(0);
+            let lists = repo::list_watchlists(&state.db).await.unwrap_or_default();
+            let list_name = lists
+                .iter()
+                .find(|l| l.id == list_id)
+                .map(|l| l.name.clone())
+                .unwrap_or_else(|| "watchlist".into());
+            let (scored, _, _) = crate::screener::scored_candidates(state, list_id)
+                .await
+                .unwrap_or_default();
+            let block = crate::screener::candidates_prompt_block(&list_name, &scored);
+            (
+                format!(
+                    "{date}\n\n{track}\n\n{block}\n\nFor EACH candidate above, return a \
+                     recommendation whose `action` matches the screen and whose `rationale` is a \
+                     1-2 sentence thesis grounding the call in the listed signals plus your own \
+                     knowledge of the name. Keep `report_md` to a 2-3 sentence overview of the \
+                     batch. Do not add or drop names; do not restate the raw signal lines.",
+                ),
+                false,
+                vec![],
+                Some(review_schema()),
+            )
+        }
         _ => (
             format!(
                 "{date}\n\n{track}\n\nQuestion from the user:\n{}",
@@ -608,7 +636,7 @@ async fn run_analysis_inner(
         // output schema; the CLI has no such knob, so we ask for the same
         // shape in-prompt and parse it back out (see `extract_json_object`).
         // It also has no web access, so say so rather than have it pretend.
-        if kind == "weekly_review" {
+        if kind == "weekly_review" || kind == "market_ideas" {
             user_content = format!("{user_content}\n\n{}", cli_review_json_instruction());
         }
     }
@@ -646,6 +674,9 @@ fn kind_params(kind: &str) -> (&'static str, u32) {
     match kind {
         "briefing" => (BRIEFING_MODEL, 2048),
         "weekly_review" => (ANALYST_MODEL, 16000),
+        // Narrating pre-screened candidates is light work — the deterministic
+        // screener already did the hard part.
+        "market_ideas" => (ANALYST_MODEL, 6000),
         _ => (ANALYST_MODEL, 8000),
     }
 }
@@ -687,7 +718,7 @@ async fn store_recommendations(state: &AppState, analysis_id: i64, parsed: &Valu
 
 /// Gate shared by every run path: key present, nothing already running,
 /// today's spend under budget. Returns the analysis id on success.
-async fn start_run(
+pub(crate) async fn start_run(
     state: &AppState,
     kind: &str,
     question: Option<String>,

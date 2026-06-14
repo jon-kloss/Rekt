@@ -67,6 +67,47 @@ pub async fn put_settings(
     ))
 }
 
+/// One ranked candidate plus the context the UI/AI need.
+pub struct Scored {
+    pub symbol: String,
+    pub kind: String,
+    pub aggr: Aggressiveness,
+    pub candidate: rekt_core::screener::Candidate,
+}
+
+/// Screen a list's members into ranked candidates (strongest first), shared by
+/// the endpoint and the AI-thesis flow. Returns (scored, scanned, awaiting_data).
+pub async fn scored_candidates(
+    state: &AppState,
+    list_id: i64,
+) -> anyhow::Result<(Vec<Scored>, usize, usize)> {
+    let members = repo::watchlist_members_detail(&state.db, list_id).await?;
+    let stock_aggr = aggressiveness_for(&state.db, "stock").await;
+    let etf_aggr = aggressiveness_for(&state.db, "etf").await;
+    let mut scored = Vec::new();
+    let mut scanned = 0usize;
+    let mut awaiting_data = 0usize;
+    for (symbol, kind) in members {
+        let closes = repo::recent_closes(&state.db, &symbol, SIGNAL_WINDOW_BARS).await?;
+        if closes.len() < MIN_BARS {
+            awaiting_data += 1;
+            continue;
+        }
+        scanned += 1;
+        let aggr = if kind == "etf" { etf_aggr } else { stock_aggr };
+        if let Some(candidate) = screen(&summarize(&closes), aggr) {
+            scored.push(Scored {
+                symbol,
+                kind,
+                aggr,
+                candidate,
+            });
+        }
+    }
+    scored.sort_by(|a, b| b.candidate.score.cmp(&a.candidate.score));
+    Ok((scored, scanned, awaiting_data))
+}
+
 /// GET /api/screener/{list_id} — ranked buy/sell candidates from a list's
 /// members. Deterministic (signal-derived); the AI layer narrates these later.
 pub async fn screen_list(
@@ -80,51 +121,68 @@ pub async fn screen_list(
             format!("no watchlist {list_id}"),
         ));
     }
-    let members = repo::watchlist_members_detail(&state.db, list_id)
-        .await
-        .map_err(internal)?;
-    let stock_aggr = aggressiveness_for(&state.db, "stock").await;
-    let etf_aggr = aggressiveness_for(&state.db, "etf").await;
-
-    let mut scored = Vec::new();
-    let mut scanned = 0usize;
-    let mut awaiting_data = 0usize;
-    for (symbol, kind) in members {
-        let closes = repo::recent_closes(&state.db, &symbol, SIGNAL_WINDOW_BARS)
-            .await
-            .map_err(internal)?;
-        // Honest degradation: no idea for a symbol whose history hasn't
-        // backfilled yet — report the count instead of guessing.
-        if closes.len() < MIN_BARS {
-            awaiting_data += 1;
-            continue;
-        }
-        scanned += 1;
-        let aggr = if kind == "etf" { etf_aggr } else { stock_aggr };
-        if let Some(c) = screen(&summarize(&closes), aggr) {
-            scored.push((symbol, kind, aggr, c));
-        }
-    }
-    // Strongest signals first.
-    scored.sort_by(|a, b| b.3.score.cmp(&a.3.score));
+    let (scored, scanned, awaiting_data) =
+        scored_candidates(&state, list_id).await.map_err(internal)?;
     let ideas: Vec<Value> = scored
         .into_iter()
-        .map(|(symbol, kind, aggr, c)| {
+        .map(|s| {
             json!({
-                "symbol": symbol,
-                "kind": kind,
-                "action": c.action,
-                "score": c.score,
-                "reasons": c.reasons,
-                "aggressiveness": aggr.as_str(),
+                "symbol": s.symbol,
+                "kind": s.kind,
+                "action": s.candidate.action,
+                "score": s.candidate.score,
+                "reasons": s.candidate.reasons,
+                "aggressiveness": s.aggr.as_str(),
             })
         })
         .collect();
-
     Ok(Json(json!({
         "list_id": list_id,
         "scanned": scanned,
         "awaiting_data": awaiting_data,
         "ideas": ideas,
     })))
+}
+
+/// Format the screened candidates as a prompt block the analyst narrates.
+pub fn candidates_prompt_block(list_name: &str, scored: &[Scored]) -> String {
+    let mut out = format!(
+        "A deterministic signal screen of the user's \"{list_name}\" watchlist surfaced these \
+         ranked candidates. The action and the signals are FACTS from the screen — ground each \
+         thesis in them; do NOT add tickers not listed and do NOT drop any:\n"
+    );
+    for s in scored {
+        out.push_str(&format!(
+            "- {} {} (score {}): {}\n",
+            s.candidate.action.to_uppercase(),
+            s.symbol,
+            s.candidate.score,
+            s.candidate.reasons.join("; ")
+        ));
+    }
+    out
+}
+
+/// POST /api/screener/{list_id}/analyze — kick off an AI pass that writes a
+/// thesis per screened candidate (persisted as tracked recommendations). Does
+/// nothing (and bills nothing) if the screen is empty.
+pub async fn analyze_list(
+    State(state): State<AppState>,
+    Path(list_id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    let lists = repo::list_watchlists(&state.db).await.map_err(internal)?;
+    if !lists.iter().any(|l| l.id == list_id) {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            format!("no watchlist {list_id}"),
+        ));
+    }
+    let (scored, _, _) = scored_candidates(&state, list_id).await.map_err(internal)?;
+    if scored.is_empty() {
+        return Ok(Json(json!({ "started": false, "ideas": 0 })));
+    }
+    let id = crate::analyst::start_run(&state, "market_ideas", Some(list_id.to_string())).await?;
+    Ok(Json(
+        json!({ "started": true, "id": id, "ideas": scored.len() }),
+    ))
 }

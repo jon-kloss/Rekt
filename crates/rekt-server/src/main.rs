@@ -111,6 +111,10 @@ fn app(state: AppState) -> Router {
         )
         .route("/api/screener/{list_id}", get(screener::screen_list))
         .route(
+            "/api/screener/{list_id}/analyze",
+            post(screener::analyze_list),
+        )
+        .route(
             "/api/alerts",
             get(alerts::list_alerts).post(alerts::create_alert),
         )
@@ -260,8 +264,19 @@ async fn open_db(path: &str) -> anyhow::Result<SqlitePool> {
         .filename(path)
         .create_if_missing(true)
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+    // Run migrations with FK enforcement OFF so a table rebuild (e.g. widening
+    // a CHECK constraint) can drop+recreate a table other tables reference —
+    // SQLite forbids that with foreign_keys on, even inside a transaction.
+    // Migrations are trusted, controlled DDL; the app pool below keeps FK on.
+    let migrate_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone().foreign_keys(false))
+        .await?;
+    sqlx::migrate!("../../migrations")
+        .run(&migrate_pool)
+        .await?;
+    migrate_pool.close().await;
     let pool = SqlitePoolOptions::new().connect_with(options).await?;
-    sqlx::migrate!("../../migrations").run(&pool).await?;
     Ok(pool)
 }
 

@@ -149,7 +149,7 @@ const S = {
   importOpen:false, importFmt:'generic', importText:'', importPreview:null, importErr:'', importBusy:false,
   manageOpen:false, confirmDelPf:null,
   newAlert:{sym:'',cond:'price_below',thr:'',note:''},
-  wlAddText:'',
+  wlAddText:'', ideasAnalyzing:false,
 };
 // M holds the latest server-derived data the views render from.
 const M = {
@@ -802,19 +802,23 @@ function marketIdeasSection(){
   let html='<div style="margin-top:18px;padding:12px 16px;border-top:1px solid '+C.border+';border-bottom:1px solid '+C.border+';background:'+C.panel2+';display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'+
     '<span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">MARKET IDEAS'+(ideas.length?' <span style="color:'+C.amber+';">'+ideas.length+'</span>':'')+'</span>'+
     '<span style="font-size:9.5px;color:'+C.faint+';">scanned '+(d.scanned||0)+note+'</span>'+
-    '<span style="margin-left:auto;display:flex;align-items:center;">'+aggrToggle('stock')+aggrToggle('etf')+'</span>'+
+    '<span style="margin-left:auto;display:flex;align-items:center;gap:10px;">'+
+      (ideas.length?'<button data-act="analyzeIdeas"'+(S.ideasAnalyzing?' disabled':'')+' title="Write an AI thesis for each candidate" style="font-family:inherit;font-size:9.5px;font-weight:600;letter-spacing:0.5px;color:'+(S.ideasAnalyzing?C.faint:C.blue)+';background:transparent;border:1px solid '+(S.ideasAnalyzing?C.border:'#1B2A44')+';border-radius:4px;padding:4px 10px;cursor:'+(S.ideasAnalyzing?'default':'pointer')+';">'+(S.ideasAnalyzing?'✦ ANALYZING…':'✦ AI THESES')+'</button>':'')+
+      aggrToggle('stock')+aggrToggle('etf')+'</span>'+
   '</div>'+
-  '<div style="padding:6px 16px 4px;font-size:10px;color:'+C.faint+';line-height:1.5;">Signal-ranked candidates from this list — deterministic, not fabricated. Higher score = stronger setup. STAGE routes through the paper ticket.</div>';
+  '<div style="padding:6px 16px 4px;font-size:10px;color:'+C.faint+';line-height:1.5;">Signal-ranked candidates from this list — deterministic, not fabricated. Higher score = stronger setup. STAGE routes through the paper ticket. <span style="color:'+C.blue+';">✦ AI THESES</span> adds a written take per candidate.</div>';
   if(!ideas.length){
     html+='<div style="padding:18px 16px;text-align:center;color:'+C.faint+';font-size:11.5px;">no setups at this aggressiveness — try AGGR, or add more symbols.</div>';
     return html;
   }
   const cols='0.5fr 0.95fr 2.4fr 0.7fr';
   html+=ideas.map(it=>{ const buy=it.action==='buy'; const reasons=(it.reasons||[]).map(r=>esc(r)).join(' · ');
-    return '<div style="display:grid;grid-template-columns:'+cols+';gap:10px;align-items:center;padding:9px 16px;border-bottom:1px solid '+C.hairline+';font-size:12px;">'+
-      '<div><span style="font-size:9px;font-weight:700;letter-spacing:0.5px;color:'+(buy?UP:DN)+';border:1px solid '+(buy?UP:DN)+';border-radius:3px;padding:2px 6px;">'+(buy?'BUY':'SELL')+'</span></div>'+
+    const rec=(M.recs||[]).find(r=>r.sym===it.symbol);
+    const thesis=(rec&&rec.reason)?'<div style="margin-top:5px;font-size:11px;color:'+C.body+';line-height:1.45;"><span style="color:'+C.blue+';font-size:8.5px;font-weight:700;letter-spacing:0.5px;">AI</span> '+esc(rec.reason)+'</div>':'';
+    return '<div style="display:grid;grid-template-columns:'+cols+';gap:10px;align-items:start;padding:9px 16px;border-bottom:1px solid '+C.hairline+';font-size:12px;">'+
+      '<div style="padding-top:1px;"><span style="font-size:9px;font-weight:700;letter-spacing:0.5px;color:'+(buy?UP:DN)+';border:1px solid '+(buy?UP:DN)+';border-radius:3px;padding:2px 6px;">'+(buy?'BUY':'SELL')+'</span></div>'+
       '<div style="font-weight:600;color:'+C.bright+';">'+esc(it.symbol)+' <span title="screener score" style="font-size:9px;color:'+C.faint+';">'+esc(String(it.score))+'</span></div>'+
-      '<div style="color:'+C.body+';line-height:1.4;">'+reasons+'</div>'+
+      '<div style="color:'+C.body+';line-height:1.4;">'+reasons+thesis+'</div>'+
       '<div style="text-align:right;"><button data-act="stageIdea" data-arg="'+esc(it.symbol)+':'+esc(it.action)+'" title="Stage a PAPER '+esc(it.action)+' of '+esc(it.symbol)+'" style="font-family:inherit;font-size:9.5px;font-weight:600;color:'+(buy?UP:DN)+';background:'+(buy?'rgba(47,191,113,0.1)':'rgba(255,92,87,0.1)')+';border:1px solid '+(buy?'rgba(47,191,113,0.35)':'rgba(255,92,87,0.35)')+';border-radius:3px;padding:4px 9px;cursor:pointer;white-space:nowrap;">STAGE '+(buy?'BUY':'SELL')+'</button></div>'+
     '</div>';
   }).join('');
@@ -844,6 +848,16 @@ async function setAggr(kind, level){
   const next=Object.assign({stock:'balanced',etf:'balanced'}, M.screenerSettings); next[kind]=level;
   try{ M.screenerSettings = await japi('PUT','/api/screener/settings', next); await loadScreener(); render(); }
   catch(e){ toast(e.message); }
+}
+async function analyzeIdeas(){
+  if(M.wlActive==null) return;
+  try{
+    const r=await japi('POST','/api/screener/'+M.wlActive+'/analyze');
+    if(!r.started){ toast('No candidates to analyze — loosen aggressiveness or add symbols'); return; }
+    S.ideasAnalyzing=true; toast('AI writing theses for '+r.ideas+' ideas…'); render();
+    for(let i=0;i<22;i++){ await new Promise(res=>setTimeout(res,3000)); let a={}; try{ a=await jget('/api/analyst'); applyAnalyst(a); }catch(e){} if(a && !a.running) break; }
+    S.ideasAnalyzing=false; toast('AI THESES READY'); render();
+  }catch(e){ S.ideasAnalyzing=false; toast(e.message); render(); }
 }
 function stageIdea(sym, action){
   const side=action==='buy'?'buy':'sell';
@@ -1325,6 +1339,7 @@ async function act(name, arg){
     case 'wlDeleteList': wlDeleteList(+arg); break;
     case 'setAggr': { const [k,l]=arg.split(':'); setAggr(k,l); break; }
     case 'stageIdea': { const i=arg.lastIndexOf(':'); stageIdea(arg.slice(0,i), arg.slice(i+1)); break; }
+    case 'analyzeIdeas': analyzeIdeas(); break;
     case 'dismissAlert': try{ await japi('POST','/api/alerts/'+arg+'/dismiss'); await refreshSilent(); }catch(e){ toast(e.message); } break;
     case 'rearmAlert': try{ await japi('POST','/api/alerts/'+arg+'/rearm'); await refreshSilent(); }catch(e){ toast(e.message); } break;
     case 'reviewAlert': { const a=M.alerts.find(x=>x.id==arg); if(a&&a.draft){ if(addToBasket(a.draft.side,a.sym,a.draft.qty,a.draft.order_type,a.draft.limit_price)) toast('STAGED '+a.sym+' FROM ALERT → ticket basket'); render(); } break; }
