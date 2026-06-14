@@ -49,6 +49,12 @@ pub async fn gauges(State(state): State<AppState>) -> Result<Json<Value>, ApiErr
             _ => None,
         };
         let signals = (closes.len() >= MIN_BARS).then(|| summarize(&closes));
+        tracing::debug!(
+            symbol,
+            closes = closes.len(),
+            has_signals = signals.is_some(),
+            "gauge"
+        );
         out.push(json!({
             "symbol": symbol,
             "name": name,
@@ -58,21 +64,15 @@ pub async fn gauges(State(state): State<AppState>) -> Result<Json<Value>, ApiErr
         }));
     }
     // The latest finished market brief, so the UI shows the AI read inline.
-    use sqlx::Row;
-    let brief = sqlx::query(
-        "SELECT report_md, finished_ts FROM analyses
-         WHERE kind = 'market_brief' AND status = 'done' AND report_md IS NOT NULL
-         ORDER BY id DESC LIMIT 1",
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(internal)?
-    .map(|row| {
-        json!({
-            "report_md": row.get::<Option<String>, _>("report_md"),
-            "ts": row.get::<Option<String>, _>("finished_ts"),
-        })
-    });
+    let brief = repo::latest_market_brief(&state.db)
+        .await
+        .map_err(internal)?
+        .map(|(report_md, ts)| json!({ "report_md": report_md, "ts": ts }));
+    tracing::debug!(
+        gauges = out.len(),
+        brief = brief.is_some(),
+        "GET /api/market"
+    );
     Ok(Json(json!({ "gauges": out, "brief": brief })))
 }
 
@@ -80,6 +80,7 @@ pub async fn gauges(State(state): State<AppState>) -> Result<Json<Value>, ApiErr
 /// gauges (advisory context, no recommendations). Bills nothing on disabled.
 pub async fn brief(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let id = crate::analyst::start_run(&state, "market_brief", None).await?;
+    tracing::debug!(id, "POST /api/market/brief started");
     Ok(Json(json!({ "started": true, "id": id })))
 }
 
@@ -92,6 +93,7 @@ pub async fn gauges_prompt_block(state: &AppState) -> String {
         "Current market gauges (index ETFs; RSI/SMA distance/drawdown are \
          deterministic facts computed locally):\n",
     );
+    let mut rows = 0;
     for (symbol, name) in INDICES {
         let closes = repo::recent_closes(&state.db, symbol, SIGNAL_WINDOW_BARS)
             .await
@@ -99,6 +101,7 @@ pub async fn gauges_prompt_block(state: &AppState) -> String {
         if closes.len() < MIN_BARS {
             continue;
         }
+        rows += 1;
         let s = summarize(&closes);
         let price = prices
             .get(*symbol)
@@ -115,5 +118,14 @@ pub async fn gauges_prompt_block(state: &AppState) -> String {
             opt(s.drawdown_pct),
         ));
     }
+    // Honest degradation on a fresh install: if no index has enough history yet,
+    // tell the model to decline rather than improvise levels it cannot see.
+    if rows == 0 {
+        out.push_str(
+            "No index gauges have enough history yet — say the market read isn't \
+             available rather than guessing.\n",
+        );
+    }
+    tracing::debug!(rows, "gauges_prompt_block");
     out
 }

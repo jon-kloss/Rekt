@@ -161,7 +161,7 @@ const M = {
   briefing:'', briefingHead:'', analystEnabled:false, analystBackend:null, todayCost:0, budget:0,
   hist:[], metrics:{}, totals:{}, tax:null, taxYear:null, taxYears:[],
   candleCache:{}, lastPrices:{}, portfolios:[], activePortfolio:'',
-  gauges:{gauges:[],brief:null},
+  gauges:{gauges:[],brief:null}, gaugesErr:false,
 };
 
 //================================================================ API
@@ -242,12 +242,12 @@ async function loadAll(){
     const [pf, hist, an, ords, txns] = await Promise.all([
       jget('/api/portfolio'), jget('/api/history?range=all'), jget('/api/analyst'),
       jget('/api/orders').catch(()=>[]), jget('/api/transactions').catch(()=>[]),
+      loadMarket(), // independent overview widget — load in parallel, don't block first paint
     ]);
     applyPortfolio(pf); applyHistory(hist); applyAnalyst(an); applyOrders(ords); applyTxns(txns);
     try { applyTax(await jget('/api/taxes' + (M.taxYear?('?year='+M.taxYear):''))); } catch(e){}
     try { const pl=await jget('/api/portfolios'); M.portfolios=pl.portfolios||[]; M.activePortfolio=pl.active||M.activePortfolio; } catch(e){}
     await loadWatchlists();
-    await loadMarket();
     M.ready = true; render();
   } catch(e){ console.error(e); toast('LOAD FAILED — is the server up?'); }
 }
@@ -648,19 +648,29 @@ function marketSection(){
     '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;"><span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">MARKET</span>'+
     '<span style="font-size:8.5px;letter-spacing:0.5px;color:'+C.faint+';">deterministic gauges · AI read</span>'+
     '<button data-act="marketBrief"'+(S.marketBriefing?' disabled':'')+' title="AI state-of-market read of the gauges" style="margin-left:auto;font-family:inherit;font-size:9.5px;font-weight:600;letter-spacing:0.5px;color:'+(S.marketBriefing?C.faint:C.blue)+';background:transparent;border:1px solid '+(S.marketBriefing?C.border:'#1B2A44')+';border-radius:4px;padding:4px 10px;cursor:'+(S.marketBriefing?'default':'pointer')+';">'+(S.marketBriefing?'✦ THINKING…':'✦ BRIEF')+'</button></div>'+
-    '<div style="display:flex;gap:8px;flex-wrap:wrap;">'+(gauges||'<span style="font-size:11px;color:'+C.faint+';">gauges loading…</span>')+'</div>'+
+    '<div style="display:flex;gap:8px;flex-wrap:wrap;">'+(gauges||(M.gaugesErr?'<span style="font-size:11px;color:'+C.red+';">couldn’t load gauges — is the server reachable?</span>':'<span style="font-size:11px;color:'+C.faint+';">gauges loading…</span>'))+'</div>'+
     brief+
   '</div>';
 }
-async function loadMarket(){ try{ M.gauges = await jget('/api/market'); }catch(e){} }
+async function loadMarket(){ try{ M.gauges = await jget('/api/market'); M.gaugesErr=false; }catch(e){ M.gaugesErr=true; } }
 async function marketBrief(){
+  if(S.marketBriefing) return;            // guard the double-click window
+  S.marketBriefing=true; render();        // disable the button before the await
   try{
-    const r=await japi('POST','/api/market/brief');
-    if(!r.started){ toast('Market brief unavailable'); return; }
-    S.marketBriefing=true; toast('AI reading the market…'); render();
-    for(let i=0;i<20;i++){ await new Promise(res=>setTimeout(res,3000)); let a={}; try{ a=await jget('/api/analyst'); }catch(e){} if(a && !a.running) break; }
-    await loadMarket(); S.marketBriefing=false; toast('MARKET BRIEF READY'); render();
-  }catch(e){ S.marketBriefing=false; toast(e.message); render(); }
+    const r=await japi('POST','/api/market/brief'); // errors (disabled/budget/busy) throw → caught
+    const id=r.id; toast('AI reading the market…');
+    // Poll THIS brief's own analysis row — not the shared global running flag,
+    // which any other analyst run (briefing/ideas) could flip.
+    let done=false;
+    for(let i=0;i<25;i++){
+      await new Promise(res=>setTimeout(res,3000));
+      let row=null; try{ row=await jget('/api/analyses/'+id); }catch(e){}
+      if(row && row.status && row.status!=='running'){ done = row.status==='done'; break; }
+    }
+    await loadMarket();
+    toast(done ? 'MARKET BRIEF READY' : 'Market brief still running — refresh shortly');
+  }catch(e){ toast(e.message); }
+  finally{ S.marketBriefing=false; render(); }
 }
 
 function overviewView(){

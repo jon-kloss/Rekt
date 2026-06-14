@@ -912,6 +912,26 @@ pub async fn latest_portfolio_analysis(pool: &SqlitePool) -> Result<Option<Analy
     row.map(analysis_from_row).transpose()
 }
 
+/// The most recent finished market brief as `(report_md, finished_ts)`, so
+/// GET /api/market can show the AI read inline. `None` until one has run.
+/// The WHERE clause guarantees `report_md` is non-NULL.
+pub async fn latest_market_brief(pool: &SqlitePool) -> Result<Option<(String, Option<String>)>> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT report_md, finished_ts FROM analyses
+         WHERE kind = 'market_brief' AND status = 'done' AND report_md IS NOT NULL
+         ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| {
+        (
+            r.get::<String, _>("report_md"),
+            r.get::<Option<String>, _>("finished_ts"),
+        )
+    }))
+}
+
 /// Recent analyses WITHOUT report bodies — the polled summary endpoint
 /// must not ship kilobytes of markdown the client discards. Fetch the full
 /// record by id when the body is needed.

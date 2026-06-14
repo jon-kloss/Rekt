@@ -18,6 +18,13 @@ trading. For what REKT *is* and the design behind it, see
   transaction log, so the transaction rows are the only irreplaceable data.
 - **Secrets stay in the environment.** API keys are read from env vars at boot
   and never written to the database, the logs, or the browser.
+- **Four index gauges are always fetched.** The MARKET overview reads SPY/QQQ/
+  IWM/DIA, so those four symbols join the backfill + live-refresh sets
+  regardless of what you hold (SPY was already the benchmark, so the marginal
+  cost is +3 symbols). On a streaming Finnhub feed this is three extra
+  websocket subscriptions; on the REST-poll fallback it is ~3 extra quote calls
+  per minute — well within free-tier limits, but it means even a zero-position
+  install does a small amount of always-on market-data work.
 
 ## Configuration
 
