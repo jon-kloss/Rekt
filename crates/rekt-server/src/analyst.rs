@@ -625,6 +625,23 @@ async fn run_analysis_inner(
             vec![json!({"type": "web_search_20260209", "name": "web_search", "max_uses": 6})],
             Some(review_schema()),
         ),
+        "market_brief" => {
+            // State-of-the-market context over deterministic index gauges —
+            // narration, not portfolio advice; no recommendations.
+            let block = crate::market::gauges_prompt_block(state).await;
+            (
+                format!(
+                    "{date}\n\n{block}\n\nWrite a SHORT state-of-the-market read (3-5 sentences): \
+                     the overall posture (risk-on / risk-off / mixed), what the indices' trend and \
+                     RSI say across broad (SPY), tech (QQQ) and small caps (IWM), and the single \
+                     thing to watch next. Ground it in the gauge facts above; plain markdown. This \
+                     is market CONTEXT — do not give portfolio or per-name trade advice.",
+                ),
+                false,
+                vec![],
+                None,
+            )
+        }
         "market_ideas" => {
             // Candidates were screened up front (see market_screen); the AI
             // only narrates them.
@@ -664,7 +681,9 @@ async fn run_analysis_inner(
         use_tools = false;
         server_tools = vec![];
         output_schema = None;
-        if kind != "briefing" {
+        // briefing + market_brief carry their own context in the prompt; the
+        // market brief is deliberately NOT about the user's holdings.
+        if kind != "briefing" && kind != "market_brief" {
             user_content = format!(
                 "{user_content}\n\nCurrent portfolio state:\n{}\n\n{}",
                 portfolio_context(state).await,
@@ -726,6 +745,8 @@ fn kind_params(kind: &str) -> (&'static str, u32) {
         // Narrating pre-screened candidates is light work — the deterministic
         // screener already did the hard part.
         "market_ideas" => (ANALYST_MODEL, 6000),
+        // A short state-of-market read over the injected gauges — cheap model.
+        "market_brief" => (BRIEFING_MODEL, 1024),
         _ => (ANALYST_MODEL, 8000),
     }
 }
@@ -926,12 +947,12 @@ pub async fn summary(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
     let analyses = repo::recent_analyses_light(&state.db, 8)
         .await
         .map_err(internal)?;
-    let latest = match analyses.first() {
-        Some(first) => repo::get_analysis(&state.db, first.id)
-            .await
-            .map_err(internal)?,
-        None => None,
-    };
+    // The highlighted "latest" speaks to the user's portfolio, so it skips
+    // market_brief / market_ideas (those live in the MARKET / WATCH views).
+    // The `analyses` history below still lists every kind.
+    let latest = repo::latest_portfolio_analysis(&state.db)
+        .await
+        .map_err(internal)?;
     let recommendations = repo::list_recommendations(&state.db, TRACK_RECORD_RECS)
         .await
         .map_err(internal)?;

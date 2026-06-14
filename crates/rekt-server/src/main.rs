@@ -12,6 +12,7 @@ mod api;
 mod history;
 mod import;
 mod live;
+mod market;
 mod portfolios;
 mod repo;
 mod screener;
@@ -116,6 +117,8 @@ fn app(state: AppState) -> Router {
             "/api/screener/{list_id}/analyze",
             post(screener::analyze_list),
         )
+        .route("/api/market", get(market::gauges))
+        .route("/api/market/brief", post(market::brief))
         .route(
             "/api/alerts",
             get(alerts::list_alerts).post(alerts::create_alert),

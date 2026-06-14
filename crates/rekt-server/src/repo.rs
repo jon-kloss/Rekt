@@ -897,6 +897,21 @@ pub async fn get_analysis(pool: &SqlitePool, id: i64) -> Result<Option<AnalysisR
     row.map(analysis_from_row).transpose()
 }
 
+/// The most recent *portfolio-narrative* analysis (full body). Market briefs
+/// and market-idea scans are advisory context with their own UI homes (the
+/// MARKET section / WATCH ideas) — they must not hijack the AI BRIEFING /
+/// LATEST ANALYSIS surfaces, which speak to the user's own portfolio.
+pub async fn latest_portfolio_analysis(pool: &SqlitePool) -> Result<Option<AnalysisRecord>> {
+    let row = sqlx::query(&format!(
+        "SELECT {ANALYSIS_COLUMNS} FROM analyses
+         WHERE kind IN ('briefing', 'weekly_review', 'on_demand')
+         ORDER BY id DESC LIMIT 1"
+    ))
+    .fetch_optional(pool)
+    .await?;
+    row.map(analysis_from_row).transpose()
+}
+
 /// Recent analyses WITHOUT report bodies — the polled summary endpoint
 /// must not ship kilobytes of markdown the client discards. Fetch the full
 /// record by id when the body is needed.

@@ -392,6 +392,7 @@ pub async fn refresh_symbols(state: &AppState) -> anyhow::Result<()> {
     let mut symbols = repo::all_symbols(&state.db).await?;
     symbols.extend(repo::watchlist_symbols(&state.db).await?);
     symbols.extend(repo::alert_symbols(&state.db).await?);
+    symbols.extend(crate::market::index_symbols()); // market gauges (signals + quotes)
     symbols.sort();
     symbols.dedup();
     state.symbols.send_if_modified(|current| {

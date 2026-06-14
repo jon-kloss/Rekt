@@ -43,6 +43,7 @@ pub async fn backfill_candles(state: &AppState) -> anyhow::Result<()> {
     symbols.extend(repo::alert_symbols(&state.db).await?); // drawdown alerts need closes
     symbols.extend(repo::recommendation_symbols(&state.db).await?); // outcome tracking
     symbols.push(BENCHMARK.to_string());
+    symbols.extend(crate::market::index_symbols()); // market gauges need candles
     symbols.sort();
     symbols.dedup();
 

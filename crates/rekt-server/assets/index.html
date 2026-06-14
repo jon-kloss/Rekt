@@ -149,7 +149,7 @@ const S = {
   importOpen:false, importFmt:'generic', importText:'', importPreview:null, importErr:'', importBusy:false,
   manageOpen:false, confirmDelPf:null,
   newAlert:{sym:'',cond:'price_below',thr:'',note:''},
-  wlAddText:'', ideasAnalyzing:false,
+  wlAddText:'', ideasAnalyzing:false, marketBriefing:false,
 };
 // M holds the latest server-derived data the views render from.
 const M = {
@@ -161,6 +161,7 @@ const M = {
   briefing:'', briefingHead:'', analystEnabled:false, analystBackend:null, todayCost:0, budget:0,
   hist:[], metrics:{}, totals:{}, tax:null, taxYear:null, taxYears:[],
   candleCache:{}, lastPrices:{}, portfolios:[], activePortfolio:'',
+  gauges:{gauges:[],brief:null},
 };
 
 //================================================================ API
@@ -246,6 +247,7 @@ async function loadAll(){
     try { applyTax(await jget('/api/taxes' + (M.taxYear?('?year='+M.taxYear):''))); } catch(e){}
     try { const pl=await jget('/api/portfolios'); M.portfolios=pl.portfolios||[]; M.activePortfolio=pl.active||M.activePortfolio; } catch(e){}
     await loadWatchlists();
+    await loadMarket();
     M.ready = true; render();
   } catch(e){ console.error(e); toast('LOAD FAILED — is the server up?'); }
 }
@@ -623,6 +625,44 @@ function attentionItems(){
   return items;
 }
 
+// State-of-market: deterministic index gauges + an AI read of them.
+function marketSection(){
+  const m = M.gauges||{gauges:[],brief:null};
+  const gauges = (m.gauges||[]).map(g=>{
+    const s=g.signals||{}; const dp=g.day_pct;
+    const rsi = has(s.rsi14)?num(s.rsi14):null;
+    const v50=has(s.vs_sma50_pct)?num(s.vs_sma50_pct):null, v200=has(s.vs_sma200_pct)?num(s.vs_sma200_pct):null;
+    const trend = (v50!=null&&v200!=null) ? (v50>0&&v200>0?'▲':(v50<0&&v200<0?'▼':'·')) : '·';
+    const tc = trend==='▲'?UP:trend==='▼'?DN:C.faint;
+    return '<div style="flex:1;min-width:118px;padding:9px 12px;border:1px solid '+C.border+';border-radius:5px;background:'+C.bg+';">'+
+      '<div style="font-size:9px;letter-spacing:0.5px;color:'+C.label+';">'+esc(g.symbol)+' <span style="color:'+C.faint+';">'+esc(g.name)+'</span></div>'+
+      '<div style="display:flex;align-items:baseline;gap:8px;margin-top:4px;"><span style="font-size:15px;font-weight:600;color:'+C.bright+';font-variant-numeric:tabular-nums;">'+(has(g.price)?money(g.price):'—')+'</span>'+
+      '<span style="font-size:11px;color:'+(dp==null?C.label:dirColor(dp))+';">'+(dp==null?'—':signedPct(dp))+'</span></div>'+
+      '<div style="margin-top:5px;font-size:9px;color:'+C.faint+';">'+(rsi!=null?('RSI '+esc(String(rsi))+' · '):'')+'<span style="color:'+tc+';">'+trend+' trend</span></div>'+
+    '</div>';
+  }).join('');
+  const brief = (m.brief && m.brief.report_md)
+    ? '<div style="margin-top:12px;font-size:12px;line-height:1.55;color:'+C.body+';max-width:940px;">'+mdToHtml(m.brief.report_md)+'</div>'
+    : '<div style="margin-top:10px;font-size:11px;color:'+C.faint+';">No market brief yet — click ✦ BRIEF for an AI read of these gauges.</div>';
+  return '<div style="margin:14px 16px 0;padding:14px 16px;border:1px solid '+C.border+';border-radius:6px;background:'+C.panel2+';">'+
+    '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;"><span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">MARKET</span>'+
+    '<span style="font-size:8.5px;letter-spacing:0.5px;color:'+C.faint+';">deterministic gauges · AI read</span>'+
+    '<button data-act="marketBrief"'+(S.marketBriefing?' disabled':'')+' title="AI state-of-market read of the gauges" style="margin-left:auto;font-family:inherit;font-size:9.5px;font-weight:600;letter-spacing:0.5px;color:'+(S.marketBriefing?C.faint:C.blue)+';background:transparent;border:1px solid '+(S.marketBriefing?C.border:'#1B2A44')+';border-radius:4px;padding:4px 10px;cursor:'+(S.marketBriefing?'default':'pointer')+';">'+(S.marketBriefing?'✦ THINKING…':'✦ BRIEF')+'</button></div>'+
+    '<div style="display:flex;gap:8px;flex-wrap:wrap;">'+(gauges||'<span style="font-size:11px;color:'+C.faint+';">gauges loading…</span>')+'</div>'+
+    brief+
+  '</div>';
+}
+async function loadMarket(){ try{ M.gauges = await jget('/api/market'); }catch(e){} }
+async function marketBrief(){
+  try{
+    const r=await japi('POST','/api/market/brief');
+    if(!r.started){ toast('Market brief unavailable'); return; }
+    S.marketBriefing=true; toast('AI reading the market…'); render();
+    for(let i=0;i<20;i++){ await new Promise(res=>setTimeout(res,3000)); let a={}; try{ a=await jget('/api/analyst'); }catch(e){} if(a && !a.running) break; }
+    await loadMarket(); S.marketBriefing=false; toast('MARKET BRIEF READY'); render();
+  }catch(e){ S.marketBriefing=false; toast(e.message); render(); }
+}
+
 function overviewView(){
   const head=M.briefingHead?('<span style="font-size:10px;color:'+C.label+';">'+esc(M.briefingHead)+'</span>'):'';
   let html='<div style="margin:14px 16px 0;background:linear-gradient(135deg,#0B1018,#0B0E13);border:1px solid #1B2A44;border-radius:6px;overflow:hidden;">'+
@@ -633,6 +673,7 @@ function overviewView(){
       '<span style="margin-left:auto;font-size:9.5px;color:'+C.faint+';">'+(S.briefOpen?'click to collapse':'click to expand')+'</span></button>'+
     (S.briefOpen?'<div style="padding:2px 16px 14px 35px;font-size:12.5px;line-height:1.6;color:'+C.body+';max-width:940px;">'+aiSummaryCard()+mdToHtml(mdStripSummary(M.briefing))+'</div>':'')+
   '</div>';
+  html += marketSection();
   html += '<div style="padding:14px 16px;border-bottom:1px solid '+C.border+';">'+
     '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;"><span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">EQUITY CURVE <span style="color:'+C.faint+';">· VS SPY · DEPOSITED</span></span>'+
     '<button data-act="expand" data-arg="equity" title="expand chart" style="font-family:inherit;font-size:11px;color:'+C.label+';background:transparent;border:1px solid #1A212B;border-radius:3px;padding:2px 7px;cursor:pointer;">⤢</button></div>'+
@@ -1340,6 +1381,7 @@ async function act(name, arg){
     case 'setAggr': { const [k,l]=arg.split(':'); setAggr(k,l); break; }
     case 'stageIdea': { const i=arg.lastIndexOf(':'); stageIdea(arg.slice(0,i), arg.slice(i+1)); break; }
     case 'analyzeIdeas': analyzeIdeas(); break;
+    case 'marketBrief': marketBrief(); break;
     case 'dismissAlert': try{ await japi('POST','/api/alerts/'+arg+'/dismiss'); await refreshSilent(); }catch(e){ toast(e.message); } break;
     case 'rearmAlert': try{ await japi('POST','/api/alerts/'+arg+'/rearm'); await refreshSilent(); }catch(e){ toast(e.message); } break;
     case 'reviewAlert': { const a=M.alerts.find(x=>x.id==arg); if(a&&a.draft){ if(addToBasket(a.draft.side,a.sym,a.draft.qty,a.draft.order_type,a.draft.limit_price)) toast('STAGED '+a.sym+' FROM ALERT → ticket basket'); render(); } break; }
