@@ -157,7 +157,7 @@ const M = {
   market:'closed', liveFeed:false, tradingEnabled:false,
   paperCash:null, paperEquity:null, paperBuyingPower:null, paperPositions:{},
   positions:[], watchlist:[], alerts:[], orders:[], txns:[], recs:[], track:{favorable:0,tested:0},
-  watchlists:[], wlActive:null, wlMembers:[],
+  watchlists:[], wlActive:null, wlMembers:[], screenerSettings:{stock:'balanced',etf:'balanced'}, ideas:{ideas:[],scanned:0,awaiting_data:0},
   briefing:'', briefingHead:'', analystEnabled:false, analystBackend:null, todayCost:0, budget:0,
   hist:[], metrics:{}, totals:{}, tax:null, taxYear:null, taxYears:[],
   candleCache:{}, lastPrices:{}, portfolios:[], activePortfolio:'',
@@ -784,20 +784,68 @@ function watchlistView(){
     '</div></div>'+
   '<div style="display:grid;grid-template-columns:'+cols+';gap:10px;padding:8px 16px;font-size:9.5px;letter-spacing:0.5px;color:'+C.label+';border-bottom:1px solid '+C.border+';"><div>SYMBOL</div><div style="text-align:right;">PRICE</div><div style="text-align:right;">DAY</div><div>SIGNALS</div><div></div></div>';
   html += (M.wlMembers&&M.wlMembers.length) ? memberRows : '<div style="padding:22px 16px;text-align:center;color:'+C.faint+';font-size:11px;">empty list — paste some symbols above to start tracking them</div>';
+  html += marketIdeasSection();
+  return html;
+}
+// Aggressiveness toggle for one equity type (stock|etf).
+function aggrToggle(kind){
+  const cur=(M.screenerSettings&&M.screenerSettings[kind])||'balanced';
+  const opt=(lvl,label)=>{ const on=cur===lvl;
+    return '<button data-act="setAggr" data-arg="'+kind+':'+lvl+'" style="font-family:inherit;font-size:9px;letter-spacing:0.5px;color:'+(on?C.bg:C.label)+';background:'+(on?C.amber:'transparent')+';border:1px solid '+(on?C.amber:'#1A212B')+';padding:3px 8px;cursor:pointer;">'+label+'</button>'; };
+  return '<span style="font-size:9px;letter-spacing:0.5px;color:'+C.faint+';margin-right:4px;">'+kind.toUpperCase()+'</span><span style="display:inline-flex;border-radius:4px;overflow:hidden;margin-right:14px;">'+opt('conservative','CONS')+opt('balanced','BAL')+opt('aggressive','AGGR')+'</span>';
+}
+// Ranked buy/sell candidates screened from the active list, signal-grounded.
+function marketIdeasSection(){
+  const d=M.ideas||{ideas:[],scanned:0,awaiting_data:0};
+  const ideas=d.ideas||[];
+  const note=(d.awaiting_data?(' · '+d.awaiting_data+' awaiting price history'):'');
+  let html='<div style="margin-top:18px;padding:12px 16px;border-top:1px solid '+C.border+';border-bottom:1px solid '+C.border+';background:'+C.panel2+';display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'+
+    '<span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">MARKET IDEAS'+(ideas.length?' <span style="color:'+C.amber+';">'+ideas.length+'</span>':'')+'</span>'+
+    '<span style="font-size:9.5px;color:'+C.faint+';">scanned '+(d.scanned||0)+note+'</span>'+
+    '<span style="margin-left:auto;display:flex;align-items:center;">'+aggrToggle('stock')+aggrToggle('etf')+'</span>'+
+  '</div>'+
+  '<div style="padding:6px 16px 4px;font-size:10px;color:'+C.faint+';line-height:1.5;">Signal-ranked candidates from this list — deterministic, not fabricated. Higher score = stronger setup. STAGE routes through the paper ticket.</div>';
+  if(!ideas.length){
+    html+='<div style="padding:18px 16px;text-align:center;color:'+C.faint+';font-size:11.5px;">no setups at this aggressiveness — try AGGR, or add more symbols.</div>';
+    return html;
+  }
+  const cols='0.5fr 0.95fr 2.4fr 0.7fr';
+  html+=ideas.map(it=>{ const buy=it.action==='buy'; const reasons=(it.reasons||[]).map(r=>esc(r)).join(' · ');
+    return '<div style="display:grid;grid-template-columns:'+cols+';gap:10px;align-items:center;padding:9px 16px;border-bottom:1px solid '+C.hairline+';font-size:12px;">'+
+      '<div><span style="font-size:9px;font-weight:700;letter-spacing:0.5px;color:'+(buy?UP:DN)+';border:1px solid '+(buy?UP:DN)+';border-radius:3px;padding:2px 6px;">'+(buy?'BUY':'SELL')+'</span></div>'+
+      '<div style="font-weight:600;color:'+C.bright+';">'+esc(it.symbol)+' <span title="screener score" style="font-size:9px;color:'+C.faint+';">'+esc(String(it.score))+'</span></div>'+
+      '<div style="color:'+C.body+';line-height:1.4;">'+reasons+'</div>'+
+      '<div style="text-align:right;"><button data-act="stageIdea" data-arg="'+esc(it.symbol)+':'+it.action+'" title="Stage a PAPER '+it.action+' of '+esc(it.symbol)+'" style="font-family:inherit;font-size:9.5px;font-weight:600;color:'+(buy?UP:DN)+';background:'+(buy?'rgba(47,191,113,0.1)':'rgba(255,92,87,0.1)')+';border:1px solid '+(buy?'rgba(47,191,113,0.35)':'rgba(255,92,87,0.35)')+';border-radius:3px;padding:4px 9px;cursor:pointer;white-space:nowrap;">STAGE '+(buy?'BUY':'SELL')+'</button></div>'+
+    '</div>';
+  }).join('');
   return html;
 }
 async function loadWatchlists(){
   try{
     const lists = await jget('/api/watchlists'); M.watchlists = lists||[];
     if(!M.watchlists.some(l=>l.id===M.wlActive)) M.wlActive = M.watchlists[0]?M.watchlists[0].id:null;
-    await loadWlMembers();
+    await loadWlMembers(); await loadScreener();
   }catch(e){}
 }
 async function loadWlMembers(){
   if(M.wlActive==null){ M.wlMembers=[]; return; }
   try{ M.wlMembers = await jget('/api/watchlists/'+M.wlActive)||[]; }catch(e){ M.wlMembers=[]; }
 }
-async function selectWatchlist(id){ M.wlActive=id; await loadWlMembers(); render(); }
+async function loadScreener(){
+  try{ M.screenerSettings = await jget('/api/screener/settings'); }catch(e){}
+  if(M.wlActive==null){ M.ideas={ideas:[],scanned:0,awaiting_data:0}; return; }
+  try{ M.ideas = await jget('/api/screener/'+M.wlActive); }catch(e){ M.ideas={ideas:[],scanned:0,awaiting_data:0}; }
+}
+async function selectWatchlist(id){ M.wlActive=id; await loadWlMembers(); await loadScreener(); render(); }
+async function setAggr(kind, level){
+  const next=Object.assign({stock:'balanced',etf:'balanced'}, M.screenerSettings); next[kind]=level;
+  try{ M.screenerSettings = await japi('PUT','/api/screener/settings', next); await loadScreener(); render(); }
+  catch(e){ toast(e.message); }
+}
+function stageIdea(sym, action){
+  const side=action==='buy'?'buy':'sell';
+  if(addToBasket(side, sym, 5, 'market')) toast('STAGED '+side.toUpperCase()+' '+sym+' → ticket basket'); render();
+}
 async function wlAddSymbols(){
   if(M.wlActive==null){ toast('No list selected'); return; }
   const text=(S.wlAddText||'').trim();
@@ -1266,6 +1314,8 @@ async function act(name, arg){
     case 'wlRemoveSym': wlRemoveSym(arg); break;
     case 'wlNewList': wlNewList(); break;
     case 'wlDeleteList': wlDeleteList(+arg); break;
+    case 'setAggr': { const [k,l]=arg.split(':'); setAggr(k,l); break; }
+    case 'stageIdea': { const i=arg.lastIndexOf(':'); stageIdea(arg.slice(0,i), arg.slice(i+1)); break; }
     case 'dismissAlert': try{ await japi('POST','/api/alerts/'+arg+'/dismiss'); await refreshSilent(); }catch(e){ toast(e.message); } break;
     case 'rearmAlert': try{ await japi('POST','/api/alerts/'+arg+'/rearm'); await refreshSilent(); }catch(e){ toast(e.message); } break;
     case 'reviewAlert': { const a=M.alerts.find(x=>x.id==arg); if(a&&a.draft){ if(addToBasket(a.draft.side,a.sym,a.draft.qty,a.draft.order_type,a.draft.limit_price)) toast('STAGED '+a.sym+' FROM ALERT → ticket basket'); render(); } break; }
