@@ -104,7 +104,7 @@ pub async fn scored_candidates(
             });
         }
     }
-    scored.sort_by(|a, b| b.candidate.score.cmp(&a.candidate.score));
+    scored.sort_by_key(|b| std::cmp::Reverse(b.candidate.score));
     Ok((scored, scanned, awaiting_data))
 }
 
