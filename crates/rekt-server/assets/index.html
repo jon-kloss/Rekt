@@ -139,7 +139,7 @@ function mdStripSummary(src){
 }
 
 //================================================================ state + data store
-const VIEWS = ['overview','positions','performance','analyst','alerts','blotter','taxes','ledger'];
+const VIEWS = ['overview','positions','performance','analyst','watchlist','alerts','blotter','taxes','ledger'];
 const S = {
   view:'positions', selSym:null, cmd:'', showHelp:false, expanded:null, candleRange:'6m',
   briefOpen:true, hoverIdx:null, eqHoverIdx:null, toast:'', halted:false, dockOpen:true, confirmDelTx:null, switching:'',
@@ -147,6 +147,7 @@ const S = {
   importOpen:false, importFmt:'generic', importText:'', importPreview:null, importErr:'', importBusy:false,
   manageOpen:false, confirmDelPf:null,
   newAlert:{sym:'',cond:'price_below',thr:'',note:''},
+  wlAddText:'',
 };
 // M holds the latest server-derived data the views render from.
 const M = {
@@ -154,6 +155,7 @@ const M = {
   market:'closed', liveFeed:false, tradingEnabled:false,
   paperCash:null, paperEquity:null, paperBuyingPower:null, paperPositions:{},
   positions:[], watchlist:[], alerts:[], orders:[], txns:[], recs:[], track:{favorable:0,tested:0},
+  watchlists:[], wlActive:null, wlMembers:[],
   briefing:'', briefingHead:'', analystEnabled:false, analystBackend:null, todayCost:0, budget:0,
   hist:[], metrics:{}, totals:{}, tax:null, taxYear:null, taxYears:[],
   candleCache:{}, lastPrices:{}, portfolios:[], activePortfolio:'',
@@ -241,6 +243,7 @@ async function loadAll(){
     applyPortfolio(pf); applyHistory(hist); applyAnalyst(an); applyOrders(ords); applyTxns(txns);
     try { applyTax(await jget('/api/taxes' + (M.taxYear?('?year='+M.taxYear):''))); } catch(e){}
     try { const pl=await jget('/api/portfolios'); M.portfolios=pl.portfolios||[]; M.activePortfolio=pl.active||M.activePortfolio; } catch(e){}
+    await loadWatchlists();
     M.ready = true; render();
   } catch(e){ console.error(e); toast('LOAD FAILED — is the server up?'); }
 }
@@ -451,7 +454,7 @@ function fillMarkers(sym, arr){
 
 //================================================================ RENDER
 function navTabs(){
-  const labels={ overview:'OVERVIEW',positions:'POSITIONS',performance:'PERF',analyst:'AI',alerts:'ALERTS',blotter:'BLOTTER',taxes:'TAX',ledger:'LEDGER' };
+  const labels={ overview:'OVERVIEW',positions:'POSITIONS',performance:'PERF',analyst:'AI',watchlist:'WATCH',alerts:'ALERTS',blotter:'BLOTTER',taxes:'TAX',ledger:'LEDGER' };
   return VIEWS.map((k,i)=>{ const on=S.view===k;
     return '<button role="tab" aria-selected="'+on+'" data-act="view" data-arg="'+k+'" style="font-family:inherit;font-size:11px;letter-spacing:0.5px;color:'+(on?C.bg:C.label)+';background:'+(on?C.amber:'transparent')+';border:none;padding:5px 11px;border-radius:3px;cursor:pointer;">'+(i+1)+' '+labels[k]+'</button>';
   }).join('');
@@ -744,6 +747,83 @@ function alertCreateForm(){
   '</div>';
 }
 
+// Named watchlists: themed universes the user curates; each will become a
+// screening source for AI market ideas. Live price/signals are looked up from
+// the union snapshot (M.watchlist), which already carries every member.
+function watchlistView(){
+  const lists = M.watchlists||[];
+  const active = M.wlActive;
+  const picker = lists.map(l=>{ const on=l.id===active;
+    return '<button data-act="wlSelect" data-arg="'+l.id+'" style="font-family:inherit;font-size:10.5px;letter-spacing:0.5px;color:'+(on?C.bg:C.body)+';background:'+(on?C.amber:'transparent')+';border:1px solid '+(on?C.amber:C.border)+';border-radius:4px;padding:5px 12px;cursor:pointer;white-space:nowrap;">'+esc(l.name)+' <span style="opacity:0.7;">'+l.count+'</span></button>';
+  }).join('');
+  const cols='1fr 0.8fr 0.8fr 1.6fr 0.5fr';
+  const memberRows = (M.wlMembers||[]).map(sym=>{
+    const w = M.watchlist.find(x=>x.sym===sym) || {};
+    const sigs = sigBadges(w.signals).map(b=>'<span title="'+esc(b.title)+'" style="white-space:nowrap;font-size:9px;color:'+b.color+';border:1px solid '+b.color+';opacity:0.9;padding:1px 5px;border-radius:3px;">'+esc(b.text)+'</span>').join('');
+    const chg = (has(w.price)&&has(w.prevClose)&&w.prevClose)?((num(w.price)-num(w.prevClose))/num(w.prevClose)*100):null;
+    return '<div style="display:grid;grid-template-columns:'+cols+';gap:10px;align-items:center;padding:9px 16px;border-bottom:1px solid '+C.hairline+';font-size:12px;font-variant-numeric:tabular-nums;">'+
+      '<div style="font-weight:600;color:'+C.bright+';">'+esc(sym)+'</div>'+
+      '<div style="text-align:right;color:'+C.body+';">'+(has(w.price)?money(w.price):'—')+'</div>'+
+      '<div style="text-align:right;color:'+(chg==null?C.label:dirColor(chg))+';">'+(chg==null?'—':signedPct(chg))+'</div>'+
+      '<div style="display:flex;gap:4px;flex-wrap:wrap;">'+sigs+'</div>'+
+      '<div style="text-align:right;"><button data-act="wlRemoveSym" data-arg="'+esc(sym)+'" aria-label="Remove from list" title="Remove from list" style="background:none;border:1px solid #1A212B;color:'+DN+';cursor:pointer;font-size:10px;padding:3px 7px;border-radius:3px;">✕</button></div>'+
+    '</div>';
+  }).join('');
+  let html = '<div style="padding:12px 16px;border-bottom:1px solid '+C.border+';display:flex;align-items:center;gap:8px;flex-wrap:wrap;">'+
+    picker +
+    '<button data-act="wlNewList" title="New watchlist" style="font-family:inherit;font-size:10.5px;color:'+UP+';background:transparent;border:1px dashed rgba(47,191,113,0.45);border-radius:4px;padding:5px 10px;cursor:pointer;">＋ LIST</button>'+
+    (lists.length>1?'<button data-act="wlDeleteList" data-arg="'+active+'" title="Delete this list" style="margin-left:auto;font-family:inherit;font-size:10px;color:'+DN+';background:transparent;border:1px solid #1A212B;border-radius:4px;padding:5px 10px;cursor:pointer;">DELETE LIST</button>':'')+
+  '</div>'+
+  '<div style="padding:14px 16px;border-bottom:1px solid '+C.border+';background:'+C.panel2+';">'+
+    '<div style="font-size:9.5px;letter-spacing:1px;color:'+C.label+';margin-bottom:6px;">ADD SYMBOLS — paste as many as you like (comma, space, or newline separated)</div>'+
+    '<div style="display:flex;gap:8px;align-items:flex-start;">'+
+      '<textarea id="wlAdd" placeholder="NVDA, MSFT, GOOGL  AAPL AMZN" style="flex:1;height:52px;resize:vertical;background:'+C.bg+';border:1px solid '+C.border+';border-radius:4px;color:'+C.bright+';font-family:inherit;font-size:12.5px;padding:8px 10px;outline:none;box-sizing:border-box;">'+esc(S.wlAddText||'')+'</textarea>'+
+      '<button data-act="wlAddSymbols" style="font-family:inherit;font-size:11px;font-weight:600;color:'+C.bg+';background:'+C.amber+';border:none;border-radius:4px;padding:10px 16px;cursor:pointer;white-space:nowrap;">＋ ADD</button>'+
+    '</div></div>'+
+  '<div style="display:grid;grid-template-columns:'+cols+';gap:10px;padding:8px 16px;font-size:9.5px;letter-spacing:0.5px;color:'+C.label+';border-bottom:1px solid '+C.border+';"><div>SYMBOL</div><div style="text-align:right;">PRICE</div><div style="text-align:right;">DAY</div><div>SIGNALS</div><div></div></div>';
+  html += (M.wlMembers&&M.wlMembers.length) ? memberRows : '<div style="padding:22px 16px;text-align:center;color:'+C.faint+';font-size:11px;">empty list — paste some symbols above to start tracking them</div>';
+  return html;
+}
+async function loadWatchlists(){
+  try{
+    const lists = await jget('/api/watchlists'); M.watchlists = lists||[];
+    if(!M.watchlists.some(l=>l.id===M.wlActive)) M.wlActive = M.watchlists[0]?M.watchlists[0].id:null;
+    await loadWlMembers();
+  }catch(e){}
+}
+async function loadWlMembers(){
+  if(M.wlActive==null){ M.wlMembers=[]; return; }
+  try{ M.wlMembers = await jget('/api/watchlists/'+M.wlActive)||[]; }catch(e){ M.wlMembers=[]; }
+}
+async function selectWatchlist(id){ M.wlActive=id; await loadWlMembers(); render(); }
+async function wlAddSymbols(){
+  if(M.wlActive==null){ toast('No list selected'); return; }
+  const text=(S.wlAddText||'').trim();
+  if(!text){ toast('Paste some symbols first'); return; }
+  try{
+    const r = await japi('POST','/api/watchlists/'+M.wlActive+'/symbols',{symbols:text});
+    S.wlAddText='';
+    toast('ADDED '+r.added+(r.invalid&&r.invalid.length?(' · skipped '+r.invalid.length+' invalid'):''));
+    await loadWatchlists();
+    render();
+  }catch(e){ toast(e.message); render(); }
+}
+async function wlNewList(){
+  const name=(window.prompt('Name for the new watchlist:')||'').trim();
+  if(!name) return;
+  try{ const r=await japi('POST','/api/watchlists',{name}); M.wlActive=r.id; await loadWatchlists(); toast('CREATED "'+name+'"'); render(); }
+  catch(e){ toast(e.message); render(); }
+}
+async function wlDeleteList(id){
+  try{ await japi('DELETE','/api/watchlists/'+id); M.wlActive=null; await loadWatchlists(); toast('LIST DELETED'); render(); }
+  catch(e){ toast(e.message); render(); }
+}
+async function wlRemoveSym(sym){
+  if(M.wlActive==null) return;
+  try{ await japi('DELETE','/api/watchlists/'+M.wlActive+'/symbols/'+encodeURIComponent(sym)); await loadWatchlists(); render(); }
+  catch(e){ toast(e.message); render(); }
+}
+
 function alertsView(){
   const cols='1.4fr 0.8fr 1.2fr 1.5fr 1.3fr 0.5fr';
   const CL={ price_below:'≤ $',price_above:'≥ $',drawdown_above:'DD ≥ ' };
@@ -1009,6 +1089,7 @@ function viewBody(){
     case 'positions': return positionsView();
     case 'performance': return perfView();
     case 'analyst': return analystView();
+    case 'watchlist': return watchlistView();
     case 'alerts': return alertsView();
     case 'blotter': return blotterView();
     case 'taxes': return taxesView();
@@ -1054,7 +1135,7 @@ function render(){
     '<footer style="display:flex;align-items:center;gap:16px;padding:6px 14px;border-top:1px solid '+C.border+';background:'+C.panel2+';flex-shrink:0;font-size:10.5px;color:'+C.label+';">'+
       '<span style="color:'+(M.tradingEnabled?UP:C.label)+';">● '+(M.tradingEnabled?'RECONCILED':'TRACK-ONLY')+'</span>'+
       '<span>'+(M.liveFeed?'FEED LIVE':'FEED IDLE')+'</span><span style="color:'+C.faint+';">|</span>'+
-      '<span><span style="color:'+C.body+';">/</span> command</span><span><span style="color:'+C.body+';">B/S</span> side</span><span><span style="color:'+C.body+';">T</span> ticket</span><span><span style="color:'+C.body+';">1–8</span> views</span><span><span style="color:'+C.body+';">↑↓</span> select</span><span><span style="color:'+C.body+';">↵</span> load ticket</span>'+
+      '<span><span style="color:'+C.body+';">/</span> command</span><span><span style="color:'+C.body+';">B/S</span> side</span><span><span style="color:'+C.body+';">T</span> ticket</span><span><span style="color:'+C.body+';">1–9</span> views</span><span><span style="color:'+C.body+';">↑↓</span> select</span><span><span style="color:'+C.body+';">↵</span> load ticket</span>'+
       '<button data-act="help" style="margin-left:auto;font-family:inherit;font-size:10.5px;color:'+C.label+';background:transparent;border:1px solid #1A212B;border-radius:3px;padding:3px 9px;cursor:pointer;">? shortcuts</button>'+
     '</footer>'+
   '</div>'+ overlays();
@@ -1178,6 +1259,11 @@ async function act(name, arg){
     case 'halt': try{ await japi('POST','/api/trading/pause',{ paused:!S.halted }); S.halted=!S.halted; toast(S.halted?'TRADING HALTED':'TRADING RESUMED'); render(); }catch(e){ toast('FAILED: '+e.message); } break;
     case 'createAlert': createAlert(); break;
     case 'deleteAlert': try{ await japi('DELETE','/api/alerts/'+arg); toast('ALERT DELETED'); await refreshSilent(); }catch(e){ toast(e.message); } break;
+    case 'wlSelect': selectWatchlist(+arg); break;
+    case 'wlAddSymbols': wlAddSymbols(); break;
+    case 'wlRemoveSym': wlRemoveSym(arg); break;
+    case 'wlNewList': wlNewList(); break;
+    case 'wlDeleteList': wlDeleteList(+arg); break;
     case 'dismissAlert': try{ await japi('POST','/api/alerts/'+arg+'/dismiss'); await refreshSilent(); }catch(e){ toast(e.message); } break;
     case 'rearmAlert': try{ await japi('POST','/api/alerts/'+arg+'/rearm'); await refreshSilent(); }catch(e){ toast(e.message); } break;
     case 'reviewAlert': { const a=M.alerts.find(x=>x.id==arg); if(a&&a.draft){ if(addToBasket(a.draft.side,a.sym,a.draft.qty,a.draft.order_type,a.draft.limit_price)) toast('STAGED '+a.sym+' FROM ALERT → ticket basket'); render(); } break; }
@@ -1310,6 +1396,7 @@ document.addEventListener('input', (e)=>{
   if(id==='tQty'){ S.tQty=e.target.value; patchTicket(); return; }
   if(id==='tLimit'){ S.tLimit=e.target.value; patchTicket(); return; }
   if(id==='importtext'){ S.importText=e.target.value; if(S.importPreview){ S.importPreview=null; render(); } return; } // editing invalidates a prior preview
+  if(id==='wlAdd'){ S.wlAddText=e.target.value; return; }
   if(id==='alSym'){ S.newAlert.sym=e.target.value.toUpperCase(); return; }
   if(id==='alThr'){ S.newAlert.thr=e.target.value; return; }
   if(id==='alNote'){ S.newAlert.note=e.target.value; return; }

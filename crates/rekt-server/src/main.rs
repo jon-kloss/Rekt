@@ -89,6 +89,22 @@ fn app(state: AppState) -> Router {
         )
         .route("/api/watchlist/{symbol}", delete(api::watchlist_remove))
         .route(
+            "/api/watchlists",
+            get(api::watchlists_list).post(api::watchlist_create),
+        )
+        .route(
+            "/api/watchlists/{id}",
+            get(api::watchlist_member_list).delete(api::watchlist_delete),
+        )
+        .route(
+            "/api/watchlists/{id}/symbols",
+            post(api::watchlist_add_symbols),
+        )
+        .route(
+            "/api/watchlists/{id}/symbols/{symbol}",
+            delete(api::watchlist_remove_symbol),
+        )
+        .route(
             "/api/alerts",
             get(alerts::list_alerts).post(alerts::create_alert),
         )
@@ -1543,6 +1559,90 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (_, snapshot) = request(state, "GET", "/api/portfolio", None).await;
         assert!(snapshot["watchlist"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn named_watchlists_crud_and_bulk_add() {
+        let state = test_state().await;
+
+        // A default list exists out of the box.
+        let (_, lists) = request(state.clone(), "GET", "/api/watchlists", None).await;
+        assert_eq!(lists.as_array().unwrap().len(), 1);
+        assert_eq!(lists[0]["name"], "Watchlist");
+
+        // Create a themed list.
+        let (status, created) = request(
+            state.clone(),
+            "POST",
+            "/api/watchlists",
+            Some(serde_json::json!({ "name": "AI" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = created["id"].as_i64().unwrap();
+        // Duplicate name (case-insensitive) is refused.
+        let (status, _) = request(
+            state.clone(),
+            "POST",
+            "/api/watchlists",
+            Some(serde_json::json!({ "name": "ai" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // Bulk add: comma / whitespace / newline mixed, dupes + junk tolerated.
+        let (status, res) = request(
+            state.clone(),
+            "POST",
+            &format!("/api/watchlists/{id}/symbols"),
+            Some(serde_json::json!({ "symbols": "nvda, MSFT\ngoogl  nvda  !!bad" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(res["added"], 3, "{res}"); // NVDA, MSFT, GOOGL (nvda deduped)
+        assert_eq!(res["invalid"], serde_json::json!(["!!BAD"]), "{res}");
+
+        // Members come back uppercased + alphabetical.
+        let (_, members) =
+            request(state.clone(), "GET", &format!("/api/watchlists/{id}"), None).await;
+        assert_eq!(members, serde_json::json!(["GOOGL", "MSFT", "NVDA"]));
+        // And they join the global union (stream subs / signals).
+        let (_, all) = request(state.clone(), "GET", "/api/watchlist", None).await;
+        assert_eq!(all.as_array().unwrap().len(), 3);
+
+        // Remove one member.
+        let (status, _) = request(
+            state.clone(),
+            "DELETE",
+            &format!("/api/watchlists/{id}/symbols/MSFT"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, members) =
+            request(state.clone(), "GET", &format!("/api/watchlists/{id}"), None).await;
+        assert_eq!(members, serde_json::json!(["GOOGL", "NVDA"]));
+
+        // Delete the themed list (default remains, so it's allowed).
+        let (status, _) = request(
+            state.clone(),
+            "DELETE",
+            &format!("/api/watchlists/{id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        // The last remaining list can't be deleted.
+        let (_, lists) = request(state.clone(), "GET", "/api/watchlists", None).await;
+        let last = lists[0]["id"].as_i64().unwrap();
+        let (status, _) = request(
+            state.clone(),
+            "DELETE",
+            &format!("/api/watchlists/{last}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 
     #[tokio::test]
