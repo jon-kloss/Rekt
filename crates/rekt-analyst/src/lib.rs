@@ -389,6 +389,147 @@ impl Transport for CliTransport {
     }
 }
 
+/// Transport that drives the analyst through a LOCAL Ollama server
+/// (`http://localhost:11434`) — zero-cost, private, offline after one
+/// `ollama pull`. Tool-less like the CLI: the server injects context into the
+/// prompt and parses the JSON back out. The deterministic screener does the
+/// hard part, so even a small local model is enough to narrate candidates.
+pub struct OllamaTransport {
+    client: reqwest::Client,
+    base_url: String,
+    model: String,
+}
+
+impl OllamaTransport {
+    pub fn new(base_url: String, model: String) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(600))
+                .build()
+                .expect("reqwest client"),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            model,
+        }
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Probe Ollama and resolve the configured model to an EXACT pulled tag,
+    /// returning the transport ready to use — or `None` if Ollama is
+    /// unreachable or the model isn't pulled (so the analyst degrades honestly
+    /// instead of failing every run). Resolving the exact tag matters: a bare
+    /// `llama3.1` passed to `/api/chat` can 404 when only `llama3.1:8b` is
+    /// pulled, even though `/api/tags` lists it.
+    pub async fn resolve(mut self) -> Option<Self> {
+        let resp = self
+            .client
+            .get(format!("{}/api/tags", self.base_url))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let v = resp.json::<serde_json::Value>().await.ok()?;
+        // Prefer an exact name match; else the first variant of the family
+        // (so a configured `llama3.1` resolves to the pulled `llama3.1:8b`).
+        let want = self
+            .model
+            .split(':')
+            .next()
+            .unwrap_or(&self.model)
+            .to_string();
+        let exact = v["models"].as_array()?.iter().find_map(|m| {
+            let n = m["name"].as_str()?;
+            (n == self.model || n.split(':').next() == Some(want.as_str())).then(|| n.to_string())
+        })?;
+        self.model = exact;
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl Transport for OllamaTransport {
+    async fn send(&self, request: &serde_json::Value) -> Result<MessageResponse, AnalystError> {
+        let system = request["system"]
+            .get(0)
+            .and_then(|s| s["text"].as_str())
+            .unwrap_or("");
+        // Tool-less runs carry a single user turn whose content is a string.
+        let prompt = request["messages"]
+            .as_array()
+            .map(|msgs| {
+                msgs.iter()
+                    .filter(|m| m["role"] == "user")
+                    .filter_map(|m| m["content"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            })
+            .unwrap_or_default();
+        let mut messages = Vec::new();
+        if !system.is_empty() {
+            messages.push(serde_json::json!({"role": "system", "content": system}));
+        }
+        messages.push(serde_json::json!({"role": "user", "content": prompt}));
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": messages,
+            "stream": false,
+        });
+
+        tracing::debug!(model = %self.model, "POST ollama /api/chat");
+        let resp = self
+            .client
+            .post(format!("{}/api/chat", self.base_url))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AnalystError::Network(format!("ollama unreachable: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let msg: String = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(300)
+                .collect();
+            return Err(AnalystError::Api {
+                status: status.as_u16(),
+                message: format!("ollama: {msg}"),
+            });
+        }
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| AnalystError::BadResponse(format!("ollama response not JSON: {e}")))?;
+        Ok(parse_ollama_chat(&v))
+    }
+}
+
+/// Map an Ollama `/api/chat` response into a [`MessageResponse`]. Factored out
+/// so it's unit-testable without a running Ollama. Cost is $0 (local).
+fn parse_ollama_chat(v: &serde_json::Value) -> MessageResponse {
+    let text = v["message"]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let usage = Usage {
+        input_tokens: v["prompt_eval_count"].as_u64().unwrap_or(0),
+        output_tokens: v["eval_count"].as_u64().unwrap_or(0),
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
+    };
+    MessageResponse {
+        content: vec![serde_json::json!({ "type": "text", "text": text })],
+        stop_reason: Some("end_turn".to_string()),
+        usage,
+    }
+}
+
 /// Read-only data the analyst may ask for. Implemented by the server over
 /// its own caches/DB; nothing in this trait can mutate anything.
 #[async_trait]
@@ -457,5 +598,22 @@ mod tests {
             Err(AnalystError::Api { .. })
         ));
         assert!(parse_cli_output("not json").is_err());
+    }
+
+    #[test]
+    fn ollama_chat_parses_message_and_token_counts() {
+        // Captured shape of Ollama's POST /api/chat (stream:false).
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"model":"llama3.2","message":{"role":"assistant","content":"MSFT is oversold."},
+                "done":true,"prompt_eval_count":120,"eval_count":35}"#,
+        )
+        .unwrap();
+        let resp = parse_ollama_chat(&v);
+        assert_eq!(resp.text(), "MSFT is oversold.");
+        assert_eq!(resp.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(resp.usage.input_tokens, 120);
+        assert_eq!(resp.usage.output_tokens, 35);
+        // A malformed/empty response degrades to empty text, never panics.
+        assert_eq!(parse_ollama_chat(&serde_json::json!({})).text(), "");
     }
 }

@@ -434,9 +434,14 @@ pub async fn run_analysis(state: AppState, id: i64, kind: String, question: Opti
     let _running = RunningGuard(state.analyst_running.clone());
 
     match run_analysis_inner(&state, &kind, question.as_deref()).await {
-        Ok((outcome, model)) => {
+        Ok((outcome, model, allowlist)) => {
             let tool_log = serde_json::to_string(&outcome.tool_log).ok();
-            let cost = pricing::cost_usd(model, &outcome.usage);
+            // Ollama runs locally and bills nothing.
+            let cost = if state.analyst_backend == "ollama" {
+                Decimal::ZERO
+            } else {
+                pricing::cost_usd(model, &outcome.usage)
+            };
             // The weekly review answers in structured JSON; split it into
             // the report + persisted recommendations. Both backends produce
             // the same shape — the HTTP one via the API's output schema, the
@@ -444,10 +449,19 @@ pub async fn run_analysis(state: AppState, id: i64, kind: String, question: Opti
             // tolerates fences/prose the CLI may add). A parse failure is an
             // honest error (with the tokens we PAID for still accounted),
             // never a silently-mangled report.
-            let (report, error): (String, Option<String>) = if kind == "weekly_review" {
+            let (report, error): (String, Option<String>) = if kind == "weekly_review"
+                || kind == "market_ideas"
+            {
                 match extract_json_object(&outcome.text) {
                     Some(parsed) => {
-                        store_recommendations(&state, id, &parsed).await;
+                        // market_ideas is GROUNDED: persist only recs the
+                        // screener actually surfaced, with the screen's
+                        // action — the AI can't add or flip names.
+                        if kind == "market_ideas" {
+                            store_grounded_recommendations(&state, id, &parsed, &allowlist).await;
+                        } else {
+                            store_recommendations(&state, id, &parsed).await;
+                        }
                         (
                             parsed["report_md"]
                                 .as_str()
@@ -492,7 +506,11 @@ pub async fn run_analysis(state: AppState, id: i64, kind: String, question: Opti
                 output_tokens: failure.usage.output_tokens as i64,
                 cache_read_tokens: failure.usage.cache_read_tokens as i64,
                 cache_write_tokens: failure.usage.cache_write_tokens as i64,
-                cost_usd: pricing::cost_usd(failure.model, &failure.usage),
+                cost_usd: if state.analyst_backend == "ollama" {
+                    Decimal::ZERO
+                } else {
+                    pricing::cost_usd(failure.model, &failure.usage)
+                },
                 report_md: None,
                 tool_log_json: tool_log.as_deref(),
                 error: Some(&failure.message),
@@ -516,7 +534,7 @@ async fn run_analysis_inner(
     state: &AppState,
     kind: &str,
     question: Option<&str>,
-) -> Result<(RunOutcome, &'static str), RunFailureDetails> {
+) -> Result<(RunOutcome, &'static str, Vec<(String, &'static str)>), RunFailureDetails> {
     // Kind split: the BRIEFING is the inject-and-answer kind — portfolio
     // context in the user turn, NO tools, one cheap Haiku call. Review/ask
     // get the tool surface instead and fetch fresh data exactly once.
@@ -534,6 +552,35 @@ async fn run_analysis_inner(
     // Past calls and how they aged — volatile data, so it lives in the
     // user turn (after the cached prefix), never in the system prompt.
     let track = track_record(state).await;
+
+    // market_ideas screens deterministically UP FRONT: screen errors stay
+    // honest (not swallowed into an empty prompt that still bills), and the
+    // SAME candidate set drives both the prompt and the post-hoc grounding
+    // filter (so the AI can't add or flip names — the screen is authoritative).
+    let market_screen = if kind == "market_ideas" {
+        let list_id: i64 = question
+            .and_then(|q| q.parse().ok())
+            .ok_or_else(|| fail("market_ideas run missing a valid list id".into()))?;
+        let lists = repo::list_watchlists(&state.db)
+            .await
+            .map_err(|e| fail(format!("watchlist lookup failed: {e}")))?;
+        let list_name = lists
+            .iter()
+            .find(|l| l.id == list_id)
+            .map(|l| l.name.clone())
+            .ok_or_else(|| fail(format!("no watchlist {list_id}")))?;
+        let (scored, _, _) = crate::screener::scored_candidates(state, list_id)
+            .await
+            .map_err(|e| fail(format!("screen failed: {e}")))?;
+        if scored.is_empty() {
+            return Err(fail(
+                "no screened candidates at run time (the screen may have changed)".into(),
+            ));
+        }
+        Some((list_name, scored))
+    } else {
+        None
+    };
 
     let (mut user_content, mut use_tools, mut server_tools, mut output_schema) = match kind {
         "briefing" => (
@@ -578,6 +625,43 @@ async fn run_analysis_inner(
             vec![json!({"type": "web_search_20260209", "name": "web_search", "max_uses": 6})],
             Some(review_schema()),
         ),
+        "market_brief" => {
+            // State-of-the-market context over deterministic index gauges —
+            // narration, not portfolio advice; no recommendations.
+            let block = crate::market::gauges_prompt_block(state).await;
+            (
+                format!(
+                    "{date}\n\n{block}\n\nWrite a SHORT state-of-the-market read (3-5 sentences): \
+                     the overall posture (risk-on / risk-off / mixed), what the indices' trend and \
+                     RSI say across broad (SPY), tech (QQQ) and small caps (IWM), and the single \
+                     thing to watch next. Ground it in the gauge facts above; plain markdown. This \
+                     is market CONTEXT — do not give portfolio or per-name trade advice.",
+                ),
+                false,
+                vec![],
+                None,
+            )
+        }
+        "market_ideas" => {
+            // Candidates were screened up front (see market_screen); the AI
+            // only narrates them.
+            let (list_name, scored) = market_screen
+                .as_ref()
+                .expect("market_screen is Some for market_ideas");
+            let block = crate::screener::candidates_prompt_block(list_name, scored);
+            (
+                format!(
+                    "{date}\n\n{track}\n\n{block}\n\nFor EACH candidate above, return a \
+                     recommendation whose `action` matches the screen and whose `rationale` is a \
+                     1-2 sentence thesis grounding the call in the listed signals plus your own \
+                     knowledge of the name. Keep `report_md` to a 2-3 sentence overview of the \
+                     batch. Do not add or drop names; do not restate the raw signal lines.",
+                ),
+                false,
+                vec![],
+                Some(review_schema()),
+            )
+        }
         _ => (
             format!(
                 "{date}\n\n{track}\n\nQuestion from the user:\n{}",
@@ -597,7 +681,9 @@ async fn run_analysis_inner(
         use_tools = false;
         server_tools = vec![];
         output_schema = None;
-        if kind != "briefing" {
+        // briefing + market_brief carry their own context in the prompt; the
+        // market brief is deliberately NOT about the user's holdings.
+        if kind != "briefing" && kind != "market_brief" {
             user_content = format!(
                 "{user_content}\n\nCurrent portfolio state:\n{}\n\n{}",
                 portfolio_context(state).await,
@@ -608,7 +694,7 @@ async fn run_analysis_inner(
         // output schema; the CLI has no such knob, so we ask for the same
         // shape in-prompt and parse it back out (see `extract_json_object`).
         // It also has no web access, so say so rather than have it pretend.
-        if kind == "weekly_review" {
+        if kind == "weekly_review" || kind == "market_ideas" {
             user_content = format!("{user_content}\n\n{}", cli_review_json_instruction());
         }
     }
@@ -637,7 +723,17 @@ async fn run_analysis_inner(
         tool_log: failure.tool_log,
         model,
     })?;
-    Ok((outcome, model))
+    // The screened (symbol, action) set — the ground truth the persisted
+    // market_ideas recs are filtered against (empty for other kinds).
+    let allowlist: Vec<(String, &'static str)> = market_screen
+        .map(|(_, scored)| {
+            scored
+                .into_iter()
+                .map(|s| (s.symbol, s.candidate.action))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((outcome, model, allowlist))
 }
 
 /// Model + max_tokens per kind — shared by the run path and the budget
@@ -646,6 +742,11 @@ fn kind_params(kind: &str) -> (&'static str, u32) {
     match kind {
         "briefing" => (BRIEFING_MODEL, 2048),
         "weekly_review" => (ANALYST_MODEL, 16000),
+        // Narrating pre-screened candidates is light work — the deterministic
+        // screener already did the hard part.
+        "market_ideas" => (ANALYST_MODEL, 6000),
+        // A short state-of-market read over the injected gauges — cheap model.
+        "market_brief" => (BRIEFING_MODEL, 1024),
         _ => (ANALYST_MODEL, 8000),
     }
 }
@@ -685,9 +786,53 @@ async fn store_recommendations(state: &AppState, analysis_id: i64, parsed: &Valu
     }
 }
 
+/// Persist market-ideas recommendations GROUNDED against the screen: a rec for
+/// a symbol the screener didn't surface is dropped, and the action is forced to
+/// the screen's (not the AI's) — so a hallucinated ticker or a flipped
+/// buy/sell can never become a tracked, stage-able recommendation.
+async fn store_grounded_recommendations(
+    state: &AppState,
+    analysis_id: i64,
+    parsed: &Value,
+    allowlist: &[(String, &'static str)],
+) {
+    let Some(recommendations) = parsed["recommendations"].as_array() else {
+        return;
+    };
+    let expires = Utc::now() + Duration::days(RECOMMENDATION_TTL_DAYS);
+    for recommendation in recommendations {
+        let raw_symbol = recommendation["symbol"].as_str().unwrap_or("");
+        let Ok(symbol) = validate_symbol(raw_symbol) else {
+            continue;
+        };
+        // The screen is authoritative: skip anything it didn't surface, and use
+        // ITS action regardless of what the model returned.
+        let Some((_, screen_action)) = allowlist.iter().find(|(s, _)| *s == symbol) else {
+            tracing::warn!(symbol, "dropping market-idea rec not in the screen");
+            continue;
+        };
+        let result = repo::insert_recommendation(
+            &state.db,
+            repo::NewRecommendation {
+                analysis_id,
+                symbol: &symbol,
+                action: screen_action,
+                sizing: recommendation["sizing"].as_str().unwrap_or(""),
+                rationale: recommendation["rationale"].as_str().unwrap_or(""),
+                confidence: recommendation["confidence"].as_str().unwrap_or(""),
+                expires_ts: expires,
+            },
+        )
+        .await;
+        if let Err(e) = result {
+            tracing::error!(error = %e, symbol, "failed to store grounded recommendation");
+        }
+    }
+}
+
 /// Gate shared by every run path: key present, nothing already running,
 /// today's spend under budget. Returns the analysis id on success.
-async fn start_run(
+pub(crate) async fn start_run(
     state: &AppState,
     kind: &str,
     question: Option<String>,
@@ -699,26 +844,30 @@ async fn start_run(
             "AI analyst disabled — set ANTHROPIC_API_KEY",
         ));
     }
-    // Budget gate (NY day, like the scheduler): the gate requires headroom
-    // for this run's WORST-CASE output cost, so a run can't sail
-    // arbitrarily far past the ceiling. Input cost (web search results) is
-    // unbounded by nature and stays post-hoc — a run in flight may finish
-    // somewhat past the budget; the next run is then blocked.
-    let spent = repo::analyses_cost_since(&state.db, ny_day_start())
-        .await
-        .map_err(internal)?;
     let (model, max_tokens) = kind_params(kind);
-    let headroom = pricing::max_output_cost(model, max_tokens);
-    if spent + headroom > state.ai_budget {
-        return Err(err(
-            StatusCode::TOO_MANY_REQUESTS,
-            format!(
-                "daily AI budget would be exceeded (${spent} spent of ${}, this run reserves \
-                 ${headroom} — raise REKT_AI_DAILY_BUDGET)",
-                state.ai_budget
-            ),
-        ));
-    }
+    // Budget gate (NY day, like the scheduler): requires headroom for this
+    // run's WORST-CASE output cost, so a run can't sail arbitrarily far past the
+    // ceiling. SKIPPED for Ollama — it bills $0, and a $0-headroom gate would
+    // still wrongly block on prior paid-backend spend.
+    let spent = if state.analyst_backend == "ollama" {
+        Decimal::ZERO
+    } else {
+        let spent = repo::analyses_cost_since(&state.db, ny_day_start())
+            .await
+            .map_err(internal)?;
+        let headroom = pricing::max_output_cost(model, max_tokens);
+        if spent + headroom > state.ai_budget {
+            return Err(err(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "daily AI budget would be exceeded (${spent} spent of ${}, this run reserves \
+                     ${headroom} — raise REKT_AI_DAILY_BUDGET)",
+                    state.ai_budget
+                ),
+            ));
+        }
+        spent
+    };
     // One analysis at a time: they share the price cache and the budget.
     if state
         .analyst_running
@@ -798,12 +947,12 @@ pub async fn summary(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
     let analyses = repo::recent_analyses_light(&state.db, 8)
         .await
         .map_err(internal)?;
-    let latest = match analyses.first() {
-        Some(first) => repo::get_analysis(&state.db, first.id)
-            .await
-            .map_err(internal)?,
-        None => None,
-    };
+    // The highlighted "latest" speaks to the user's portfolio, so it skips
+    // market_brief / market_ideas (those live in the MARKET / WATCH views).
+    // The `analyses` history below still lists every kind.
+    let latest = repo::latest_portfolio_analysis(&state.db)
+        .await
+        .map_err(internal)?;
     let recommendations = repo::list_recommendations(&state.db, TRACK_RECORD_RECS)
         .await
         .map_err(internal)?;
@@ -833,10 +982,7 @@ pub async fn summary(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
         })
         .collect();
     // Which backend is live, so the UI can say so (None when disabled).
-    let backend = state
-        .analyst
-        .as_ref()
-        .map(|_| if state.analyst_cli { "cli" } else { "http" });
+    let backend = state.analyst.as_ref().map(|_| state.analyst_backend);
     Ok(Json(json!({
         "enabled": state.analyst.is_some(),
         "backend": backend,

@@ -126,7 +126,7 @@ function aiSummaryCard(){
 // runs whatever model your Claude Code is set to (NOT necessarily Haiku), so we
 // name the backend, not a hardcoded model.
 function analystBadge(){
-  return M.analystBackend==='cli' ? 'CLAUDE CODE · CLI' : M.analystBackend==='http' ? 'CLAUDE API' : 'CLAUDE';
+  return M.analystBackend==='cli' ? 'CLAUDE CODE · CLI' : M.analystBackend==='http' ? 'CLAUDE API' : M.analystBackend==='ollama' ? 'OLLAMA · LOCAL' : 'AI';
 }
 // Spend is a real charge on the HTTP/API backend, but only an ESTIMATE on the
 // CLI backend (it runs under your Claude subscription; we price token usage as
@@ -149,7 +149,7 @@ const S = {
   importOpen:false, importFmt:'generic', importText:'', importPreview:null, importErr:'', importBusy:false,
   manageOpen:false, confirmDelPf:null,
   newAlert:{sym:'',cond:'price_below',thr:'',note:''},
-  wlAddText:'',
+  wlAddText:'', ideasAnalyzing:false, marketBriefing:false,
 };
 // M holds the latest server-derived data the views render from.
 const M = {
@@ -157,10 +157,11 @@ const M = {
   market:'closed', liveFeed:false, tradingEnabled:false,
   paperCash:null, paperEquity:null, paperBuyingPower:null, paperPositions:{},
   positions:[], watchlist:[], alerts:[], orders:[], txns:[], recs:[], track:{favorable:0,tested:0},
-  watchlists:[], wlActive:null, wlMembers:[],
+  watchlists:[], wlActive:null, wlMembers:[], screenerSettings:{stock:'balanced',etf:'balanced'}, ideas:{ideas:[],scanned:0,awaiting_data:0},
   briefing:'', briefingHead:'', analystEnabled:false, analystBackend:null, todayCost:0, budget:0,
   hist:[], metrics:{}, totals:{}, tax:null, taxYear:null, taxYears:[],
   candleCache:{}, lastPrices:{}, portfolios:[], activePortfolio:'',
+  gauges:{gauges:[],brief:null}, gaugesErr:false,
 };
 
 //================================================================ API
@@ -225,10 +226,10 @@ function applyAnalyst(a){
   const lat = a.latest;
   if(lat && lat.report_md){ M.briefing = lat.report_md;
     M.briefingHead = (lat.kind||'').replace('_',' ') + ' · ' + (lat.started_ts||'').slice(0,16).replace('T',' ') + ' · ' + analystCost(lat.cost_usd); }
-  else { M.briefing = a.enabled ? 'No analysis yet — trigger a briefing or weekly review.' : 'AI analyst disabled — the HTTP backend needs ANTHROPIC_API_KEY. Unset REKT_ANALYST_BACKEND to use the local Claude Code CLI (the default) instead.'; M.briefingHead = ''; }
+  else { M.briefing = a.enabled ? 'No analysis yet — trigger a briefing or weekly review.' : 'AI analyst disabled. Pick a backend via REKT_ANALYST_BACKEND: cli (default, local Claude Code), http (ANTHROPIC_API_KEY), or ollama (free local model — start Ollama and `ollama pull llama3.1`).'; M.briefingHead = ''; }
   M.recs = (a.recommendations||[]).filter(r=>r.status==='open'||r.status==='accepted').map(r => {
     const oc = r.outcome;
-    return { id:r.id, action:(r.action||'').toUpperCase(), sym:r.symbol, conf:r.confidence, sizing:r.sizing,
+    return { id:r.id, action:(r.action||'').toUpperCase(), sym:r.symbol, conf:r.confidence, sizing:r.sizing, kind:r.analysis_kind||'',
       headline:r.rationale ? r.rationale.split('. ')[0] : '', reason:r.rationale||'', citations:[],
       verdict: oc ? (oc.favorable===true?'favorable':oc.favorable===false?'unfavorable':'pending') : 'pending',
       move: oc && has(oc.return_pct) ? signedPct(oc.return_pct) : '—' };
@@ -241,6 +242,7 @@ async function loadAll(){
     const [pf, hist, an, ords, txns] = await Promise.all([
       jget('/api/portfolio'), jget('/api/history?range=all'), jget('/api/analyst'),
       jget('/api/orders').catch(()=>[]), jget('/api/transactions').catch(()=>[]),
+      loadMarket(), // independent overview widget — load in parallel, don't block first paint
     ]);
     applyPortfolio(pf); applyHistory(hist); applyAnalyst(an); applyOrders(ords); applyTxns(txns);
     try { applyTax(await jget('/api/taxes' + (M.taxYear?('?year='+M.taxYear):''))); } catch(e){}
@@ -623,6 +625,54 @@ function attentionItems(){
   return items;
 }
 
+// State-of-market: deterministic index gauges + an AI read of them.
+function marketSection(){
+  const m = M.gauges||{gauges:[],brief:null};
+  const gauges = (m.gauges||[]).map(g=>{
+    const s=g.signals||{}; const dp=g.day_pct;
+    const rsi = has(s.rsi14)?num(s.rsi14):null;
+    const v50=has(s.vs_sma50_pct)?num(s.vs_sma50_pct):null, v200=has(s.vs_sma200_pct)?num(s.vs_sma200_pct):null;
+    const trend = (v50!=null&&v200!=null) ? (v50>0&&v200>0?'▲':(v50<0&&v200<0?'▼':'·')) : '·';
+    const tc = trend==='▲'?UP:trend==='▼'?DN:C.faint;
+    return '<div style="flex:1;min-width:118px;padding:9px 12px;border:1px solid '+C.border+';border-radius:5px;background:'+C.bg+';">'+
+      '<div style="font-size:9px;letter-spacing:0.5px;color:'+C.label+';">'+esc(g.symbol)+' <span style="color:'+C.faint+';">'+esc(g.name)+'</span></div>'+
+      '<div style="display:flex;align-items:baseline;gap:8px;margin-top:4px;"><span style="font-size:15px;font-weight:600;color:'+C.bright+';font-variant-numeric:tabular-nums;">'+(has(g.price)?money(g.price):'—')+'</span>'+
+      '<span style="font-size:11px;color:'+(dp==null?C.label:dirColor(dp))+';">'+(dp==null?'—':signedPct(dp))+'</span></div>'+
+      '<div style="margin-top:5px;font-size:9px;color:'+C.faint+';">'+(rsi!=null?('RSI '+esc(String(rsi))+' · '):'')+'<span style="color:'+tc+';">'+trend+' trend</span></div>'+
+    '</div>';
+  }).join('');
+  const brief = (m.brief && m.brief.report_md)
+    ? '<div style="margin-top:12px;font-size:12px;line-height:1.55;color:'+C.body+';max-width:940px;">'+mdToHtml(m.brief.report_md)+'</div>'
+    : '<div style="margin-top:10px;font-size:11px;color:'+C.faint+';">No market brief yet — click ✦ BRIEF for an AI read of these gauges.</div>';
+  return '<div style="margin:14px 16px 0;padding:14px 16px;border:1px solid '+C.border+';border-radius:6px;background:'+C.panel2+';">'+
+    '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;"><span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">MARKET</span>'+
+    '<span style="font-size:8.5px;letter-spacing:0.5px;color:'+C.faint+';">deterministic gauges · AI read</span>'+
+    '<button data-act="marketBrief"'+(S.marketBriefing?' disabled':'')+' title="AI state-of-market read of the gauges" style="margin-left:auto;font-family:inherit;font-size:9.5px;font-weight:600;letter-spacing:0.5px;color:'+(S.marketBriefing?C.faint:C.blue)+';background:transparent;border:1px solid '+(S.marketBriefing?C.border:'#1B2A44')+';border-radius:4px;padding:4px 10px;cursor:'+(S.marketBriefing?'default':'pointer')+';">'+(S.marketBriefing?'✦ THINKING…':'✦ BRIEF')+'</button></div>'+
+    '<div style="display:flex;gap:8px;flex-wrap:wrap;">'+(gauges||(M.gaugesErr?'<span style="font-size:11px;color:'+C.red+';">couldn’t load gauges — is the server reachable?</span>':'<span style="font-size:11px;color:'+C.faint+';">gauges loading…</span>'))+'</div>'+
+    brief+
+  '</div>';
+}
+async function loadMarket(){ try{ M.gauges = await jget('/api/market'); M.gaugesErr=false; }catch(e){ M.gaugesErr=true; } }
+async function marketBrief(){
+  if(S.marketBriefing) return;            // guard the double-click window
+  S.marketBriefing=true; render();        // disable the button before the await
+  try{
+    const r=await japi('POST','/api/market/brief'); // errors (disabled/budget/busy) throw → caught
+    const id=r.id; toast('AI reading the market…');
+    // Poll THIS brief's own analysis row — not the shared global running flag,
+    // which any other analyst run (briefing/ideas) could flip.
+    let done=false;
+    for(let i=0;i<25;i++){
+      await new Promise(res=>setTimeout(res,3000));
+      let row=null; try{ row=await jget('/api/analyses/'+id); }catch(e){}
+      if(row && row.status && row.status!=='running'){ done = row.status==='done'; break; }
+    }
+    await loadMarket();
+    toast(done ? 'MARKET BRIEF READY' : 'Market brief still running — refresh shortly');
+  }catch(e){ toast(e.message); }
+  finally{ S.marketBriefing=false; render(); }
+}
+
 function overviewView(){
   const head=M.briefingHead?('<span style="font-size:10px;color:'+C.label+';">'+esc(M.briefingHead)+'</span>'):'';
   let html='<div style="margin:14px 16px 0;background:linear-gradient(135deg,#0B1018,#0B0E13);border:1px solid #1B2A44;border-radius:6px;overflow:hidden;">'+
@@ -633,6 +683,7 @@ function overviewView(){
       '<span style="margin-left:auto;font-size:9.5px;color:'+C.faint+';">'+(S.briefOpen?'click to collapse':'click to expand')+'</span></button>'+
     (S.briefOpen?'<div style="padding:2px 16px 14px 35px;font-size:12.5px;line-height:1.6;color:'+C.body+';max-width:940px;">'+aiSummaryCard()+mdToHtml(mdStripSummary(M.briefing))+'</div>':'')+
   '</div>';
+  html += marketSection();
   html += '<div style="padding:14px 16px;border-bottom:1px solid '+C.border+';">'+
     '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;"><span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">EQUITY CURVE <span style="color:'+C.faint+';">· VS SPY · DEPOSITED</span></span>'+
     '<button data-act="expand" data-arg="equity" title="expand chart" style="font-family:inherit;font-size:11px;color:'+C.label+';background:transparent;border:1px solid #1A212B;border-radius:3px;padding:2px 7px;cursor:pointer;">⤢</button></div>'+
@@ -784,6 +835,44 @@ function watchlistView(){
     '</div></div>'+
   '<div style="display:grid;grid-template-columns:'+cols+';gap:10px;padding:8px 16px;font-size:9.5px;letter-spacing:0.5px;color:'+C.label+';border-bottom:1px solid '+C.border+';"><div>SYMBOL</div><div style="text-align:right;">PRICE</div><div style="text-align:right;">DAY</div><div>SIGNALS</div><div></div></div>';
   html += (M.wlMembers&&M.wlMembers.length) ? memberRows : '<div style="padding:22px 16px;text-align:center;color:'+C.faint+';font-size:11px;">empty list — paste some symbols above to start tracking them</div>';
+  html += marketIdeasSection();
+  return html;
+}
+// Aggressiveness toggle for one equity type (stock|etf).
+function aggrToggle(kind){
+  const cur=(M.screenerSettings&&M.screenerSettings[kind])||'balanced';
+  const opt=(lvl,label)=>{ const on=cur===lvl;
+    return '<button data-act="setAggr" data-arg="'+kind+':'+lvl+'" style="font-family:inherit;font-size:9px;letter-spacing:0.5px;color:'+(on?C.bg:C.label)+';background:'+(on?C.amber:'transparent')+';border:1px solid '+(on?C.amber:'#1A212B')+';padding:3px 8px;cursor:pointer;">'+label+'</button>'; };
+  return '<span style="font-size:9px;letter-spacing:0.5px;color:'+C.faint+';margin-right:4px;">'+kind.toUpperCase()+'</span><span style="display:inline-flex;border-radius:4px;overflow:hidden;margin-right:14px;">'+opt('conservative','CONS')+opt('balanced','BAL')+opt('aggressive','AGGR')+'</span>';
+}
+// Ranked buy/sell candidates screened from the active list, signal-grounded.
+function marketIdeasSection(){
+  const d=M.ideas||{ideas:[],scanned:0,awaiting_data:0};
+  const ideas=d.ideas||[];
+  const note=(d.awaiting_data?(' · '+d.awaiting_data+' awaiting price history'):'');
+  let html='<div style="margin-top:18px;padding:12px 16px;border-top:1px solid '+C.border+';border-bottom:1px solid '+C.border+';background:'+C.panel2+';display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'+
+    '<span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">MARKET IDEAS'+(ideas.length?' <span style="color:'+C.amber+';">'+ideas.length+'</span>':'')+'</span>'+
+    '<span style="font-size:9.5px;color:'+C.faint+';">scanned '+(d.scanned||0)+note+'</span>'+
+    '<span style="margin-left:auto;display:flex;align-items:center;gap:10px;">'+
+      (ideas.length?'<button data-act="analyzeIdeas"'+(S.ideasAnalyzing?' disabled':'')+' title="Write an AI thesis for each candidate" style="font-family:inherit;font-size:9.5px;font-weight:600;letter-spacing:0.5px;color:'+(S.ideasAnalyzing?C.faint:C.blue)+';background:transparent;border:1px solid '+(S.ideasAnalyzing?C.border:'#1B2A44')+';border-radius:4px;padding:4px 10px;cursor:'+(S.ideasAnalyzing?'default':'pointer')+';">'+(S.ideasAnalyzing?'✦ ANALYZING…':'✦ AI THESES')+'</button>':'')+
+      aggrToggle('stock')+aggrToggle('etf')+'</span>'+
+  '</div>'+
+  '<div style="padding:6px 16px 4px;font-size:10px;color:'+C.faint+';line-height:1.5;">Signal-ranked candidates from this list — deterministic, not fabricated. Higher score = stronger setup. STAGE routes through the paper ticket. <span style="color:'+C.blue+';">✦ AI THESES</span> adds a written take per candidate.</div>';
+  if(!ideas.length){
+    html+='<div style="padding:18px 16px;text-align:center;color:'+C.faint+';font-size:11.5px;">no setups at this aggressiveness — try AGGR, or add more symbols.</div>';
+    return html;
+  }
+  const cols='0.5fr 0.95fr 2.4fr 0.7fr';
+  html+=ideas.map(it=>{ const buy=it.action==='buy'; const reasons=(it.reasons||[]).map(r=>esc(r)).join(' · ');
+    const rec=(M.recs||[]).find(r=>r.sym===it.symbol && r.kind==='market_ideas');
+    const thesis=(rec&&rec.reason)?'<div style="margin-top:5px;font-size:11px;color:'+C.body+';line-height:1.45;"><span style="color:'+C.blue+';font-size:8.5px;font-weight:700;letter-spacing:0.5px;">AI</span> '+esc(rec.reason)+'</div>':'';
+    return '<div style="display:grid;grid-template-columns:'+cols+';gap:10px;align-items:start;padding:9px 16px;border-bottom:1px solid '+C.hairline+';font-size:12px;">'+
+      '<div style="padding-top:1px;"><span style="font-size:9px;font-weight:700;letter-spacing:0.5px;color:'+(buy?UP:DN)+';border:1px solid '+(buy?UP:DN)+';border-radius:3px;padding:2px 6px;">'+(buy?'BUY':'SELL')+'</span></div>'+
+      '<div style="font-weight:600;color:'+C.bright+';">'+esc(it.symbol)+' <span title="screener score" style="font-size:9px;color:'+C.faint+';">'+esc(String(it.score))+'</span></div>'+
+      '<div style="color:'+C.body+';line-height:1.4;">'+reasons+thesis+'</div>'+
+      '<div style="text-align:right;"><button data-act="stageIdea" data-arg="'+esc(it.symbol)+':'+esc(it.action)+'" title="Stage a PAPER '+esc(it.action)+' of '+esc(it.symbol)+'" style="font-family:inherit;font-size:9.5px;font-weight:600;color:'+(buy?UP:DN)+';background:'+(buy?'rgba(47,191,113,0.1)':'rgba(255,92,87,0.1)')+';border:1px solid '+(buy?'rgba(47,191,113,0.35)':'rgba(255,92,87,0.35)')+';border-radius:3px;padding:4px 9px;cursor:pointer;white-space:nowrap;">STAGE '+(buy?'BUY':'SELL')+'</button></div>'+
+    '</div>';
+  }).join('');
   return html;
 }
 async function loadWatchlists(){
@@ -791,13 +880,46 @@ async function loadWatchlists(){
     const lists = await jget('/api/watchlists'); M.watchlists = lists||[];
     if(!M.watchlists.some(l=>l.id===M.wlActive)) M.wlActive = M.watchlists[0]?M.watchlists[0].id:null;
     await loadWlMembers();
+    // Screening (a server-side engine pass) is deferred to when WATCH is open,
+    // so it doesn't add round-trips to every boot. Refresh it if already there.
+    if(S.view==='watchlist') await loadScreener();
   }catch(e){}
 }
 async function loadWlMembers(){
   if(M.wlActive==null){ M.wlMembers=[]; return; }
   try{ M.wlMembers = await jget('/api/watchlists/'+M.wlActive)||[]; }catch(e){ M.wlMembers=[]; }
 }
-async function selectWatchlist(id){ M.wlActive=id; await loadWlMembers(); render(); }
+async function loadScreener(){
+  try{ M.screenerSettings = await jget('/api/screener/settings'); }catch(e){}
+  if(M.wlActive==null){ M.ideas={ideas:[],scanned:0,awaiting_data:0}; return; }
+  try{ M.ideas = await jget('/api/screener/'+M.wlActive); }catch(e){ M.ideas={ideas:[],scanned:0,awaiting_data:0}; }
+}
+async function selectWatchlist(id){ M.wlActive=id; await loadWlMembers(); await loadScreener(); render(); }
+async function setAggr(kind, level){
+  const next=Object.assign({stock:'balanced',etf:'balanced'}, M.screenerSettings); next[kind]=level;
+  try{ M.screenerSettings = await japi('PUT','/api/screener/settings', next); await loadScreener(); render(); }
+  catch(e){ toast(e.message); }
+}
+async function analyzeIdeas(){
+  if(M.wlActive==null) return;
+  try{
+    const r=await japi('POST','/api/screener/'+M.wlActive+'/analyze');
+    if(!r.started){ toast('No candidates to analyze — loosen aggressiveness or add symbols'); return; }
+    S.ideasAnalyzing=true; toast('AI writing theses for '+r.ideas+' ideas…'); render();
+    for(let i=0;i<22;i++){ await new Promise(res=>setTimeout(res,3000)); let a={}; try{ a=await jget('/api/analyst'); applyAnalyst(a); }catch(e){} if(a && !a.running) break; }
+    S.ideasAnalyzing=false; toast('AI THESES READY'); render();
+  }catch(e){ S.ideasAnalyzing=false; toast(e.message); render(); }
+}
+function stageIdea(sym, action){
+  const side=action==='buy'?'buy':'sell';
+  if(side==='sell'){
+    // A sell idea is a technical SIGNAL on a name you likely don't hold in
+    // paper — don't stage a doomed order (same guard as quickTrim).
+    const ph=(M.paperPositions && has(M.paperPositions[sym]))?num(M.paperPositions[sym]):0;
+    if(ph<=0){ toast('SELL SIGNAL · PAPER holds 0 '+sym+' — nothing to sell (your tracked holding is untouched)'); render(); return; }
+  }
+  if(addToBasket(side, sym, 1, 'market')) toast('STAGED '+side.toUpperCase()+' '+sym+' → ticket basket (adjust qty)'); render();
+}
 async function wlAddSymbols(){
   if(M.wlActive==null){ toast('No list selected'); return; }
   const text=(S.wlAddText||'').trim();
@@ -1174,7 +1296,7 @@ function wireCharts(){
 
 //================================================================ actions
 function toast(msg){ S.toast=msg; S.announce=msg; render(); clearTimeout(toast._t); toast._t=setTimeout(()=>{ S.toast=''; render(); }, 3200); }
-function setView(v){ S.view=v; S.hoverIdx=null; S.confirmDelTx=null; render(); if(v==='ledger') reloadTxns(); }
+function setView(v){ S.view=v; S.hoverIdx=null; S.confirmDelTx=null; render(); if(v==='ledger') reloadTxns(); if(v==='watchlist') loadScreener().then(render); }
 // The order ticket is a BASKET: stage many, then PLACE ALL. Every "stage" path
 // — position STAGE buttons, command bar, analyst, alerts, manual compose —
 // accumulates here. Same symbol+side+type+limit merges (qty summed).
@@ -1266,6 +1388,10 @@ async function act(name, arg){
     case 'wlRemoveSym': wlRemoveSym(arg); break;
     case 'wlNewList': wlNewList(); break;
     case 'wlDeleteList': wlDeleteList(+arg); break;
+    case 'setAggr': { const [k,l]=arg.split(':'); setAggr(k,l); break; }
+    case 'stageIdea': { const i=arg.lastIndexOf(':'); stageIdea(arg.slice(0,i), arg.slice(i+1)); break; }
+    case 'analyzeIdeas': analyzeIdeas(); break;
+    case 'marketBrief': marketBrief(); break;
     case 'dismissAlert': try{ await japi('POST','/api/alerts/'+arg+'/dismiss'); await refreshSilent(); }catch(e){ toast(e.message); } break;
     case 'rearmAlert': try{ await japi('POST','/api/alerts/'+arg+'/rearm'); await refreshSilent(); }catch(e){ toast(e.message); } break;
     case 'reviewAlert': { const a=M.alerts.find(x=>x.id==arg); if(a&&a.draft){ if(addToBasket(a.draft.side,a.sym,a.draft.qty,a.draft.order_type,a.draft.limit_price)) toast('STAGED '+a.sym+' FROM ALERT → ticket basket'); render(); } break; }

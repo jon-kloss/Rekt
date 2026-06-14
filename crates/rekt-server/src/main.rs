@@ -12,8 +12,10 @@ mod api;
 mod history;
 mod import;
 mod live;
+mod market;
 mod portfolios;
 mod repo;
+mod screener;
 mod taxes;
 mod trading;
 
@@ -56,10 +58,12 @@ pub struct AppState {
     /// Claude API transport (ANTHROPIC_API_KEY) — None disables the analyst
     /// honestly. NOTE: the analyst layer never touches `broker` (PLAN.md §5).
     pub analyst: Option<Arc<dyn rekt_analyst::Transport>>,
-    /// True when the analyst transport is the Claude Code CLI (`claude -p`):
-    /// every kind runs tool-lessly with injected context, since the CLI is
-    /// launched with no tools and drives no in-process tool loop.
+    /// True for a TOOL-LESS backend (Claude Code CLI or local Ollama): every
+    /// kind runs with injected context, since these backends drive no
+    /// in-process tool loop.
     pub analyst_cli: bool,
+    /// Which backend is live, for the UI + cost: "cli" | "http" | "ollama".
+    pub analyst_backend: &'static str,
     /// Daily AI spend ceiling (REKT_AI_DAILY_BUDGET, USD).
     pub ai_budget: rust_decimal::Decimal,
     /// Single-flight latch: one analysis at a time.
@@ -104,6 +108,17 @@ fn app(state: AppState) -> Router {
             "/api/watchlists/{id}/symbols/{symbol}",
             delete(api::watchlist_remove_symbol),
         )
+        .route(
+            "/api/screener/settings",
+            get(screener::get_settings).put(screener::put_settings),
+        )
+        .route("/api/screener/{list_id}", get(screener::screen_list))
+        .route(
+            "/api/screener/{list_id}/analyze",
+            post(screener::analyze_list),
+        )
+        .route("/api/market", get(market::gauges))
+        .route("/api/market/brief", post(market::brief))
         .route(
             "/api/alerts",
             get(alerts::list_alerts).post(alerts::create_alert),
@@ -254,8 +269,19 @@ async fn open_db(path: &str) -> anyhow::Result<SqlitePool> {
         .filename(path)
         .create_if_missing(true)
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+    // Run migrations with FK enforcement OFF so a table rebuild (e.g. widening
+    // a CHECK constraint) can drop+recreate a table other tables reference —
+    // SQLite forbids that with foreign_keys on, even inside a transaction.
+    // Migrations are trusted, controlled DDL; the app pool below keeps FK on.
+    let migrate_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone().foreign_keys(false))
+        .await?;
+    sqlx::migrate!("../../migrations")
+        .run(&migrate_pool)
+        .await?;
+    migrate_pool.close().await;
     let pool = SqlitePoolOptions::new().connect_with(options).await?;
-    sqlx::migrate!("../../migrations").run(&pool).await?;
     Ok(pool)
 }
 
@@ -365,44 +391,81 @@ async fn main() -> anyhow::Result<()> {
     //   REKT_ANALYST_BACKEND=http (or =api)   → the HTTP API client
     //     (ANTHROPIC_API_KEY), which also produces structured recs.
     // The CLI is the default because REKT is self-hosted alongside Claude
-    // Code; opt into the API explicitly when you'd rather spend a key.
-    let analyst_cli = match std::env::var("REKT_ANALYST_BACKEND") {
+    // Code; opt into the API (a key) or Ollama (local/free) explicitly.
+    let backend = match std::env::var("REKT_ANALYST_BACKEND") {
         Ok(v) if v.trim().eq_ignore_ascii_case("http") || v.trim().eq_ignore_ascii_case("api") => {
-            false
+            "http"
         }
-        _ => true, // default: local Claude Code CLI
+        Ok(v)
+            if v.trim().eq_ignore_ascii_case("ollama")
+                || v.trim().eq_ignore_ascii_case("local") =>
+        {
+            "ollama"
+        }
+        _ => "cli", // default: local Claude Code CLI
     };
-    let analyst: Option<Arc<dyn rekt_analyst::Transport>> = if analyst_cli {
-        // Probe the binary so a host without Claude Code degrades honestly
-        // (disabled) rather than advertising a backend that fails every run.
-        let cli = rekt_analyst::CliTransport::new();
-        if cli.is_available().await {
-            tracing::info!(
-                "AI analyst enabled via Claude Code CLI (claude -p; advisory only, no tools)"
-            );
-            Some(Arc::new(cli) as Arc<dyn rekt_analyst::Transport>)
-        } else {
-            tracing::warn!(
-                "REKT_ANALYST_BACKEND=cli (the default) but `claude` is not runnable on PATH \
-                 — AI analyst disabled. Install Claude Code, or set REKT_ANALYST_BACKEND=http \
-                 with ANTHROPIC_API_KEY."
-            );
-            None
+    // CLI and Ollama are tool-less (no in-process tool loop); HTTP uses tools.
+    let analyst_cli = backend != "http";
+    let analyst: Option<Arc<dyn rekt_analyst::Transport>> = match backend {
+        "cli" => {
+            // Probe the binary so a host without Claude Code degrades honestly
+            // (disabled) rather than advertising a backend that fails every run.
+            let cli = rekt_analyst::CliTransport::new();
+            if cli.is_available().await {
+                tracing::info!(
+                    "AI analyst enabled via Claude Code CLI (claude -p; advisory only, no tools)"
+                );
+                Some(Arc::new(cli) as Arc<dyn rekt_analyst::Transport>)
+            } else {
+                tracing::warn!(
+                    "REKT_ANALYST_BACKEND=cli (the default) but `claude` is not runnable on PATH \
+                     — AI analyst disabled. Install Claude Code, set REKT_ANALYST_BACKEND=http \
+                     with ANTHROPIC_API_KEY, or =ollama for a local model."
+                );
+                None
+            }
         }
-    } else {
-        let t = std::env::var("ANTHROPIC_API_KEY")
-            .ok()
-            .filter(|k| !k.is_empty())
-            .map(|key| {
-                tracing::info!("AI analyst enabled (advisory only — it can never execute orders)");
-                Arc::new(rekt_analyst::HttpTransport::new(key)) as Arc<dyn rekt_analyst::Transport>
-            });
-        if t.is_none() {
-            tracing::warn!(
-                "REKT_ANALYST_BACKEND=http but no ANTHROPIC_API_KEY — AI analyst disabled"
-            );
+        "ollama" => {
+            let url = std::env::var("REKT_OLLAMA_URL")
+                .unwrap_or_else(|_| "http://localhost:11434".into());
+            let model = std::env::var("REKT_OLLAMA_MODEL").unwrap_or_else(|_| "llama3.1".into());
+            let ollama = rekt_analyst::OllamaTransport::new(url.clone(), model.clone());
+            // resolve() probes AND pins the exact pulled tag (so a bare
+            // `llama3.1` can't 404 at run time when only `llama3.1:8b` exists).
+            match ollama.resolve().await {
+                Some(t) => {
+                    tracing::info!(model = %t.model(), url = %url, "AI analyst enabled via local Ollama (free, advisory only, no tools)");
+                    Some(Arc::new(t) as Arc<dyn rekt_analyst::Transport>)
+                }
+                None => {
+                    tracing::warn!(
+                        model = %model, url = %url,
+                        "REKT_ANALYST_BACKEND=ollama but Ollama isn't reachable or the model isn't \
+                         pulled — AI analyst disabled. Start Ollama and run `ollama pull {model}`."
+                    );
+                    None
+                }
+            }
         }
-        t
+        _ => {
+            // http
+            let t = std::env::var("ANTHROPIC_API_KEY")
+                .ok()
+                .filter(|k| !k.is_empty())
+                .map(|key| {
+                    tracing::info!(
+                        "AI analyst enabled (advisory only — it can never execute orders)"
+                    );
+                    Arc::new(rekt_analyst::HttpTransport::new(key))
+                        as Arc<dyn rekt_analyst::Transport>
+                });
+            if t.is_none() {
+                tracing::warn!(
+                    "REKT_ANALYST_BACKEND=http but no ANTHROPIC_API_KEY — AI analyst disabled"
+                );
+            }
+            t
+        }
     };
     let ai_budget = std::env::var("REKT_AI_DAILY_BUDGET")
         .ok()
@@ -425,6 +488,7 @@ async fn main() -> anyhow::Result<()> {
         backfill_lock: Arc::new(Mutex::new(())),
         analyst,
         analyst_cli,
+        analyst_backend: backend,
         ai_budget,
         analyst_running: Arc::new(AtomicBool::new(false)),
         active_portfolio,
@@ -585,6 +649,7 @@ mod tests {
             backfill_lock: Arc::new(Mutex::new(())),
             analyst: None,
             analyst_cli: false,
+            analyst_backend: "http",
             ai_budget: rust_decimal::Decimal::new(250, 2),
             analyst_running: Arc::new(AtomicBool::new(false)),
             active_portfolio: "real".into(),
@@ -1643,6 +1708,84 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn screener_settings_and_screen_endpoint() {
+        let state = test_state().await;
+
+        // Defaults are Balanced for both equity types.
+        let (_, s) = request(state.clone(), "GET", "/api/screener/settings", None).await;
+        assert_eq!(s["stock"], "balanced");
+        assert_eq!(s["etf"], "balanced");
+
+        // Set + normalize: a bogus level falls back to balanced, valid sticks.
+        let (status, s) = request(
+            state.clone(),
+            "PUT",
+            "/api/screener/settings",
+            Some(serde_json::json!({ "stock": "AGGRESSIVE", "etf": "bogus" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(s["stock"], "aggressive");
+        assert_eq!(s["etf"], "balanced");
+        let (_, s) = request(state.clone(), "GET", "/api/screener/settings", None).await;
+        assert_eq!(s["stock"], "aggressive"); // persisted
+
+        // Screening an unknown list 404s.
+        let (status, _) = request(state.clone(), "GET", "/api/screener/9999", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Screening a list whose member has no candle history yet returns no
+        // ideas (honest) and reports it as awaiting_data.
+        let (_, lists) = request(state.clone(), "GET", "/api/watchlists", None).await;
+        let id = lists[0]["id"].as_i64().unwrap();
+        request(
+            state.clone(),
+            "POST",
+            &format!("/api/watchlists/{id}/symbols"),
+            Some(serde_json::json!({ "symbols": "AAPL" })),
+        )
+        .await;
+        let (status, res) =
+            request(state.clone(), "GET", &format!("/api/screener/{id}"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(res["ideas"].as_array().unwrap().len(), 0);
+        assert_eq!(res["awaiting_data"], 1); // AAPL has no backfilled candles in-test
+    }
+
+    #[tokio::test]
+    async fn market_ideas_kind_accepted_and_carries_through() {
+        // Migration 0007 widened the analyses.kind CHECK (would fail pre-0007),
+        // and recommendations carry their analysis kind for the UI thesis filter.
+        let state = test_state().await;
+        use sqlx::Row;
+        let analysis_id: i64 = sqlx::query(
+            "INSERT INTO analyses (kind, model, started_ts) VALUES ('market_ideas', 'test', ?) RETURNING id",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&state.db)
+        .await
+        .expect("widened CHECK accepts market_ideas")
+        .get("id");
+        repo::insert_recommendation(
+            &state.db,
+            repo::NewRecommendation {
+                analysis_id, // FK-linked — proves the rebuilt table resolves
+                symbol: "NVDA",
+                action: "buy",
+                sizing: "",
+                rationale: "oversold dip",
+                confidence: "medium",
+                expires_ts: chrono::Utc::now() + chrono::Duration::days(7),
+            },
+        )
+        .await
+        .unwrap();
+        let recs = repo::list_recommendations(&state.db, 10).await.unwrap();
+        let r = recs.iter().find(|r| r.symbol == "NVDA").unwrap();
+        assert_eq!(r.analysis_kind, "market_ideas");
     }
 
     #[tokio::test]

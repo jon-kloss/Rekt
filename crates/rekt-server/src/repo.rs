@@ -192,6 +192,26 @@ pub async fn watchlist_members(pool: &SqlitePool, list_id: i64) -> Result<Vec<St
     Ok(rows.into_iter().map(|r| r.get("symbol")).collect())
 }
 
+/// Members of one list as (symbol, kind) — kind is 'stock' or 'etf', used to
+/// pick the per-equity-type aggressiveness when screening.
+pub async fn watchlist_members_detail(
+    pool: &SqlitePool,
+    list_id: i64,
+) -> Result<Vec<(String, String)>> {
+    let rows = sqlx::query(
+        r#"SELECT i.symbol, i.kind FROM watchlist_members m
+           JOIN instruments i ON i.id = m.instrument_id
+           WHERE m.list_id = ? ORDER BY i.symbol"#,
+    )
+    .bind(list_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get("symbol"), r.get("kind")))
+        .collect())
+}
+
 /// Bulk-add symbols to a list. Returns how many were newly added (idempotent
 /// on duplicates). Errors if the list doesn't exist.
 pub async fn watchlist_add_bulk(
@@ -877,6 +897,41 @@ pub async fn get_analysis(pool: &SqlitePool, id: i64) -> Result<Option<AnalysisR
     row.map(analysis_from_row).transpose()
 }
 
+/// The most recent *portfolio-narrative* analysis (full body). Market briefs
+/// and market-idea scans are advisory context with their own UI homes (the
+/// MARKET section / WATCH ideas) — they must not hijack the AI BRIEFING /
+/// LATEST ANALYSIS surfaces, which speak to the user's own portfolio.
+pub async fn latest_portfolio_analysis(pool: &SqlitePool) -> Result<Option<AnalysisRecord>> {
+    let row = sqlx::query(&format!(
+        "SELECT {ANALYSIS_COLUMNS} FROM analyses
+         WHERE kind IN ('briefing', 'weekly_review', 'on_demand')
+         ORDER BY id DESC LIMIT 1"
+    ))
+    .fetch_optional(pool)
+    .await?;
+    row.map(analysis_from_row).transpose()
+}
+
+/// The most recent finished market brief as `(report_md, finished_ts)`, so
+/// GET /api/market can show the AI read inline. `None` until one has run.
+/// The WHERE clause guarantees `report_md` is non-NULL.
+pub async fn latest_market_brief(pool: &SqlitePool) -> Result<Option<(String, Option<String>)>> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT report_md, finished_ts FROM analyses
+         WHERE kind = 'market_brief' AND status = 'done' AND report_md IS NOT NULL
+         ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| {
+        (
+            r.get::<String, _>("report_md"),
+            r.get::<Option<String>, _>("finished_ts"),
+        )
+    }))
+}
+
 /// Recent analyses WITHOUT report bodies — the polled summary endpoint
 /// must not ship kilobytes of markdown the client discards. Fetch the full
 /// record by id when the body is needed.
@@ -934,6 +989,9 @@ pub struct RecommendationRecord {
     pub status: String,
     pub created_ts: String,
     pub expires_ts: Option<String>,
+    /// The analysis kind that produced it (e.g. 'weekly_review', 'market_ideas')
+    /// — lets the UI attach a market-ideas thesis only to market-ideas recs.
+    pub analysis_kind: String,
 }
 
 pub struct NewRecommendation<'a> {
@@ -986,11 +1044,14 @@ pub async fn list_recommendations(
 ) -> Result<Vec<RecommendationRecord>> {
     let rows = sqlx::query(
         r#"SELECT r.id, r.analysis_id, i.symbol, r.action, r.sizing, r.rationale,
-                  r.confidence, r.created_ts, r.expires_ts,
+                  r.confidence, r.created_ts, r.expires_ts, a.kind AS analysis_kind,
                   CASE WHEN r.status = 'open' AND r.expires_ts IS NOT NULL AND r.expires_ts < ?1
                        THEN 'expired' ELSE r.status END AS status
-           FROM recommendations r JOIN instruments i ON i.id = r.instrument_id
-           ORDER BY (status = 'open') DESC, r.id DESC LIMIT ?2"#,
+           FROM recommendations r
+           JOIN instruments i ON i.id = r.instrument_id
+           JOIN analyses a ON a.id = r.analysis_id
+           ORDER BY (CASE WHEN r.status = 'open' AND r.expires_ts IS NOT NULL AND r.expires_ts < ?1
+                          THEN 'expired' ELSE r.status END = 'open') DESC, r.id DESC LIMIT ?2"#,
     )
     .bind(Utc::now().to_rfc3339())
     .bind(limit)
@@ -1009,6 +1070,7 @@ pub async fn list_recommendations(
             status: row.get("status"),
             created_ts: row.get("created_ts"),
             expires_ts: row.get("expires_ts"),
+            analysis_kind: row.get("analysis_kind"),
         })
         .collect())
 }
