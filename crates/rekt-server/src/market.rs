@@ -79,6 +79,7 @@ pub async fn gauges(State(state): State<AppState>) -> Result<Json<Value>, ApiErr
 /// POST /api/market/brief — kick off an AI state-of-market brief over the
 /// gauges (advisory context, no recommendations). Bills nothing on disabled.
 pub async fn brief(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    crate::demo_guard(&state)?;
     let id = crate::analyst::start_run(&state, "market_brief", None).await?;
     tracing::debug!(id, "POST /api/market/brief started");
     Ok(Json(json!({ "started": true, "id": id })))

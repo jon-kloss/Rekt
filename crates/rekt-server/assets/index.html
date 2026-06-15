@@ -161,7 +161,7 @@ const M = {
   briefing:'', briefingHead:'', analystEnabled:false, analystBackend:null, todayCost:0, budget:0,
   hist:[], metrics:{}, totals:{}, tax:null, taxYear:null, taxYears:[],
   candleCache:{}, lastPrices:{}, portfolios:[], activePortfolio:'',
-  gauges:{gauges:[],brief:null}, gaugesErr:false,
+  gauges:{gauges:[],brief:null}, gaugesErr:false, demo:false,
 };
 
 //================================================================ API
@@ -180,6 +180,7 @@ function applyPortfolio(p){
   M.unreal = num(pf.unrealized_pnl); M.realized = num(pf.realized_pnl); M.dividends = num(pf.dividends);
   M.dayPct = (M.equity - M.dayPnl) !== 0 ? M.dayPnl/(M.equity - M.dayPnl)*100 : 0;
   if(has(p.active_portfolio)) M.activePortfolio = p.active_portfolio;
+  M.demo = !!p.demo;
   M.market = p.market || 'closed';
   M.liveFeed = !!p.live_feed;
   M.tradingEnabled = !!(p.trading && p.trading.enabled);
@@ -1222,6 +1223,14 @@ function viewBody(){
   }
 }
 
+function demoBanner(){
+  if(!M.demo) return '';
+  return '<div style="flex-shrink:0;display:flex;align-items:center;gap:10px;padding:6px 14px;background:linear-gradient(90deg,#1B1407,#0B0E13);border-bottom:1px solid #3A2F18;font-size:10.5px;letter-spacing:0.4px;color:'+C.amber+';">'+
+    '<span style="font-weight:700;">◆ LIVE DEMO</span>'+
+    '<span style="color:'+C.label+';">Sample data · paper trading is live · AI analyst is pre-baked (triggers disabled) · the instance resets periodically.</span>'+
+    '<a href="https://github.com/jon-kloss/Rekt" target="_blank" rel="noopener" style="margin-left:auto;color:'+C.blue+';text-decoration:none;">source ↗</a>'+
+  '</div>';
+}
 function render(){
   const active = document.activeElement;
   const activeId = active && active.id ? active.id : null;
@@ -1238,14 +1247,15 @@ function render(){
         '<input id="cmd" value="'+esc(S.cmd)+'" placeholder="symbol, or  b 10 nvda  ·  s 5 tsla @ 240   ( / to focus )" aria-label="Command" style="flex:1;background:transparent;border:none;color:'+C.text+';font-family:inherit;font-size:12.5px;padding:8px 0;outline:none;"><span style="font-size:10px;color:'+C.faint+';">↵</span></div>'+
       '<div style="margin-left:auto;display:flex;align-items:center;gap:14px;flex-shrink:0;">'+
         '<span style="font-size:11px;font-variant-numeric:tabular-nums;color:'+dirColor(M.dayPnl)+';">DAY '+(M.ready?signedMoney(M.dayPnl):'—')+'</span>'+
-        portfolioSelect()+
-        '<button data-act="manageOpen" aria-label="Manage portfolios" title="Manage portfolios" style="font-family:inherit;font-size:11px;color:'+C.label+';background:transparent;border:1px solid #1A212B;border-radius:4px;padding:4px 7px;cursor:pointer;">⚙</button>'+
+        (M.demo?'':portfolioSelect()+
+        '<button data-act="manageOpen" aria-label="Manage portfolios" title="Manage portfolios" style="font-family:inherit;font-size:11px;color:'+C.label+';background:transparent;border:1px solid #1A212B;border-radius:4px;padding:4px 7px;cursor:pointer;">⚙</button>')+
         '<span title="The order ticket trades a SIMULATED paper account (Alpaca paper), separate from your tracked holdings — fills never change your imported positions. The numbers on the dashboard are your real tracked book." style="font-size:10px;letter-spacing:0.5px;color:'+C.amber+';cursor:help;">[ PAPER ]</span>'+
         '<span style="font-size:11px;color:'+marketColor+';display:flex;align-items:center;gap:6px;"><span style="width:6px;height:6px;border-radius:50%;background:'+marketColor+';"></span>'+(M.market==='open'?'MKT OPEN':'MKT CLOSED')+'</span>'+
         '<span style="font-size:11px;color:'+UP+';display:flex;align-items:center;gap:6px;"><span style="width:6px;height:6px;border-radius:50%;background:'+UP+';animation:pulse 1.4s ease infinite;"></span>'+clock+'</span>'+
-        '<button data-act="importOpen" title="Import transactions from CSV (Fidelity, Schwab, Robinhood, IBKR, or generic)" style="font-family:inherit;font-size:10px;letter-spacing:0.5px;color:'+C.label+';background:transparent;border:1px solid #1A212B;padding:5px 10px;border-radius:4px;cursor:pointer;">⬆ IMPORT</button>'+
+        (M.demo?'':'<button data-act="importOpen" title="Import transactions from CSV (Fidelity, Schwab, Robinhood, IBKR, or generic)" style="font-family:inherit;font-size:10px;letter-spacing:0.5px;color:'+C.label+';background:transparent;border:1px solid #1A212B;padding:5px 10px;border-radius:4px;cursor:pointer;">⬆ IMPORT</button>')+
         '<button data-act="halt" aria-pressed="'+S.halted+'" style="font-family:inherit;font-size:10px;letter-spacing:0.5px;color:'+haltColor+';background:'+haltBg+';border:1px solid '+haltColor+';padding:5px 10px;border-radius:4px;cursor:pointer;">'+haltLabel+'</button>'+
       '</div></header>'+
+    demoBanner()+
     // body grid
     '<div style="flex:1;display:grid;grid-template-columns:1fr '+(S.dockOpen?'332px':'40px')+';min-height:0;">'+
       '<div style="display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden;border-right:1px solid '+C.border+';">'+
@@ -1350,7 +1360,12 @@ async function placeAll(){
   }
   toast(ok+' PLACED'+(fail?(' · '+fail+' REJECTED: '+firstErr):'')+' [paper]'); await refreshSilent();
 }
+// Actions disabled on the shared public demo (cost-bearing or destructive).
+// The server also 403s these (demo_guard); this gives an instant, clear toast.
+const DEMO_BLOCKED = new Set(['briefingRun','reviewRun','marketBrief','analyzeIdeas',
+  'importOpen','importPreview','importConfirm','newPortfolio','delPortfolio','switchPortfolio','manageOpen']);
 async function act(name, arg){
+  if(M.demo && DEMO_BLOCKED.has(name)){ toast('Disabled in the public demo'); return; }
   switch(name){
     case 'view': setView(arg); break;
     case 'help': S.showHelp=!S.showHelp; render(); break;

@@ -906,6 +906,7 @@ pub(crate) async fn start_run(
 pub async fn run_briefing(
     State(state): State<AppState>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    crate::demo_guard(&state)?;
     let id = start_run(&state, "briefing", None).await?;
     Ok((StatusCode::ACCEPTED, Json(json!({"id": id}))))
 }
@@ -913,6 +914,7 @@ pub async fn run_briefing(
 pub async fn run_review(
     State(state): State<AppState>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    crate::demo_guard(&state)?;
     let id = start_run(&state, "weekly_review", None).await?;
     Ok((StatusCode::ACCEPTED, Json(json!({"id": id}))))
 }
@@ -926,6 +928,7 @@ pub async fn ask(
     State(state): State<AppState>,
     Json(input): Json<AskInput>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    crate::demo_guard(&state)?;
     let question = input.question.trim().to_string();
     if question.is_empty() {
         return Err(err(
