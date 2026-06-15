@@ -1486,10 +1486,19 @@ mod tests {
         orders: std::sync::Mutex<Vec<rekt_broker::BrokerOrder>>,
         by_id: std::sync::Mutex<std::collections::HashMap<String, rekt_broker::BrokerOrder>>,
         fills: std::sync::Mutex<Vec<rekt_broker::Execution>>,
+        list_calls: std::sync::atomic::AtomicUsize,
+        // (signalled when inside list_orders, awaited before returning) — lets a
+        // test force one reconcile to be provably in-flight while another tries.
+        gate: std::sync::Mutex<
+            Option<(
+                std::sync::Arc<tokio::sync::Notify>,
+                std::sync::Arc<tokio::sync::Notify>,
+            )>,
+        >,
     }
     impl ScriptedBroker {
         fn with_orders(self, o: Vec<rekt_broker::BrokerOrder>) -> Self {
-            *self.orders.lock().unwrap() = o;
+            self.set_orders(o);
             self
         }
         fn with_fills(self, f: Vec<rekt_broker::Execution>) -> Self {
@@ -1499,6 +1508,20 @@ mod tests {
         fn with_by_id(self, id: &str, o: rekt_broker::BrokerOrder) -> Self {
             self.by_id.lock().unwrap().insert(id.into(), o);
             self
+        }
+        fn with_gate(
+            self,
+            entered: std::sync::Arc<tokio::sync::Notify>,
+            release: std::sync::Arc<tokio::sync::Notify>,
+        ) -> Self {
+            *self.gate.lock().unwrap() = Some((entered, release));
+            self
+        }
+        fn set_orders(&self, o: Vec<rekt_broker::BrokerOrder>) {
+            *self.orders.lock().unwrap() = o;
+        }
+        fn list_call_count(&self) -> usize {
+            self.list_calls.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
     #[async_trait::async_trait]
@@ -1538,13 +1561,33 @@ mod tests {
         async fn list_orders(
             &self,
         ) -> Result<Vec<rekt_broker::BrokerOrder>, rekt_broker::BrokerError> {
+            let n = self
+                .list_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            // On the first call, if gated, signal we're inside and block until
+            // released — so a second reconcile is provably here while we hold
+            // the single-flight lock.
+            if n == 1 {
+                let gate = self.gate.lock().unwrap().clone();
+                if let Some((entered, release)) = gate {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+            }
             Ok(self.orders.lock().unwrap().clone())
         }
         async fn executions_since(
             &self,
-            _after: Option<chrono::DateTime<chrono::Utc>>,
+            after: Option<chrono::DateTime<chrono::Utc>>,
         ) -> Result<Vec<rekt_broker::Execution>, rekt_broker::BrokerError> {
-            Ok(self.fills.lock().unwrap().clone())
+            // Honour the exclusive `after` cursor like the real API, so the
+            // reconcile's 1h-overlap logic is actually exercised.
+            let fills = self.fills.lock().unwrap().clone();
+            Ok(match after {
+                Some(a) => fills.into_iter().filter(|e| e.ts > a).collect(),
+                None => fills,
+            })
         }
         async fn account(&self) -> Result<rekt_broker::AccountInfo, rekt_broker::BrokerError> {
             Ok(rekt_broker::AccountInfo {
@@ -1721,9 +1764,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_reconciles_ingest_each_fill_exactly_once() {
-        // A stream `Connected` event and the periodic timer can fire reconcile
-        // at once. Single-flight + execution_id dedupe must yield exactly-once.
+    async fn reconciles_dedupe_each_fill_by_execution_id() {
+        // Two reconciles over the same fill ingest it once — this proves the
+        // execution_id dedupe (the safety net). The single-flight LOCK is proven
+        // separately in `reconcile_single_flights_an_in_flight_pass`.
         let broker = std::sync::Arc::new(
             ScriptedBroker::default()
                 .with_orders(vec![broker_order(
@@ -1758,6 +1802,150 @@ mod tests {
                 .unwrap();
         assert_eq!(fills, 1, "two reconciles must not double-ingest a fill");
         assert_eq!(txs, 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_single_flights_an_in_flight_pass() {
+        // Proves the LOCK itself (not just dedupe): with reconcile A provably
+        // in-flight (blocked inside list_orders, holding the lock), reconcile B
+        // must SKIP — so list_orders is hit exactly once. Without the try-lock,
+        // B would run and call list_orders a second time.
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let broker = std::sync::Arc::new(
+            ScriptedBroker::default().with_gate(entered.clone(), release.clone()),
+        );
+        let state = scripted_state(broker.clone()).await;
+        let bg_state = state.clone();
+        let a = tokio::spawn(async move { trading::reconcile(&bg_state).await.unwrap() });
+        entered.notified().await; // A is inside list_orders, holding the lock
+        trading::reconcile(&state).await.unwrap(); // B: try_lock fails → skips
+        assert_eq!(
+            broker.list_call_count(),
+            1,
+            "B must skip while A holds the single-flight lock"
+        );
+        release.notify_one(); // let A finish
+        a.await.unwrap();
+        assert_eq!(broker.list_call_count(), 1, "A's single list_orders call");
+    }
+
+    #[tokio::test]
+    async fn a_fill_for_an_unmaterialized_order_is_skipped_then_ingested_next_reconcile() {
+        // The genuine "fill arrives before its order" gap: ingest_execution finds
+        // no order → skips (no tx). The NEXT reconcile (once the order shows up in
+        // mass status) materializes it and the overlap-cursor re-fetches the fill.
+        let broker = std::sync::Arc::new(ScriptedBroker::default().with_fills(vec![execution(
+            "e1",
+            "b-ext",
+            "MSFT",
+            rekt_core::orders::Side::Buy,
+            "3",
+            "300",
+        )]));
+        let state = scripted_state(broker.clone()).await;
+        trading::reconcile(&state).await.unwrap();
+        let txs0: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE source = 'broker_fill'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(txs0, 0, "a fill for an unknown order must not ingest");
+
+        // The order now appears → materialize + the fill ingests on this pass.
+        broker.set_orders(vec![broker_order(
+            "ext-1",
+            "b-ext",
+            rekt_core::orders::OrderStatus::Filled,
+            Some("MSFT"),
+            Some(rekt_core::orders::Side::Buy),
+            Some("3"),
+        )]);
+        trading::reconcile(&state).await.unwrap();
+        let txs1: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE source = 'broker_fill'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(txs1, 1, "the next reconcile must pick the fill up");
+    }
+
+    #[tokio::test]
+    async fn overlap_cursor_recovers_a_same_timestamp_fill_added_after_the_first() {
+        // Alpaca's `after` is exclusive, so a fill at exactly the last-seen
+        // timestamp would be missed forever without the 1h overlap. F2 lands at
+        // the SAME ts as F1, after F1 was already ingested — the overlap must
+        // still catch it.
+        let ts = chrono::Utc::now();
+        let order = broker_order(
+            "ext-1",
+            "b-ext",
+            rekt_core::orders::OrderStatus::Filled,
+            Some("MSFT"),
+            Some(rekt_core::orders::Side::Buy),
+            Some("3"),
+        );
+        let f1 = rekt_broker::Execution {
+            ts,
+            ..execution(
+                "e1",
+                "b-ext",
+                "MSFT",
+                rekt_core::orders::Side::Buy,
+                "1",
+                "300",
+            )
+        };
+        let broker = std::sync::Arc::new(
+            ScriptedBroker::default()
+                .with_orders(vec![order])
+                .with_fills(vec![f1.clone()]),
+        );
+        let state = scripted_state(broker.clone()).await;
+        trading::reconcile(&state).await.unwrap(); // ingests F1
+
+        let f2 = rekt_broker::Execution {
+            ts, // SAME instant as F1
+            ..execution(
+                "e2",
+                "b-ext",
+                "MSFT",
+                rekt_core::orders::Side::Buy,
+                "2",
+                "300",
+            )
+        };
+        *broker.fills.lock().unwrap() = vec![f1, f2];
+        trading::reconcile(&state).await.unwrap(); // after = ts-1h → re-fetches both; F2 is new
+
+        let fills: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fills")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            fills, 2,
+            "the 1h overlap must recover the same-timestamp fill"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_order_the_broker_listed_is_not_marked_failed() {
+        // A pending_submit order that mass-status (list_orders) reports as live
+        // must be synced, NOT failed by step 2's never-saw path. Guards against a
+        // regression that drops the seen_client_ids check.
+        let broker =
+            std::sync::Arc::new(ScriptedBroker::default().with_orders(vec![broker_order(
+                "rekt-paper-1-7",
+                "b-real",
+                rekt_core::orders::OrderStatus::Accepted,
+                Some("AAPL"),
+                Some(rekt_core::orders::Side::Buy),
+                Some("5"),
+            )]));
+        let state = scripted_state(broker).await;
+        insert_pending_order(&state.db, "rekt-paper-1-7", "AAPL").await;
+        trading::reconcile(&state).await.unwrap();
+        assert_eq!(order_status(&state.db, "rekt-paper-1-7").await, "accepted");
     }
 
     #[tokio::test]

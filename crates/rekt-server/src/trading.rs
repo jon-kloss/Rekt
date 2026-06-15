@@ -57,11 +57,11 @@ pub struct TradingState {
     /// basis cache so the broadcast path never re-reads the paper log unless
     /// a fill/tx landed.
     paper_positions_cache: RwLock<(u64, serde_json::Value)>,
-    /// Single-flights reconciliation. A stream `Connected` event and the
-    /// periodic timer can both fire `reconcile` at once; every write inside is
-    /// individually idempotent (fills dedupe on execution_id, status updates
-    /// are staleness-guarded), but serializing avoids two passes racing on the
-    /// same broker snapshot and the wasted duplicate broker round-trips.
+    /// Single-flights reconciliation via try-lock-and-skip (see `reconcile`): a
+    /// stream `Connected` event and the periodic timer can both fire reconcile,
+    /// so a second concurrent pass SKIPS rather than waits — every write inside
+    /// is already idempotent, and skipping avoids both duplicate broker
+    /// round-trips and head-of-line-blocking the serial event consumer.
     reconcile_lock: tokio::sync::Mutex<()>,
 }
 
@@ -503,8 +503,16 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
     let Some(broker) = &state.broker else {
         return Ok(());
     };
-    // Serialize concurrent reconciles (Connected event + periodic timer).
-    let _reconcile_guard = state.trading.reconcile_lock.lock().await;
+    // Single-flight via try-lock-and-SKIP, never wait. A `Connected` event and
+    // the periodic timer can both fire reconcile; serializing (waiting) would
+    // head-of-line-block the serial event consumer behind a slow broker call,
+    // violating "a blocked websocket can never lock trading out". Skipping is
+    // safe: the in-flight pass already syncs current broker truth, the next
+    // periodic tick repairs anything newer, and stream events keep flowing.
+    let Ok(_reconcile_guard) = state.trading.reconcile_lock.try_lock() else {
+        tracing::debug!("reconcile already in flight — skipping");
+        return Ok(());
+    };
     let mode = broker.mode().as_str();
 
     // (1) Mass status: one HTTP call covers our orders AND externals.
