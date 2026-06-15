@@ -46,11 +46,12 @@ pub trait MarketData: Send + Sync {
         Err(DataError::Unsupported("daily candles"))
     }
 
-    /// Forward/reverse stock splits with an ex-date in [start, end]. Default:
-    /// unsupported (only the corporate-actions-capable provider implements it).
+    /// Forward/reverse stock splits with an ex-date in [start, end] for any of
+    /// `symbols` (batched into one request). Default: unsupported (only the
+    /// corporate-actions-capable provider implements it).
     async fn splits(
         &self,
-        _symbol: &str,
+        _symbols: &[String],
         _start: NaiveDate,
         _end: NaiveDate,
     ) -> Result<Vec<SplitEvent>, DataError> {

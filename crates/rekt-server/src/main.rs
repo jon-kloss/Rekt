@@ -17,6 +17,7 @@ mod market;
 mod portfolios;
 mod repo;
 mod screener;
+mod splits;
 mod taxes;
 mod trading;
 
@@ -105,6 +106,7 @@ fn app(state: AppState) -> Router {
         .route("/api/import/csv", post(api::import_csv))
         .route("/api/history", get(history::history))
         .route("/api/candles", get(history::candles))
+        .route("/api/splits", get(splits::check))
         .route("/api/taxes", get(taxes::taxes))
         .route("/api/taxes/csv", get(taxes::taxes_csv))
         .route(
@@ -833,6 +835,18 @@ mod tests {
         let (status, json) = request(test_state().await, "GET", "/api/quote/aapl", None).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(json["error"].as_str().unwrap().contains("FINNHUB_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn splits_degrade_honestly_without_a_provider() {
+        // test_state wires no bars provider → split detection can't run, so it
+        // must report unsupported with a clear reason, not 500 or fake-empty.
+        let (status, json) =
+            request(test_state().await, "GET", "/api/splits?refresh=true", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["supported"], false);
+        assert!(json["reason"].as_str().unwrap().contains("ALPACA"));
+        assert_eq!(json["missing"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]

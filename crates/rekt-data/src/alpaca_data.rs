@@ -209,15 +209,23 @@ impl MarketData for AlpacaData {
     /// corporate-actions API (free tier). Ratio = new_rate / old_rate.
     async fn splits(
         &self,
-        symbol: &str,
+        symbols: &[String],
         start: NaiveDate,
         end: NaiveDate,
     ) -> Result<Vec<SplitEvent>, DataError> {
+        if symbols.is_empty() {
+            return Ok(Vec::new());
+        }
+        let symbols_param = symbols
+            .iter()
+            .map(|s| s.to_uppercase())
+            .collect::<Vec<_>>()
+            .join(",");
         let mut events = Vec::new();
         let mut page_token: Option<String> = None;
         loop {
             let mut query: Vec<(String, String)> = vec![
-                ("symbols".into(), symbol.to_uppercase()),
+                ("symbols".into(), symbols_param.clone()),
                 ("types".into(), "forward_split,reverse_split".into()),
                 ("start".into(), start.to_string()),
                 ("end".into(), end.to_string()),
@@ -232,12 +240,7 @@ impl MarketData for AlpacaData {
             match response.next_page_token {
                 Some(token) => page_token = Some(token),
                 None => {
-                    tracing::debug!(
-                        provider = "alpaca",
-                        symbol,
-                        splits = events.len(),
-                        "splits fetched"
-                    );
+                    tracing::debug!(provider = "alpaca", splits = events.len(), "splits fetched");
                     return Ok(events);
                 }
             }
