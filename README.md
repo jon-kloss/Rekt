@@ -58,31 +58,75 @@ throwaway; don't enter anything real.)*
   or sent to the browser). Missing data or keys produce clear errors or `None` —
   **never fabricated values**.
 
-## Quick start
+## Setup
+
+> Just want to look around first? Try the **[live demo](https://rekt-production-545b.up.railway.app)** — no setup, no keys.
+
+### 1. Prerequisites
+
+- **Rust** (stable) — install via [rustup.rs](https://rustup.rs). REKT pins its
+  toolchain in `rust-toolchain.toml`, so the right version is fetched
+  automatically. *(Or skip Rust entirely and use Docker — see below.)*
+- A free **Finnhub** and **Alpaca** account for the API keys below.
+
+### 2. Get your API keys
+
+All keys are **free** and read from the environment at startup — they're never
+written to disk, logged, or sent to the browser. Everything degrades honestly:
+leave a key out and the affected feature shows a clear error instead of faking
+it, so you can start with just Finnhub and add the rest later.
+
+| Key | What it powers | Required? | Where to get it |
+|-----|----------------|-----------|-----------------|
+| `FINNHUB_API_KEY` | Live quotes & prices | **Recommended** (no live prices without it) | [finnhub.io](https://finnhub.io) → free account → Dashboard → API key |
+| `ALPACA_PAPER_KEY` + `ALPACA_PAPER_SECRET` | Daily candles (charts, gauges, signals) **and** paper trading | **Recommended** (no charts/paper trading without it) | [alpaca.markets](https://alpaca.markets) → free account → **Paper** trading → "View / Generate API Keys". Paper keys only — live trading is deliberately not wired up. |
+| AI analyst | Briefings, weekly reviews, market ideas, Q&A | Optional | **Three options — pick one:** see step 3 |
+
+You only strictly need Rust to *launch* it; with **zero keys** REKT still runs as
+a transaction ledger (import history, positions, cost basis, P&L, taxes) — you
+just won't get live prices, charts, paper trading, or AI.
+
+### 3. Choose an AI backend (optional)
+
+The analyst is advisory only — it can never place orders. Pick one backend (or
+none):
+
+- **Claude Code CLI** *(default — no API key)*: if you have the `claude` CLI on
+  your `PATH` and signed in, REKT reuses that auth. Nothing to configure.
+- **Claude API**: `export REKT_ANALYST_BACKEND=http` and
+  `export ANTHROPIC_API_KEY=your_key` (from [console.anthropic.com](https://console.anthropic.com)).
+- **Local Ollama** *(free, private, offline)*: `export REKT_ANALYST_BACKEND=ollama`,
+  then `ollama pull llama3.1`. The deterministic screener does the picking, so a
+  small local model is enough.
+
+### 4. Run it
 
 ```sh
-# market data (free key from https://finnhub.io)
 export FINNHUB_API_KEY=your_key
-
-# paper trading + daily candles (free account at https://alpaca.markets —
-# paper keys only; live trading is deliberately not wired up)
 export ALPACA_PAPER_KEY=your_key
 export ALPACA_PAPER_SECRET=your_secret
-
-# AI analyst (advisory only). Defaults to the local Claude Code CLI — it reuses
-# the `claude` you've already signed in (must be on PATH), so no API key is
-# needed. It runs tool-less by design and can never place orders. Alternatives:
-#   export REKT_ANALYST_BACKEND=http   && export ANTHROPIC_API_KEY=your_key
-#   export REKT_ANALYST_BACKEND=ollama && ollama pull llama3.1   # free + local
+# (optional AI backend — see step 3; the default needs nothing)
 
 cargo run -p rekt-server
-# → http://127.0.0.1:7777
+# → open http://127.0.0.1:7777
 ```
 
-Everything degrades honestly: without keys, the affected features answer with
-clear errors instead of pretending. Full env-var reference (guardrails, AI
-budget, alert push, ports, multiple portfolios) is in
-[docs/OPERATIONS.md](docs/OPERATIONS.md).
+**Or with Docker** (no Rust toolchain needed):
+
+```sh
+docker build -t rekt .
+docker run -p 7777:8080 \
+  -e FINNHUB_API_KEY=your_key \
+  -e ALPACA_PAPER_KEY=your_key -e ALPACA_PAPER_SECRET=your_secret \
+  -v rekt-data:/data \
+  rekt
+# → open http://127.0.0.1:7777   (the -v volume persists your data)
+```
+
+Then **import your portfolio** (next section) to populate it. The full env-var
+reference — guardrails, AI budget (`REKT_AI_DAILY_BUDGET`), alert push, the
+listen address (`REKT_LISTEN`, default `127.0.0.1:7777`), and multiple
+portfolios — is in [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ## Bringing over your portfolio
 
