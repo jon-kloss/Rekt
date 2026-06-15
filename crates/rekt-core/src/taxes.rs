@@ -907,4 +907,39 @@ mod tests {
             PortfolioError::MissingSymbol { id: 1, .. }
         ));
     }
+
+    #[test]
+    fn nondivisible_wash_drift_stays_subcent_and_rounds_to_economic_truth() {
+        // Per-share TAX basis is exact only when (cost / shares) terminates. A
+        // $1 fee makes the basis non-terminating (301/3) and the full wash
+        // carries a non-terminating per-share loss (31/3), so the internal
+        // Decimals drift by ~1e-26. The guard: the wash is still DETECTED and
+        // carried (not lost to rounding), and the 2dp-rounded Schedule D — what
+        // actually gets filed — equals the exact economic truth. Cash flow:
+        // -301 (buy+fee) +270 (sell) -270 (rebuy) +270 (final) = -$31.
+        let txs = vec![
+            Tx {
+                fees: dec("1"),
+                ..tx(1, TxKind::Buy, "GME", "3", "100", "2026-01-05T15:00:00Z")
+            },
+            tx(2, TxKind::Sell, "GME", "3", "90", "2026-01-20T15:00:00Z"),
+            // Replacement within 30 days — fully washes the $31 loss.
+            tx(3, TxKind::Buy, "GME", "3", "90", "2026-01-28T15:00:00Z"),
+            // Far outside any window — the deferred loss must re-emerge.
+            tx(4, TxKind::Sell, "GME", "3", "90", "2026-09-01T15:00:00Z"),
+        ];
+        let report = tax_report(&txs, 2026).unwrap();
+        // The wash is detected and carried, not silently dropped by rounding.
+        assert_eq!(report.rows[0].code, "W");
+        assert_eq!(report.rows[0].disallowed.round_dp(2), dec("31"));
+        assert_eq!(report.rows[1].disallowed, Decimal::ZERO);
+        // Drift is real but bounded far under a cent...
+        let total = report.short.reportable + report.long.reportable;
+        assert!(
+            (total - dec("-31")).abs() < dec("0.01"),
+            "drift too large: {total}"
+        );
+        // ...and vanishes at filing precision: Schedule D == economic truth.
+        assert_eq!(total.round_dp(2), dec("-31"));
+    }
 }

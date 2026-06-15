@@ -62,7 +62,8 @@ pub async fn fetch_txs(pool: &SqlitePool, mode: Option<&str>) -> Result<Vec<TxRe
     }
     let rows = q.fetch_all(pool).await?;
 
-    rows.into_iter()
+    let mut records: Vec<TxRecord> = rows
+        .into_iter()
         .map(|row| {
             let kind: String = row.get("kind");
             let ts: String = row.get("ts");
@@ -83,7 +84,16 @@ pub async fn fetch_txs(pool: &SqlitePool, mode: Option<&str>) -> Result<Vec<TxRe
                 mode: row.get("mode"),
             })
         })
-        .collect()
+        .collect::<Result<_>>()?;
+
+    // The replay engines (portfolio basis + tax/wash-sale) depend on TRUE
+    // chronological order, with (ts, id) as the tiebreak. The SQL `ORDER BY
+    // t.ts` sorts the ts TEXT column, which only matches chronological order
+    // while every row is uniform RFC3339 — re-sort by the PARSED instant so a
+    // stray timestamp format (a `Z` suffix, an imported DB, a new insert path)
+    // can never silently misorder the replay and corrupt cost basis.
+    records.sort_by_key(|r| (r.tx.ts, r.tx.id));
+    Ok(records)
 }
 
 /// Replay-ready transactions for ONE mode.
