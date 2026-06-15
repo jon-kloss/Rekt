@@ -10,6 +10,7 @@ pub mod stream;
 
 use async_trait::async_trait;
 use chrono::NaiveDate;
+use rekt_core::splits::SplitEvent;
 use rekt_core::{Candle, Quote};
 
 #[derive(Debug, thiserror::Error)]
@@ -43,5 +44,16 @@ pub trait MarketData: Send + Sync {
         _end: NaiveDate,
     ) -> Result<Vec<Candle>, DataError> {
         Err(DataError::Unsupported("daily candles"))
+    }
+
+    /// Forward/reverse stock splits with an ex-date in [start, end]. Default:
+    /// unsupported (only the corporate-actions-capable provider implements it).
+    async fn splits(
+        &self,
+        _symbol: &str,
+        _start: NaiveDate,
+        _end: NaiveDate,
+    ) -> Result<Vec<SplitEvent>, DataError> {
+        Err(DataError::Unsupported("corporate splits"))
     }
 }

@@ -6,6 +6,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
+use rekt_core::splits::SplitEvent;
 use rekt_core::{Candle, Quote};
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -203,6 +204,84 @@ impl MarketData for AlpacaData {
             }
         }
     }
+
+    /// Forward/reverse splits with an ex-date in [start, end], via the
+    /// corporate-actions API (free tier). Ratio = new_rate / old_rate.
+    async fn splits(
+        &self,
+        symbol: &str,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> Result<Vec<SplitEvent>, DataError> {
+        let mut events = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut query: Vec<(String, String)> = vec![
+                ("symbols".into(), symbol.to_uppercase()),
+                ("types".into(), "forward_split,reverse_split".into()),
+                ("start".into(), start.to_string()),
+                ("end".into(), end.to_string()),
+                ("limit".into(), "1000".into()),
+            ];
+            if let Some(token) = &page_token {
+                query.push(("page_token".into(), token.clone()));
+            }
+            let response: CorporateActionsResponse =
+                self.get("/v1/corporate-actions", &query).await?;
+            events.extend(response.corporate_actions.into_events());
+            match response.next_page_token {
+                Some(token) => page_token = Some(token),
+                None => {
+                    tracing::debug!(
+                        provider = "alpaca",
+                        symbol,
+                        splits = events.len(),
+                        "splits fetched"
+                    );
+                    return Ok(events);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CorporateActionsResponse {
+    corporate_actions: CorporateActions,
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CorporateActions {
+    #[serde(default)]
+    forward_splits: Vec<SplitRecord>,
+    #[serde(default)]
+    reverse_splits: Vec<SplitRecord>,
+}
+
+impl CorporateActions {
+    fn into_events(self) -> impl Iterator<Item = SplitEvent> {
+        self.forward_splits
+            .into_iter()
+            .chain(self.reverse_splits)
+            .filter(|r| r.old_rate > Decimal::ZERO)
+            .map(|r| SplitEvent {
+                symbol: r.symbol,
+                ex_date: r.ex_date,
+                // normalize so 1/10 prints "0.1", not "0.10".
+                ratio: (r.new_rate / r.old_rate).normalize(),
+            })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SplitRecord {
+    symbol: String,
+    ex_date: NaiveDate,
+    #[serde(with = "rust_decimal::serde::float")]
+    new_rate: Decimal,
+    #[serde(with = "rust_decimal::serde::float")]
+    old_rate: Decimal,
 }
 
 #[cfg(test)]
@@ -223,6 +302,38 @@ mod tests {
         assert_eq!(candle.date.to_string(), "2026-06-10");
         assert_eq!(candle.close.to_string(), "101.25");
         assert_eq!(candle.volume, 1234567);
+    }
+
+    #[test]
+    fn parses_corporate_actions_into_split_events() {
+        // Captured shape from data.alpaca.markets/v1/corporate-actions (NVDA
+        // 10:1 forward + a synthetic 1:10 reverse to cover both branches).
+        let json = r#"{
+            "corporate_actions": {
+                "forward_splits": [
+                    {"symbol": "NVDA", "ex_date": "2024-06-10", "new_rate": 10, "old_rate": 1}
+                ],
+                "reverse_splits": [
+                    {"symbol": "ZZZ", "ex_date": "2024-03-15", "new_rate": 1, "old_rate": 10}
+                ]
+            },
+            "next_page_token": null
+        }"#;
+        let resp: CorporateActionsResponse = serde_json::from_str(json).unwrap();
+        let events: Vec<SplitEvent> = resp.corporate_actions.into_events().collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].symbol, "NVDA");
+        assert_eq!(events[0].ratio.to_string(), "10");
+        assert_eq!(events[0].ex_date.to_string(), "2024-06-10");
+        // Reverse split: 1/10 = 0.1.
+        assert_eq!(events[1].ratio.to_string(), "0.1");
+    }
+
+    #[test]
+    fn missing_split_arrays_default_to_empty() {
+        let resp: CorporateActionsResponse =
+            serde_json::from_str(r#"{"corporate_actions": {}, "next_page_token": null}"#).unwrap();
+        assert_eq!(resp.corporate_actions.into_events().count(), 0);
     }
 
     #[test]
