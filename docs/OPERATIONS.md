@@ -25,6 +25,15 @@ trading. For what REKT *is* and the design behind it, see
   websocket subscriptions; on the REST-poll fallback it is ~3 extra quote calls
   per minute — well within free-tier limits, but it means even a zero-position
   install does a small amount of always-on market-data work.
+- **Market-data fidelity.** Daily candles come from Alpaca's free tier with the
+  **IEX feed** and **split adjustment**. IEX is a fraction of US volume, so its
+  daily close can diverge from the official consolidated (SIP) close for
+  thinly-traded names — the quant signals (RSI, SMA distance, drawdown) and the
+  AI's read of them are **directional, not tick-exact**. Everything degrades
+  honestly: missing/uncovered/delisted symbols and too-little history produce
+  `None`/`—`, never a fabricated value. Splits are detected and prompted for
+  (Taxes tab); other corporate actions (spinoffs, mergers, return-of-capital)
+  are not modeled — reconcile with your broker for those.
 
 ## Configuration
 

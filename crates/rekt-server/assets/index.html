@@ -736,13 +736,17 @@ function perfView(){
 }
 
 function analystView(){
-  const hit = M.track.tested>0 ? Math.round(M.track.favorable/M.track.tested*100)+'%' : '—';
+  // A percentage off a handful of calls implies a significance it doesn't have.
+  // Below a minimum sample, lead with the raw count and flag it as small.
+  const t=M.track.tested, small=t>0 && t<20; // a % off <20 calls is still mostly noise (wide CI)
+  const hit = t>0 ? (small ? M.track.favorable+'/'+t : Math.round(M.track.favorable/t*100)+'%') : '—';
+  const hitSub = t>0 ? (small ? 'FAVORABLE · SMALL SAMPLE' : M.track.favorable+'/'+t+' FAVORABLE') : 'NO CALLS TESTED YET';
   const backendLabel = analystBadge();
   let html='<div style="display:flex;border-bottom:1px solid '+C.border+';">'+
     '<div style="flex:1;padding:14px 16px;border-right:1px solid '+C.border+';"><div style="display:flex;align-items:center;gap:10px;margin-bottom:9px;"><span style="font-size:11px;letter-spacing:1px;color:'+C.body+';">LATEST ANALYSIS</span><span style="font-size:9px;letter-spacing:0.5px;color:'+C.amber+';border:1px solid #3A2F18;padding:2px 7px;border-radius:3px;">'+esc(backendLabel)+'</span><span style="font-size:10px;color:'+C.label+';">'+esc(M.briefingHead)+'</span></div>'+
       '<div style="font-size:12.5px;line-height:1.6;color:'+C.body+';">'+aiSummaryCard()+mdToHtml(mdStripSummary(M.briefing))+'</div></div>'+
     '<div style="width:200px;padding:14px 16px;"><div style="font-size:9.5px;letter-spacing:1px;color:'+C.label+';">TRACK RECORD</div><div style="font-size:26px;font-weight:600;color:'+C.bright+';margin-top:6px;">'+hit+'</div>'+
-      '<div style="font-size:10px;color:'+C.label+';margin-top:3px;">'+M.track.favorable+'/'+M.track.tested+' FAVORABLE</div>'+
+      '<div style="font-size:10px;color:'+C.label+';margin-top:3px;">'+hitSub+'</div>'+
       '<div style="font-size:9.5px;letter-spacing:1px;color:'+C.label+';margin-top:14px;">TODAY SPEND'+(M.analystBackend==='cli'?' <span style="color:'+C.faint+';">(est.)</span>':'')+'</div><div style="font-size:15px;font-weight:600;color:'+C.text+';margin-top:5px;">'+analystCost(M.todayCost)+' <span style="font-size:11px;color:'+C.label+';">/ '+money(M.budget)+'</span></div>'+
       '<div style="display:flex;gap:6px;margin-top:14px;"><button data-act="briefingRun" style="flex:1;font-family:inherit;font-size:9px;color:'+C.body+';background:transparent;border:1px solid '+C.border+';border-radius:3px;padding:6px;cursor:pointer;">☀ BRIEF</button><button data-act="reviewRun" style="flex:1;font-family:inherit;font-size:9px;color:'+C.body+';background:transparent;border:1px solid '+C.border+';border-radius:3px;padding:6px;cursor:pointer;">🔍 REVIEW</button></div></div></div>';
   // Only BUY/SELL/TRIM are actionable (a STAGE button means something). HOLD /
