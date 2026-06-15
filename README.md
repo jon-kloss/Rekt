@@ -56,7 +56,9 @@ throwaway; don't enter anything real.)*
   side, each its own SQLite file; switch from the header.
 - **🔒 Yours, honestly.** One process, one file, keys are env-only (never logged
   or sent to the browser). Missing data or keys produce clear errors or `None` —
-  **never fabricated values**.
+  **never fabricated values**. Signals run on Alpaca's free **IEX** daily bars,
+  so they're directional, not tick-exact official closes (see
+  [docs/OPERATIONS.md](docs/OPERATIONS.md#what-you-are-running)).
 
 ## Setup
 
