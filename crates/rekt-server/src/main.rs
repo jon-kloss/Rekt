@@ -1479,6 +1479,287 @@ mod tests {
         assert_eq!(status, "filled", "terminal state must never regress");
     }
 
+    // A broker whose reconciliation responses are scripted, so the
+    // failure-RECOVERY paths (not just the happy path) can be exercised.
+    #[derive(Default)]
+    struct ScriptedBroker {
+        orders: std::sync::Mutex<Vec<rekt_broker::BrokerOrder>>,
+        by_id: std::sync::Mutex<std::collections::HashMap<String, rekt_broker::BrokerOrder>>,
+        fills: std::sync::Mutex<Vec<rekt_broker::Execution>>,
+    }
+    impl ScriptedBroker {
+        fn with_orders(self, o: Vec<rekt_broker::BrokerOrder>) -> Self {
+            *self.orders.lock().unwrap() = o;
+            self
+        }
+        fn with_fills(self, f: Vec<rekt_broker::Execution>) -> Self {
+            *self.fills.lock().unwrap() = f;
+            self
+        }
+        fn with_by_id(self, id: &str, o: rekt_broker::BrokerOrder) -> Self {
+            self.by_id.lock().unwrap().insert(id.into(), o);
+            self
+        }
+    }
+    #[async_trait::async_trait]
+    impl rekt_broker::Broker for ScriptedBroker {
+        fn name(&self) -> &'static str {
+            "scripted"
+        }
+        fn mode(&self) -> rekt_broker::TradeMode {
+            rekt_broker::TradeMode::Paper
+        }
+        async fn submit_order(
+            &self,
+            cid: &str,
+            t: &rekt_core::orders::OrderTicket,
+        ) -> Result<rekt_broker::BrokerOrder, rekt_broker::BrokerError> {
+            Ok(broker_order(
+                cid,
+                &format!("scripted-{cid}"),
+                rekt_core::orders::OrderStatus::Accepted,
+                Some(&t.symbol),
+                Some(t.side),
+                Some(&t.qty.to_string()),
+            ))
+        }
+        async fn cancel_order(&self, _: &str) -> Result<(), rekt_broker::BrokerError> {
+            Ok(())
+        }
+        async fn cancel_all(&self) -> Result<(), rekt_broker::BrokerError> {
+            Ok(())
+        }
+        async fn order_by_client_id(
+            &self,
+            id: &str,
+        ) -> Result<Option<rekt_broker::BrokerOrder>, rekt_broker::BrokerError> {
+            Ok(self.by_id.lock().unwrap().get(id).cloned())
+        }
+        async fn list_orders(
+            &self,
+        ) -> Result<Vec<rekt_broker::BrokerOrder>, rekt_broker::BrokerError> {
+            Ok(self.orders.lock().unwrap().clone())
+        }
+        async fn executions_since(
+            &self,
+            _after: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<Vec<rekt_broker::Execution>, rekt_broker::BrokerError> {
+            Ok(self.fills.lock().unwrap().clone())
+        }
+        async fn account(&self) -> Result<rekt_broker::AccountInfo, rekt_broker::BrokerError> {
+            Ok(rekt_broker::AccountInfo {
+                cash: rust_decimal::Decimal::from(100_000),
+                buying_power: rust_decimal::Decimal::from(100_000),
+                equity: rust_decimal::Decimal::from(100_000),
+                daytrade_count: 0,
+            })
+        }
+    }
+
+    fn broker_order(
+        client_id: &str,
+        broker_id: &str,
+        status: rekt_core::orders::OrderStatus,
+        symbol: Option<&str>,
+        side: Option<rekt_core::orders::Side>,
+        qty: Option<&str>,
+    ) -> rekt_broker::BrokerOrder {
+        rekt_broker::BrokerOrder {
+            broker_order_id: broker_id.into(),
+            client_order_id: client_id.into(),
+            status,
+            filled_qty: rust_decimal::Decimal::ZERO,
+            avg_fill_price: None,
+            updated_ts: Some(chrono::Utc::now()),
+            symbol: symbol.map(Into::into),
+            side,
+            qty: qty.map(|q| q.parse().unwrap()),
+            order_type: Some("market".into()),
+            limit_price: None,
+            tif: Some("day".into()),
+        }
+    }
+    fn execution(
+        eid: &str,
+        broker_id: &str,
+        symbol: &str,
+        side: rekt_core::orders::Side,
+        qty: &str,
+        price: &str,
+    ) -> rekt_broker::Execution {
+        rekt_broker::Execution {
+            execution_id: eid.into(),
+            broker_order_id: broker_id.into(),
+            symbol: symbol.into(),
+            side,
+            qty: qty.parse().unwrap(),
+            price: price.parse().unwrap(),
+            ts: chrono::Utc::now(),
+        }
+    }
+    async fn scripted_state(broker: std::sync::Arc<ScriptedBroker>) -> AppState {
+        let mut state = test_state().await;
+        state.broker = Some(broker as std::sync::Arc<dyn rekt_broker::Broker>);
+        state
+            .trading
+            .ready
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        state
+    }
+    async fn insert_pending_order(db: &sqlx::SqlitePool, client_id: &str, symbol: &str) {
+        sqlx::query("INSERT OR IGNORE INTO instruments (symbol) VALUES (?)")
+            .bind(symbol)
+            .execute(db)
+            .await
+            .unwrap();
+        let iid: i64 = sqlx::query_scalar("SELECT id FROM instruments WHERE symbol = ?")
+            .bind(symbol)
+            .fetch_one(db)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO orders (client_order_id, instrument_id, side, order_type, qty, tif,
+             status, mode, submitted_ts, updated_ts)
+             VALUES (?, ?, 'buy', 'market', '5', 'day', 'pending_submit', 'paper', ?, ?)",
+        )
+        .bind(client_id)
+        .bind(iid)
+        .bind(&now)
+        .bind(&now)
+        .execute(db)
+        .await
+        .unwrap();
+    }
+    async fn order_status(db: &sqlx::SqlitePool, client_id: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM orders WHERE client_order_id = ?")
+            .bind(client_id)
+            .fetch_one(db)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reconcile_marks_a_pending_order_the_broker_never_saw_as_failed() {
+        // The order submit crashed before reaching the broker (or the broker
+        // never accepted it). list_orders is empty and order_by_client_id
+        // returns None → reconcile must mark it failed, not leave it pending.
+        let state = scripted_state(std::sync::Arc::new(ScriptedBroker::default())).await;
+        insert_pending_order(&state.db, "rekt-paper-1-7", "AAPL").await;
+        trading::reconcile(&state).await.unwrap();
+        assert_eq!(order_status(&state.db, "rekt-paper-1-7").await, "failed");
+    }
+
+    #[tokio::test]
+    async fn reconcile_syncs_a_pending_order_the_broker_did_accept() {
+        // The submit response was lost (timeout) but the broker DID accept the
+        // order. The deterministic client_order_id lets reconcile recover it via
+        // order_by_client_id → status advances to accepted, never failed.
+        let broker = std::sync::Arc::new(ScriptedBroker::default().with_by_id(
+            "rekt-paper-1-7",
+            broker_order(
+                "rekt-paper-1-7",
+                "b-real",
+                rekt_core::orders::OrderStatus::Accepted,
+                Some("AAPL"),
+                Some(rekt_core::orders::Side::Buy),
+                Some("5"),
+            ),
+        ));
+        let state = scripted_state(broker).await;
+        insert_pending_order(&state.db, "rekt-paper-1-7", "AAPL").await;
+        trading::reconcile(&state).await.unwrap();
+        assert_eq!(order_status(&state.db, "rekt-paper-1-7").await, "accepted");
+    }
+
+    #[tokio::test]
+    async fn reconcile_materializes_an_external_order_and_ingests_its_fill() {
+        // An order placed outside REKT (broker UI / another tool) appears in the
+        // mass status; reconcile must materialize it AND ingest its fill as a
+        // (paper) transaction so the book reflects reality.
+        let broker = std::sync::Arc::new(
+            ScriptedBroker::default()
+                .with_orders(vec![broker_order(
+                    "ext-1",
+                    "b-ext",
+                    rekt_core::orders::OrderStatus::Filled,
+                    Some("MSFT"),
+                    Some(rekt_core::orders::Side::Buy),
+                    Some("3"),
+                )])
+                .with_fills(vec![execution(
+                    "e1",
+                    "b-ext",
+                    "MSFT",
+                    rekt_core::orders::Side::Buy,
+                    "3",
+                    "300",
+                )]),
+        );
+        let state = scripted_state(broker).await;
+        trading::reconcile(&state).await.unwrap();
+
+        use sqlx::Row;
+        let note: String = sqlx::query("SELECT note FROM orders WHERE client_order_id = 'ext-1'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap()
+            .get("note");
+        assert_eq!(note, "external", "external order must be materialized");
+        let (n, mode): (i64, String) = {
+            let row = sqlx::query(
+                "SELECT COUNT(*) AS n, COALESCE(MAX(mode),'') AS mode FROM transactions
+                 WHERE source = 'broker_fill'",
+            )
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+            (row.get("n"), row.get("mode"))
+        };
+        assert_eq!(n, 1, "the external fill must ingest exactly once");
+        assert_eq!(mode, "paper", "broker fill is segregated as paper");
+    }
+
+    #[tokio::test]
+    async fn concurrent_reconciles_ingest_each_fill_exactly_once() {
+        // A stream `Connected` event and the periodic timer can fire reconcile
+        // at once. Single-flight + execution_id dedupe must yield exactly-once.
+        let broker = std::sync::Arc::new(
+            ScriptedBroker::default()
+                .with_orders(vec![broker_order(
+                    "ext-1",
+                    "b-ext",
+                    rekt_core::orders::OrderStatus::Filled,
+                    Some("MSFT"),
+                    Some(rekt_core::orders::Side::Buy),
+                    Some("3"),
+                )])
+                .with_fills(vec![execution(
+                    "e1",
+                    "b-ext",
+                    "MSFT",
+                    rekt_core::orders::Side::Buy,
+                    "3",
+                    "300",
+                )]),
+        );
+        let state = scripted_state(broker).await;
+        let (a, b) = tokio::join!(trading::reconcile(&state), trading::reconcile(&state));
+        a.unwrap();
+        b.unwrap();
+        let fills: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fills")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        let txs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE source = 'broker_fill'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(fills, 1, "two reconciles must not double-ingest a fill");
+        assert_eq!(txs, 1);
+    }
+
     #[tokio::test]
     async fn history_endpoint_builds_equity_curve_with_benchmark() {
         let state = test_state().await;

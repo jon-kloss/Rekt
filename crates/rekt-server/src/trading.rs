@@ -57,6 +57,12 @@ pub struct TradingState {
     /// basis cache so the broadcast path never re-reads the paper log unless
     /// a fill/tx landed.
     paper_positions_cache: RwLock<(u64, serde_json::Value)>,
+    /// Single-flights reconciliation. A stream `Connected` event and the
+    /// periodic timer can both fire `reconcile` at once; every write inside is
+    /// individually idempotent (fills dedupe on execution_id, status updates
+    /// are staleness-guarded), but serializing avoids two passes racing on the
+    /// same broker snapshot and the wasted duplicate broker round-trips.
+    reconcile_lock: tokio::sync::Mutex<()>,
 }
 
 impl TradingState {
@@ -497,6 +503,8 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
     let Some(broker) = &state.broker else {
         return Ok(());
     };
+    // Serialize concurrent reconciles (Connected event + periodic timer).
+    let _reconcile_guard = state.trading.reconcile_lock.lock().await;
     let mode = broker.mode().as_str();
 
     // (1) Mass status: one HTTP call covers our orders AND externals.
