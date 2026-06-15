@@ -17,6 +17,7 @@ mod market;
 mod portfolios;
 mod repo;
 mod screener;
+mod splits;
 mod taxes;
 mod trading;
 
@@ -105,6 +106,7 @@ fn app(state: AppState) -> Router {
         .route("/api/import/csv", post(api::import_csv))
         .route("/api/history", get(history::history))
         .route("/api/candles", get(history::candles))
+        .route("/api/splits", get(splits::check))
         .route("/api/taxes", get(taxes::taxes))
         .route("/api/taxes/csv", get(taxes::taxes_csv))
         .route(
@@ -833,6 +835,57 @@ mod tests {
         let (status, json) = request(test_state().await, "GET", "/api/quote/aapl", None).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(json["error"].as_str().unwrap().contains("FINNHUB_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn splits_degrade_honestly_without_a_provider() {
+        // test_state wires no bars provider → split detection can't run, so it
+        // must report unsupported with a clear reason, not 500 or fake-empty.
+        let (status, json) =
+            request(test_state().await, "GET", "/api/splits?refresh=true", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["supported"], false);
+        assert!(json["reason"].as_str().unwrap().contains("ALPACA"));
+        assert_eq!(json["missing"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn fetch_txs_orders_by_parsed_instant_not_ts_text() {
+        // The replay engines (cost basis, wash sale) depend on (ts, id) order.
+        // Two transactions at the SAME instant but stored with different RFC3339
+        // formats: the lexicographically-LARGER 'Z' form carries the SMALLER id,
+        // so a raw `ORDER BY t.ts` TEXT sort would return them id-reversed.
+        // fetch_txs must re-sort by the parsed instant and yield [5, 10].
+        let state = test_state().await;
+        sqlx::query("INSERT INTO instruments (id, symbol) VALUES (1, 'AAA')")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        for (id, ts) in [
+            (5_i64, "2026-01-05T00:00:00Z"),
+            (10, "2026-01-05T00:00:00+00:00"),
+        ] {
+            sqlx::query(
+                "INSERT INTO transactions (id, instrument_id, kind, qty, price, ts, source, mode)
+                 VALUES (?, 1, 'buy', '1', '100', ?, 'manual', 'live')",
+            )
+            .bind(id)
+            .bind(ts)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+        let ids: Vec<i64> = repo::fetch_mode_txs(&state.db, "live")
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![5, 10],
+            "must be (instant, id) order regardless of ts text"
+        );
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@ pub mod outcomes;
 pub mod portfolio;
 pub mod screener;
 pub mod signals;
+pub mod splits;
 pub mod taxes;
 
 use chrono::{DateTime, NaiveDate, Utc};

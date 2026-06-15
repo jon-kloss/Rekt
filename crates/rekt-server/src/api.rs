@@ -256,6 +256,7 @@ pub async fn create_tx(
         .await
         .map_err(internal)?;
     state.live.bump_tx_revision();
+    crate::splits::invalidate();
     live::refresh_symbols(&state).await.map_err(internal)?;
     // A newly-held symbol needs candle history for its chart + the equity
     // curve / signals; pull it now instead of waiting for the 30-min tick.
@@ -286,6 +287,7 @@ pub async fn delete_tx(
         return Err(err(StatusCode::NOT_FOUND, format!("no transaction {id}")));
     }
     state.live.bump_tx_revision();
+    crate::splits::invalidate();
     live::refresh_symbols(&state).await.map_err(internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -468,6 +470,7 @@ pub async fn import_csv(
         .await
         .map_err(internal)?;
     state.live.bump_tx_revision();
+    crate::splits::invalidate();
     live::refresh_symbols(&state).await.map_err(internal)?;
     // Pull candle history for any newly-imported symbols now (chart, equity
     // curve, signals) rather than waiting for the next scheduler tick.
