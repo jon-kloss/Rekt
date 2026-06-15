@@ -9,6 +9,7 @@
 mod alerts;
 mod analyst;
 mod api;
+mod demo;
 mod history;
 mod import;
 mod live;
@@ -172,6 +173,7 @@ fn app(state: AppState) -> Router {
         )
         .route("/api/portfolios/switch", post(portfolios::switch))
         .route("/api/portfolios/{name}", delete(portfolios::delete))
+        .route("/api/demo/reset", post(demo::reset))
         .route("/api/ws", get(ws_upgrade))
         .with_state(state)
 }
@@ -535,6 +537,13 @@ async fn main() -> anyhow::Result<()> {
         demo,
     });
 
+    // Public demo: seed a realistic portfolio + pre-baked analyses on a fresh
+    // instance, then self-heal visitor changes on a timer. Candles refetch live.
+    if state.demo {
+        demo::seed_if_empty(&state).await?;
+        demo::spawn_reseed_task(state.clone());
+    }
+
     // Subscribe the stream to currently held symbols from the start.
     live::refresh_symbols(&state).await?;
 
@@ -774,6 +783,44 @@ mod tests {
                 "{path} should not 403 off-demo"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn demo_seed_populates_and_reseed_restores() {
+        let mut state = test_state().await;
+        state.demo = true;
+        // Fresh instance → boot-seed populates the portfolio + pre-baked AI.
+        demo::seed_if_empty(&state).await.unwrap();
+        let txs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transactions")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        let analyses: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM analyses")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert!(txs > 0, "seed should populate transactions");
+        assert!(analyses >= 4, "seed should include the pre-baked analyses");
+
+        // A visitor mutates; reseed restores the baked snapshot exactly.
+        sqlx::query("DELETE FROM transactions")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        demo::reseed(&state).await.unwrap();
+        let restored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transactions")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(restored, txs, "reseed restores the transaction count");
+
+        // seed_if_empty is a no-op once seeded (doesn't double-insert).
+        demo::seed_if_empty(&state).await.unwrap();
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transactions")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(after, txs, "seed_if_empty must not re-seed a populated db");
     }
 
     #[tokio::test]
