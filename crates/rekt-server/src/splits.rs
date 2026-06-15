@@ -49,7 +49,11 @@ pub async fn check(
         }
     }
     let body = compute(&state).await?;
-    *CACHE.lock().unwrap() = Some((Instant::now(), body.clone()));
+    // Don't cache a transient failure — otherwise one blip suppresses real
+    // warnings for the whole TTL. (A stable `supported:false`/`true` IS cached.)
+    if body.get("stale") != Some(&Value::Bool(true)) {
+        *CACHE.lock().unwrap() = Some((Instant::now(), body.clone()));
+    }
     Ok(Json(body))
 }
 
@@ -81,7 +85,7 @@ async fn compute(state: &AppState) -> Result<Value, ApiError> {
 
     let events = match bars.splits(&symbols, start, today).await {
         Ok(events) => events,
-        // A non-corporate-actions provider — degrade honestly, don't 500.
+        // A non-corporate-actions provider — split detection isn't available.
         Err(rekt_data::DataError::Unsupported(_)) => {
             return Ok(json!({
                 "supported": false,
@@ -89,7 +93,19 @@ async fn compute(state: &AppState) -> Result<Value, ApiError> {
                 "missing": [],
             }));
         }
-        Err(e) => return Err(internal(e)),
+        // A transient failure (rate limit / timeout / auth blip). Degrade
+        // honestly: report `stale` so the UI can say "couldn't check" rather
+        // than implying an all-clear with an empty list, and DON'T 500.
+        Err(e) => {
+            tracing::warn!(error = %e, "split check failed — serving stale/empty");
+            return Ok(json!({
+                "supported": true,
+                "stale": true,
+                "checked": symbols.len(),
+                "reason": "couldn't reach corporate-actions data — try again shortly",
+                "missing": [],
+            }));
+        }
     };
     let missing = detect_missing_splits(&txs, &events);
     tracing::debug!(

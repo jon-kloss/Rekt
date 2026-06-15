@@ -85,6 +85,7 @@ async fn apply_seed(state: &AppState) -> anyhow::Result<()> {
     state.live.bump_tx_revision();
     state.live.bump_alerts_revision();
     state.live.bump_watchlist_revision();
+    crate::splits::invalidate(); // the reseed rewrote the live tx log
     crate::live::refresh_symbols(state).await?;
     Ok(())
 }

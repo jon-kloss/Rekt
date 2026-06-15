@@ -190,4 +190,51 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].symbol, "NVDA");
     }
+
+    #[test]
+    fn buying_only_on_the_ex_date_is_not_flagged() {
+        // Shares bought ON the ex-date already trade post-split (adjusted price
+        // + count), so the holder isn't owed an adjustment. Pins the strict `<`.
+        let txs = vec![tx(1, TxKind::Buy, "NVDA", "100", "2024-06-10T15:00:00Z")];
+        assert!(detect_missing_splits(&txs, &[split("NVDA", "2024-06-10", "10")]).is_empty());
+    }
+
+    #[test]
+    fn held_before_plus_bought_on_ex_date_flags_with_only_the_pre_ex_count() {
+        // Held 10 before; added 100 (post-split) on the ex-date. Flagged, and
+        // shares_held counts ONLY the pre-ex position (the ex-date buy is excluded).
+        let txs = vec![
+            tx(1, TxKind::Buy, "NVDA", "10", "2024-01-10T15:00:00Z"),
+            tx(2, TxKind::Buy, "NVDA", "100", "2024-06-10T15:00:00Z"),
+        ];
+        let got = detect_missing_splits(&txs, &[split("NVDA", "2024-06-10", "10")]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].shares_held, dec("10"));
+    }
+
+    #[test]
+    fn a_position_reentered_before_the_ex_date_is_flagged() {
+        // Bought, fully sold, rebought — all before the ex-date. Net > 0 → flag.
+        let txs = vec![
+            tx(1, TxKind::Buy, "NVDA", "10", "2024-01-10T15:00:00Z"),
+            tx(2, TxKind::Sell, "NVDA", "10", "2024-02-01T15:00:00Z"),
+            tx(3, TxKind::Buy, "NVDA", "7", "2024-03-01T15:00:00Z"),
+        ];
+        let got = detect_missing_splits(&txs, &[split("NVDA", "2024-06-10", "10")]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].shares_held, dec("7"));
+    }
+
+    #[test]
+    fn an_already_recorded_earlier_split_scales_the_held_count() {
+        // A recorded 2:1 in 2023 (10→20), then a later MISSING 10:1 in 2024.
+        // The replay applies the recorded split, so shares_held reflects 20.
+        let txs = vec![
+            tx(1, TxKind::Buy, "NVDA", "10", "2023-01-10T15:00:00Z"),
+            tx(2, TxKind::Split, "NVDA", "2", "2023-07-20T15:00:00Z"),
+        ];
+        let got = detect_missing_splits(&txs, &[split("NVDA", "2024-06-10", "10")]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].shares_held, dec("20"));
+    }
 }

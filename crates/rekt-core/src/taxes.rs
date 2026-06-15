@@ -77,12 +77,21 @@ pub struct TermTotals {
 }
 
 impl TermTotals {
+    /// Accumulate a row at FILING precision: each Form 8949 row is reported to
+    /// the cent, and Schedule D is the SUM of those rounded rows — so the totals
+    /// must be `Σ round_dp(2)(row)`, not `round_dp(2)(Σ raw)`. Summing the raw
+    /// internals instead lets sub-cent per-row drift accumulate and makes the
+    /// on-screen Schedule D disagree with the filed CSV (which rounds per row).
+    /// Rounding here keeps the JSON/UI totals identical to the exported 8949.
     fn add(&mut self, row: &Form8949Row) {
-        self.proceeds += row.proceeds;
-        self.basis += row.basis;
-        self.gain += row.gain;
-        self.disallowed += row.disallowed;
-        self.reportable += row.gain + row.disallowed;
+        let proceeds = row.proceeds.round_dp(2);
+        let basis = row.basis.round_dp(2);
+        let disallowed = row.disallowed.round_dp(2);
+        self.proceeds += proceeds;
+        self.basis += basis;
+        self.gain += proceeds - basis;
+        self.disallowed += disallowed;
+        self.reportable += proceeds - basis + disallowed;
     }
 }
 
@@ -941,5 +950,42 @@ mod tests {
         );
         // ...and vanishes at filing precision: Schedule D == economic truth.
         assert_eq!(total.round_dp(2), dec("-31"));
+    }
+
+    #[test]
+    fn schedule_d_total_is_the_sum_of_filed_rows_not_the_rounded_raw_sum() {
+        // Three independent lots, each with a sub-cent ($0.004) fee → per-row
+        // raw loss of -0.004. A FILED 8949 reports each row to the cent (0.00)
+        // and Schedule D sums those → 0.00. Summing the raw internals instead
+        // gives -0.012 → rounds to -0.01, disagreeing with the filed CSV by a
+        // cent. The Schedule D total must equal Σ(rounded rows), so the on-screen
+        // figure matches what the user actually files.
+        let txs = vec![
+            Tx {
+                fees: dec("0.004"),
+                ..tx(1, TxKind::Buy, "AAA", "1", "100", "2026-01-01T15:00:00Z")
+            },
+            tx(2, TxKind::Sell, "AAA", "1", "100", "2026-02-01T15:00:00Z"),
+            Tx {
+                fees: dec("0.004"),
+                ..tx(3, TxKind::Buy, "BBB", "1", "100", "2026-01-01T15:00:00Z")
+            },
+            tx(4, TxKind::Sell, "BBB", "1", "100", "2026-02-01T15:00:00Z"),
+            Tx {
+                fees: dec("0.004"),
+                ..tx(5, TxKind::Buy, "CCC", "1", "100", "2026-01-01T15:00:00Z")
+            },
+            tx(6, TxKind::Sell, "CCC", "1", "100", "2026-02-01T15:00:00Z"),
+        ];
+        let report = tax_report(&txs, 2026).unwrap();
+        // What a preparer sums off the filed 8949 (each column rounded per row).
+        let filed: Decimal = report
+            .rows
+            .iter()
+            .map(|r| r.proceeds.round_dp(2) - r.basis.round_dp(2) + r.disallowed.round_dp(2))
+            .sum();
+        assert_eq!(report.short.reportable, filed);
+        // Filed value is 0.00 — NOT the -0.01 a raw Σ-then-round would report.
+        assert_eq!(report.short.reportable, dec("0.00"));
     }
 }

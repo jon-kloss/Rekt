@@ -267,7 +267,7 @@ impl CorporateActions {
         self.forward_splits
             .into_iter()
             .chain(self.reverse_splits)
-            .filter(|r| r.old_rate > Decimal::ZERO)
+            .filter(|r| r.old_rate > Decimal::ZERO && r.new_rate > Decimal::ZERO)
             .map(|r| SplitEvent {
                 symbol: r.symbol,
                 ex_date: r.ex_date,
