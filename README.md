@@ -6,22 +6,57 @@ A self-hosted, single-user web dashboard for **tracking and trading** a US
 stocks & ETFs portfolio in real time, with an AI analyst watching over your
 shoulder. One Rust binary, one SQLite file, your keys never leave your box.
 
-**Status: Phase 10 (hardening toward v1.0)** — tracking, paper trading, history & insight,
-alerts-to-action, the **AI analyst** (morning briefings, weekly deep
-reviews with web search, on-demand analysis over the Claude API — all
-**advisory only**: no dependency path to the broker, read-only tools,
-recommendations only prefill the guarded order ticket, every run
-cost-metered against a daily budget, and now with **outcome tracking**:
-every recommendation is scored against what the price actually did —
-direction-adjusted, so a sell call is right when the price falls — and
-the analyst sees its own track record before making new calls), and
-**taxes**: per-lot Form 8949 rows with full wash-sale treatment (IRC
-§1091, code W) — disallowed losses **carry forward into the replacement
-lot's basis** with the holding period tacked on, matching broker 1099-B
-practice — plus Schedule D totals and CSV export. Same-symbol matching
-only; reconcile with your broker's 1099-B; not tax advice. See
-[PLAN.md](PLAN.md) for the full design and roadmap, and
-[docs/RESEARCH.md](docs/RESEARCH.md) for the research behind it.
+### ▶ Live demo — **https://rekt-production-545b.up.railway.app**
+
+A fully working instance with a sample portfolio: real charts and market
+gauges, live paper trading, and pre-generated AI analyses. Trading and
+watchlists are live; the AI tabs are pre-baked (no spend); it resets to the
+sample data every few hours, or hit **↺ reset** in the banner. *(Demo keys are
+throwaway; don't enter anything real.)*
+
+![REKT dashboard](docs/img/screenshot.png)
+
+---
+
+## What it does
+
+- **📒 Tracks your real book.** Import your activity history (deposits, buys,
+  sells, dividends, splits) from Fidelity, Schwab, Robinhood, IBKR, or a generic
+  CSV; REKT replays it into positions, cost basis, realized/unrealized P&L, an
+  equity curve vs. SPY, and tax lots. Money is exact decimals, never floats.
+- **📈 Paper-trades for real.** A built-in order ticket trades a simulated Alpaca
+  paper account (market/limit, basket orders) with guardrails — per-order
+  notional cap, max position %, daily order count, and a daily-loss circuit
+  breaker. Paper fills are strictly segregated from your tracked book.
+- **🤖 An AI analyst on your shoulder — advisory only.** Morning briefings,
+  weekly deep reviews (with web search), and on-demand Q&A over your portfolio.
+  It **can never place orders**: no code path to the broker, read-only tools,
+  and recommendations only *prefill* the guarded order ticket you confirm. Every
+  recommendation is **scored against what the price actually did** (direction-
+  adjusted), and the analyst sees its own track record before making new calls.
+  Runs on the local **Claude Code CLI** by default (reuses your `claude` login —
+  no API key), the **Claude API**, or a **local Ollama model** (free, private,
+  offline).
+- **🔭 Finds ideas across the market.** A deterministic screener ranks buy/sell
+  candidates from your **named watchlists** (RSI / SMA distance / drawdown), with
+  per-equity-type **aggressiveness** (separate for stocks vs ETFs). The AI then
+  *narrates* the ranked candidates — so the picks are trustworthy math, not a
+  hallucination, and a small local model is enough. Plus **market gauges**
+  (SPY / QQQ / IWM / DIA with live RSI/trend) and a daily **state-of-market
+  brief** grounded in those gauges.
+- **🔔 Alerts that become actions.** Price-above / price-below / drawdown alerts
+  with optional push (ntfy). A triggered alert can pre-stage an order ticket for
+  one-click review — it never trades on its own.
+- **🧾 Taxes done properly.** Per-lot Form 8949 rows with full **wash-sale**
+  treatment (IRC §1091, code W): disallowed losses carry forward into the
+  replacement lot's basis with the holding period tacked on, matching broker
+  1099-B practice. Schedule D totals and CSV export. *(Same-symbol matching;
+  reconcile with your 1099-B; not tax advice.)*
+- **🗂 Multiple portfolios.** Keep a `test` book and your `real` data side by
+  side, each its own SQLite file; switch from the header.
+- **🔒 Yours, honestly.** One process, one file, keys are env-only (never logged
+  or sent to the browser). Missing data or keys produce clear errors or `None` —
+  **never fabricated values**.
 
 ## Quick start
 
@@ -29,43 +64,25 @@ only; reconcile with your broker's 1099-B; not tax advice. See
 # market data (free key from https://finnhub.io)
 export FINNHUB_API_KEY=your_key
 
-# paper trading (free account at https://alpaca.markets — paper keys only;
-# live trading is deliberately not wired up yet)
+# paper trading + daily candles (free account at https://alpaca.markets —
+# paper keys only; live trading is deliberately not wired up)
 export ALPACA_PAPER_KEY=your_key
 export ALPACA_PAPER_SECRET=your_secret
 
-# AI analyst (advisory only). Defaults to the local Claude Code CLI — it
-# reuses the `claude` you've already signed in (must be on PATH), so no API
-# key is needed. Runs tool-less by design (it can never place orders).
-# To use the HTTP API instead, set a key and opt in:
-# export ANTHROPIC_API_KEY=your_key
-# export REKT_ANALYST_BACKEND=http
+# AI analyst (advisory only). Defaults to the local Claude Code CLI — it reuses
+# the `claude` you've already signed in (must be on PATH), so no API key is
+# needed. It runs tool-less by design and can never place orders. Alternatives:
+#   export REKT_ANALYST_BACKEND=http   && export ANTHROPIC_API_KEY=your_key
+#   export REKT_ANALYST_BACKEND=ollama && ollama pull llama3.1   # free + local
 
 cargo run -p rekt-server
 # → http://127.0.0.1:7777
 ```
 
-Everything degrades honestly: without keys, the affected features answer
-with clear errors instead of pretending.
-
-Configuration (env vars): `REKT_DB` (default `rekt.db`), `REKT_LISTEN`
-(default `127.0.0.1:7777`), `FINNHUB_API_KEY`, `ALPACA_PAPER_KEY`/`_SECRET`,
-alert push: `REKT_NTFY_TOPIC` (topic on the public ntfy.sh — **the topic
-name is the only secret**: anyone who guesses it can read your trade
-alerts, so use a long random string, or better, self-host ntfy and set
-`REKT_NTFY_URL`), AI analyst: `REKT_ANALYST_BACKEND` (default `cli` — drives the local `claude`
-CLI, reusing its auth and running tool-less so it can never place orders or
-touch the filesystem; set to `http` to use the API instead),
-`ANTHROPIC_API_KEY` (required only for the `http` backend),
-`REKT_AI_DAILY_BUDGET`
-(USD/day, default 2.50 — gates new runs, reserving each run's worst-case
-output cost; a run already in flight may finish somewhat past the ceiling
-and the next run is then blocked), `REKT_AI_AUTO` (set 0 to disable the
-scheduled briefing/review), and guardrails:
-`REKT_MAX_ORDER_NOTIONAL` (default 10000), `REKT_MAX_POSITION_PCT`
-(default 25), `REKT_MAX_ORDERS_PER_DAY` (default 20),
-`REKT_MAX_DAILY_LOSS` (circuit breaker on new buys, default 1000;
-≤0 disables).
+Everything degrades honestly: without keys, the affected features answer with
+clear errors instead of pretending. Full env-var reference (guardrails, AI
+budget, alert push, ports, multiple portfolios) is in
+[docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ## Bringing over your portfolio
 
@@ -92,13 +109,19 @@ import as if they were stocks, so review the preview before confirming.
 
 ## Running it for real
 
-Deployment (systemd), reverse-proxy + TLS, the SQLite backup/restore
-procedure, monitoring via `/api/health`, the security posture, and the
-deliberate paper-only stance on live trading are all in
-[docs/OPERATIONS.md](docs/OPERATIONS.md). The short version: it's one
-binary and one SQLite file, it binds loopback with no built-in auth (front
-it with a TLS proxy to expose it), and you back it up with
+Deployment (systemd or Docker), reverse-proxy + TLS, SQLite backup/restore,
+monitoring via `/api/health`, the security posture, and the deliberate
+paper-only stance on live trading are all in
+[docs/OPERATIONS.md](docs/OPERATIONS.md). The short version: it's one binary and
+one SQLite file, it binds loopback with no built-in auth (front it with a TLS
+proxy to expose it), and you back it up with
 `sqlite3 rekt.db "VACUUM INTO 'backup.db'"` while it's live.
+
+**Host your own public demo** (like the one above) with `REKT_DEMO=1`: the AI
+analyst is forced off (pre-baked analyses, no spend), cost-bearing/destructive
+routes are blocked, and a baked sample portfolio self-heals on a timer. Deploy
+to [Railway](https://railway.app) from the included `Dockerfile` — see the
+[Public demo](docs/OPERATIONS.md#public-demo-railway) section.
 
 ## Development
 
@@ -108,17 +131,24 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+The toolchain is pinned in `rust-toolchain.toml` so local and CI match. The UI
+is a single vanilla-JS file (`crates/rekt-server/assets/index.html`) embedded
+into the binary — no build step, no framework.
+
 Workspace layout:
 
 ```
 crates/rekt-core/     domain types + pure portfolio math + guardrails (I/O-free)
 crates/rekt-data/     MarketData trait + provider impls (Finnhub, Alpaca)
 crates/rekt-broker/   Broker trait + Alpaca impl (orders, fills, account)
-crates/rekt-analyst/  Claude API client + tool loop + cost metering
+crates/rekt-analyst/  AI client (CLI / API / Ollama) + tool loop + cost metering
                       (advisory only — never depends on rekt-broker)
-crates/rekt-server/   axum API, SQLite, order manager, embedded UI
+crates/rekt-server/   axum API, SQLite, order manager, screener, embedded UI
 migrations/           sqlx migrations
 ```
+
+See [PLAN.md](PLAN.md) for the full design and roadmap, and
+[docs/RESEARCH.md](docs/RESEARCH.md) for the research behind it.
 
 ## License
 

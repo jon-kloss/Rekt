@@ -170,6 +170,7 @@ pub async fn analyze_list(
     State(state): State<AppState>,
     Path(list_id): Path<i64>,
 ) -> Result<Json<Value>, ApiError> {
+    crate::demo_guard(&state)?;
     let lists = repo::list_watchlists(&state.db).await.map_err(internal)?;
     if !lists.iter().any(|l| l.id == list_id) {
         return Err(err(

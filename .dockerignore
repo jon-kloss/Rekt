@@ -1,0 +1,17 @@
+# Keep the build context small + reproducible. The binary embeds the UI and
+# migrations at compile time, so only the Rust sources/manifests are needed.
+/target
+**/*.db
+**/*.db-shm
+**/*.db-wal
+.env
+node_modules/
+ui/dist/
+.git
+plans/
+specs/
+docs/
+scripts/
+.github/
+*.md
+.claude/

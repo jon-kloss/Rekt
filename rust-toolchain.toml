@@ -1,0 +1,7 @@
+# Pinned so local dev and CI use the exact same compiler — a floating `stable`
+# silently advances and trips new clippy lints only in CI (see the 1.96.0
+# unnecessary_sort_by failure). Bump this deliberately, run the gates, commit.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

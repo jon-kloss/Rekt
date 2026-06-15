@@ -9,6 +9,7 @@
 mod alerts;
 mod analyst;
 mod api;
+mod demo;
 mod history;
 mod import;
 mod live;
@@ -72,6 +73,25 @@ pub struct AppState {
     pub active_portfolio: String,
     /// Directory holding the portfolio registry + per-portfolio DB files.
     pub data_dir: std::path::PathBuf,
+    /// Public-demo mode (REKT_DEMO=1): the instance is shared and unauthenticated,
+    /// so cost-bearing/destructive routes are blocked (see `demo_block`) and the
+    /// DB is periodically reseeded. The UI shows a banner and relabels gated
+    /// actions. Paper trading stays live.
+    pub demo: bool,
+}
+
+/// 403 for routes disabled in the public demo (cost-bearing or destructive on a
+/// shared, unauthenticated instance). Call at the top of a gated handler:
+/// `if let Some(blocked) = state.demo_block() { return blocked; }`-style via the
+/// `ApiError` path. Returns `Err(ApiError)` so handlers can `?` it.
+pub fn demo_guard(state: &AppState) -> Result<(), api::ApiError> {
+    if state.demo {
+        return Err(api::err(
+            StatusCode::FORBIDDEN,
+            "disabled in the public demo",
+        ));
+    }
+    Ok(())
 }
 
 fn app(state: AppState) -> Router {
@@ -153,6 +173,7 @@ fn app(state: AppState) -> Router {
         )
         .route("/api/portfolios/switch", post(portfolios::switch))
         .route("/api/portfolios/{name}", delete(portfolios::delete))
+        .route("/api/demo/reset", post(demo::reset))
         .route("/api/ws", get(ws_upgrade))
         .with_state(state)
 }
@@ -189,6 +210,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "uptime_seconds": uptime_seconds(),
         "db": db_ok,
         "active_portfolio": state.active_portfolio,
+        "demo": state.demo,
         "components": {
             "market_data": match &state.market {
                 Some(provider) => provider.name(),
@@ -295,7 +317,13 @@ async fn main() -> anyhow::Result<()> {
     uptime_seconds(); // anchor the uptime clock at process start
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "REKT starting");
 
-    let listen = std::env::var("REKT_LISTEN").unwrap_or_else(|_| "127.0.0.1:7777".into());
+    // Listen address. Explicit REKT_LISTEN wins; else honour a PaaS-injected
+    // $PORT (Railway/Heroku/etc. bind 0.0.0.0:$PORT); else the local default.
+    let listen = std::env::var("REKT_LISTEN").unwrap_or_else(|_| {
+        std::env::var("PORT")
+            .map(|p| format!("0.0.0.0:{p}"))
+            .unwrap_or_else(|_| "127.0.0.1:7777".into())
+    });
 
     // Resolve the active portfolio: one SQLite file per portfolio, selected by
     // a registry outside any single DB. A switch re-execs this process, so this
@@ -384,6 +412,16 @@ async fn main() -> anyhow::Result<()> {
             }),
     };
 
+    // Public-demo mode: a shared, unauthenticated instance. Cost-bearing and
+    // destructive routes are gated (demo_guard) and the DB is periodically
+    // reseeded; the AI analyst is forced off below so no key is ever spent.
+    let demo = std::env::var("REKT_DEMO")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if demo {
+        tracing::info!("REKT_DEMO=1 — public demo mode (AI off, mutations gated + reseeded)");
+    }
+
     // AI analyst (PLAN.md §5): two backends, both advisory only.
     //   default (or REKT_ANALYST_BACKEND=cli) → drive the local Claude Code
     //     CLI (`claude -p`), reusing its auth; no ANTHROPIC_API_KEY needed.
@@ -467,6 +505,9 @@ async fn main() -> anyhow::Result<()> {
             t
         }
     };
+    // Demo: drop any resolved transport so the analyst is honestly disabled and
+    // no API key is ever used. The AI tabs render from pre-baked seed analyses.
+    let analyst = if demo { None } else { analyst };
     let ai_budget = std::env::var("REKT_AI_DAILY_BUDGET")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -493,7 +534,15 @@ async fn main() -> anyhow::Result<()> {
         analyst_running: Arc::new(AtomicBool::new(false)),
         active_portfolio,
         data_dir,
+        demo,
     });
+
+    // Public demo: seed a realistic portfolio + pre-baked analyses on a fresh
+    // instance, then self-heal visitor changes on a timer. Candles refetch live.
+    if state.demo {
+        demo::seed_if_empty(&state).await?;
+        demo::spawn_reseed_task(state.clone());
+    }
 
     // Subscribe the stream to currently held symbols from the start.
     live::refresh_symbols(&state).await?;
@@ -654,6 +703,7 @@ mod tests {
             analyst_running: Arc::new(AtomicBool::new(false)),
             active_portfolio: "real".into(),
             data_dir: std::path::PathBuf::from("."),
+            demo: false,
         }
     }
 
@@ -695,6 +745,87 @@ mod tests {
         assert_eq!(json["components"]["trading_paper"], false);
         assert_eq!(json["components"]["ai_analyst"], false);
         assert_eq!(json["components"]["alert_push"], false);
+    }
+
+    #[tokio::test]
+    async fn health_reports_demo_flag() {
+        let mut state = test_state().await;
+        state.demo = true;
+        let (status, json) = request(state, "GET", "/api/health", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["demo"], true);
+    }
+
+    #[tokio::test]
+    async fn demo_blocks_cost_bearing_and_destructive_routes() {
+        // Each gated route must 403 with the demo message; the non-demo state
+        // must NOT 403 (it fails differently — analyst disabled, etc.).
+        for (method, path, body) in [
+            ("POST", "/api/analyst/briefing", None),
+            ("POST", "/api/market/brief", None),
+            (
+                "POST",
+                "/api/trading/pause",
+                Some(serde_json::json!({"paused": true})),
+            ),
+            (
+                "POST",
+                "/api/import/csv",
+                Some(serde_json::json!("date,symbol\n")),
+            ),
+        ] {
+            let mut state = test_state().await;
+            state.demo = true;
+            let (status, json) = request(state, method, path, body.clone()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "demo should block {path}");
+            assert_eq!(json["error"], "disabled in the public demo");
+
+            // Same route off-demo is not forbidden by the demo guard.
+            let (status, _) = request(test_state().await, method, path, body).await;
+            assert_ne!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{path} should not 403 off-demo"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn demo_seed_populates_and_reseed_restores() {
+        let mut state = test_state().await;
+        state.demo = true;
+        // Fresh instance → boot-seed populates the portfolio + pre-baked AI.
+        demo::seed_if_empty(&state).await.unwrap();
+        let txs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transactions")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        let analyses: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM analyses")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert!(txs > 0, "seed should populate transactions");
+        assert!(analyses >= 4, "seed should include the pre-baked analyses");
+
+        // A visitor mutates; reseed restores the baked snapshot exactly.
+        sqlx::query("DELETE FROM transactions")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        demo::reseed(&state).await.unwrap();
+        let restored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transactions")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(restored, txs, "reseed restores the transaction count");
+
+        // seed_if_empty is a no-op once seeded (doesn't double-insert).
+        demo::seed_if_empty(&state).await.unwrap();
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transactions")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(after, txs, "seed_if_empty must not re-seed a populated db");
     }
 
     #[tokio::test]

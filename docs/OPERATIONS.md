@@ -50,6 +50,9 @@ errors or `None`, never fabricated data.
 | `REKT_MAX_POSITION_PCT` | `25` | max single-position % of equity |
 | `REKT_MAX_ORDERS_PER_DAY` | `20` | daily order count cap |
 | `REKT_MAX_DAILY_LOSS` | `1000` | circuit breaker on new buys (`≤0` disables) |
+| `REKT_DEMO` | off | `1`/`true` runs the public-demo safety mode (see Public demo) |
+| `REKT_DEMO_RESET_HOURS` | `6` | demo only: hours between automatic reseeds |
+| `PORT` | — | if set and `REKT_LISTEN` is unset, bind `0.0.0.0:$PORT` (Railway/PaaS) |
 | `RUST_LOG` | `info` | tracing filter (e.g. `rekt_server=debug,info`) |
 
 ## Multiple portfolios
@@ -90,6 +93,44 @@ but the underlying account/quota is one). Guardrail env limits are global too.
 
 **Backups:** each portfolio is an independent file — apply the backup guidance
 below per file, and back up the tiny `portfolios.json` alongside them.
+
+## Public demo (Railway)
+
+REKT is single-user with no auth, so a public URL means *everyone shares one
+process, one DB, and your keys*. **`REKT_DEMO=1`** makes that safe:
+
+- **No live AI / no spend.** Any analyst transport (and `ANTHROPIC_API_KEY`) is
+  dropped at boot — the AI tabs render from *pre-baked* analyses in the seed, and
+  the trigger routes (briefing / review / on-demand Q&A / market brief /
+  market-ideas) return
+  `403 "disabled in the public demo"`. Nothing bills.
+- **Self-healing.** A fresh instance is seeded with a realistic portfolio +
+  watchlists + alerts + the baked analyses (`crates/rekt-server/assets/demo_seed.sql`).
+  Cost-bearing / destructive routes (CSV import, portfolio create/switch/delete)
+  are blocked; **paper trading, alerts, and watchlist edits stay live** and are
+  restored by an automatic reseed every `REKT_DEMO_RESET_HOURS` (default 6h) — a
+  visitor can also hit **↺ reset** in the banner. Candles refetch live, so the
+  charts/gauges show real recent data.
+
+**Deploy:**
+1. Connect the repo on [Railway](https://railway.app) — it builds from the
+   `Dockerfile` (config in `railway.json`; healthcheck `/api/health`).
+2. Set service **Variables**: `REKT_DEMO=1`, a **dedicated** `FINNHUB_API_KEY`
+   (free tier is plenty), and dedicated `ALPACA_PAPER_KEY` / `ALPACA_PAPER_SECRET`
+   for a throwaway paper account. **Do not** set `ANTHROPIC_API_KEY` (ignored
+   anyway) or `REKT_LISTEN` (the binary binds `0.0.0.0:$PORT`, which Railway
+   injects). A volume is optional — without one, every deploy is a clean seed.
+3. Open the generated URL. The banner reads **LIVE DEMO**; the portfolio, AI
+   tabs, and gauges are populated.
+
+**Regenerating the seed** (after changing the demo portfolio or to refresh the
+analyses): `FINNHUB_API_KEY=… ./scripts/gen_demo_seed.sh` — it builds the
+portfolio via the API, backfills candles, runs the real CLI analyst, and rewrites
+`demo_seed.sql`. Commit the result.
+
+**Shared across all visitors (by design):** the paper account (one Alpaca paper
+account — visitor orders accumulate there until the account is reset on Alpaca's
+side), the Finnhub market-data quota, and the four always-on index gauges.
 
 ## Deployment (systemd)
 

@@ -313,6 +313,7 @@ pub async fn import_csv(
     Query(query): Query<ImportQuery>,
     body: String,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::demo_guard(&state)?;
     let format = query.format.as_deref().unwrap_or("generic");
     tracing::debug!(format, bytes = body.len(), "POST /api/import/csv");
     // Every input carries its 1-based line number in the ORIGINAL file so

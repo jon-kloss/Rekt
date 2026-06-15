@@ -256,6 +256,7 @@ pub async fn create(
     State(state): State<AppState>,
     Json(input): Json<NameInput>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    crate::demo_guard(&state)?;
     let name = validate_name(&input.name).map_err(|m| err(StatusCode::BAD_REQUEST, m))?;
     // Serialize registry mutations so two concurrent creates can't lose an
     // entry (load → push → save is read-modify-write).
@@ -306,6 +307,7 @@ pub async fn switch(
     State(state): State<AppState>,
     Json(input): Json<NameInput>,
 ) -> Result<Json<Value>, ApiError> {
+    crate::demo_guard(&state)?;
     let name = input.name.trim().to_string();
     let mut reg = load(&state.data_dir);
     if !reg.portfolios.iter().any(|p| p.name == name) {
@@ -371,6 +373,7 @@ pub async fn delete(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<Value>, ApiError> {
+    crate::demo_guard(&state)?;
     let name = name.trim().to_string();
     // Serialize against create/switch/other deletes (read-modify-write).
     let _guard = state.mutations.lock().await;
