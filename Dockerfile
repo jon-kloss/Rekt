@@ -2,7 +2,8 @@
 # runtime image carries only the binary + CA roots (for HTTPS to Finnhub /
 # Alpaca / Anthropic). Pinned to the same toolchain as rust-toolchain.toml.
 
-FROM rust:1.96-slim-bookworm AS builder
+# Exact patch matches rust-toolchain.toml so rustup doesn't re-download a pin.
+FROM rust:1.96.0-slim-bookworm AS builder
 WORKDIR /app
 # build-essential: the bundled SQLite (libsqlite3-sys) needs a C compiler.
 RUN apt-get update \
@@ -16,11 +17,16 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/rekt /usr/local/bin/rekt
-# Durable state lives here; mount a volume at /data to persist across deploys
-# (omit the volume and every deploy is a clean slate — fine for the demo).
+# Run unprivileged; /data is owned by that user.
+RUN useradd -r -u 10001 rekt && mkdir -p /data && chown rekt /data
+USER rekt
+# ⚠️  /data is EPHEMERAL unless you mount a volume here. The public DEMO wants
+# that (every deploy is a clean, self-healing seed). A REAL deploy MUST mount a
+# persistent volume at /data or the portfolio DB is LOST on every redeploy.
 ENV REKT_DATA_DIR=/data
-RUN mkdir -p /data
-# No REKT_LISTEN: the binary binds 0.0.0.0:$PORT when a platform injects PORT
-# (Railway/Heroku/etc.). Set REKT_DEMO=1 + the API keys as deploy env vars.
+# Default bind so a plain `docker run -p 8080:8080` is reachable; platforms that
+# inject $PORT (Railway/Heroku) override this. Set REKT_DEMO=1 + the API keys as
+# deploy env vars. (REKT_LISTEN, if set, still wins over PORT.)
+ENV PORT=8080
 EXPOSE 8080
 CMD ["rekt"]

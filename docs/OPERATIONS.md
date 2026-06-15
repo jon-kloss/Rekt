@@ -101,7 +101,8 @@ process, one DB, and your keys*. **`REKT_DEMO=1`** makes that safe:
 
 - **No live AI / no spend.** Any analyst transport (and `ANTHROPIC_API_KEY`) is
   dropped at boot — the AI tabs render from *pre-baked* analyses in the seed, and
-  the trigger routes (briefing / review / market brief / market-ideas) return
+  the trigger routes (briefing / review / on-demand Q&A / market brief /
+  market-ideas) return
   `403 "disabled in the public demo"`. Nothing bills.
 - **Self-healing.** A fresh instance is seeded with a realistic portfolio +
   watchlists + alerts + the baked analyses (`crates/rekt-server/assets/demo_seed.sql`).

@@ -5,13 +5,20 @@
 //! market feed, so the seed stays small and the charts/gauges reflect real
 //! recent data. Only ever active when `AppState.demo` is set (REKT_DEMO=1).
 
-use std::time::Duration;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
+use axum::http::StatusCode;
 use axum::{extract::State, response::Json};
 use serde_json::{json, Value};
 
 use crate::api::{self, internal, ApiError};
 use crate::AppState;
+
+/// Throttle for the visitor-triggered reset: it takes the global mutations lock
+/// and rewrites the DB, so hammering it would starve every other request.
+static LAST_RESET: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
+const RESET_COOLDOWN: Duration = Duration::from_secs(15);
 
 /// Tables the reseed CLEARS (children before parents) before re-applying the
 /// seed SQL. Deliberately excluded:
@@ -54,20 +61,26 @@ pub async fn reseed(state: &AppState) -> anyhow::Result<()> {
 }
 
 async fn apply_seed(state: &AppState) -> anyhow::Result<()> {
-    // Serialize against any concurrent mutation (validation replays the log).
+    // Serialize against any concurrent mutation (validation replays the log) —
+    // this is the only writer to the seed-owned tables, so the clear+insert
+    // can't interleave with another write.
     let _guard = state.mutations.lock().await;
-    // One atomic script: clear the owned tables (children first), then apply the
-    // seed's INSERTs. Wrapped in a transaction so a partial failure rolls back.
+    // Clear the owned tables (children first), then apply the seed's INSERTs.
+    // Run in AUTOCOMMIT (no BEGIN/COMMIT): `raw_sql` is only `Send` on the pool,
+    // which acquires a fresh connection per call — so a `BEGIN…COMMIT` script
+    // that errored mid-way would leave an open transaction (holding the WAL
+    // write lock) on a connection returned to the pool, with no way to roll it
+    // back on that same connection. Autocommit means every statement settles
+    // immediately and no transaction can ever leak. The seed is a static,
+    // generation-time-validated file, so a partial apply is effectively
+    // unreachable; if it ever happened, the next reseed (timer or ↺) clears and
+    // re-applies from scratch.
     let deletes: String = CLEAR_TABLES
         .iter()
         .map(|t| format!("DELETE FROM {t};\n"))
         .collect();
-    let script = format!("BEGIN IMMEDIATE;\n{deletes}{SEED_SQL}\nCOMMIT;\n");
-    if let Err(e) = sqlx::raw_sql(&script).execute(&state.db).await {
-        // Don't leak an open transaction onto the pooled connection.
-        let _ = sqlx::raw_sql("ROLLBACK;").execute(&state.db).await;
-        return Err(e.into());
-    }
+    let script = format!("{deletes}{SEED_SQL}");
+    sqlx::raw_sql(&script).execute(&state.db).await?;
     // Reflect the reset in the revision-gated live caches + the symbol set.
     state.live.bump_tx_revision();
     state.live.bump_alerts_revision();
@@ -96,13 +109,23 @@ pub fn spawn_reseed_task(state: AppState) {
     });
 }
 
-/// POST /api/demo/reset — visitor-triggered reseed. Demo-only (404 otherwise).
+/// POST /api/demo/reset — visitor-triggered reseed. Demo-only (404 otherwise),
+/// throttled so it can't be used to starve the mutations lock.
 pub async fn reset(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     if !state.demo {
-        return Err(api::err(
-            axum::http::StatusCode::NOT_FOUND,
-            "not a demo instance",
-        ));
+        return Err(api::err(StatusCode::NOT_FOUND, "not a demo instance"));
+    }
+    {
+        let mut last = LAST_RESET.lock().unwrap();
+        if let Some(t) = *last {
+            if t.elapsed() < RESET_COOLDOWN {
+                return Err(api::err(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "demo reset is rate-limited — try again in a few seconds",
+                ));
+            }
+        }
+        *last = Some(Instant::now());
     }
     reseed(&state).await.map_err(internal)?;
     Ok(Json(json!({ "reset": true })))

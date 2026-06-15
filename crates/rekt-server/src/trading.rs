@@ -846,6 +846,10 @@ pub async fn set_paused(
     State(state): State<AppState>,
     Json(input): Json<PauseInput>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Pausing is an operator-grade safety switch persisted to `settings`, which
+    // the demo reseed doesn't clear — so a visitor could wedge trading for
+    // everyone until restart. Block it on the public demo.
+    crate::demo_guard(&state)?;
     tracing::debug!(paused = input.paused, "POST /api/trading/pause");
     // Persist FIRST — a safety switch that doesn't survive a crash isn't one.
     repo::set_setting(

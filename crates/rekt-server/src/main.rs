@@ -765,6 +765,11 @@ mod tests {
             ("POST", "/api/market/brief", None),
             (
                 "POST",
+                "/api/trading/pause",
+                Some(serde_json::json!({"paused": true})),
+            ),
+            (
+                "POST",
                 "/api/import/csv",
                 Some(serde_json::json!("date,symbol\n")),
             ),

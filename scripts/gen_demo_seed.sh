@@ -86,7 +86,7 @@ db,out=sys.argv[1],sys.argv[2]
 c=sqlite3.connect(db); c.execute("PRAGMA busy_timeout=8000"); c.row_factory=sqlite3.Row
 # Parents before children so the seed re-applies under FK enforcement.
 # settings excluded: it only holds candle_floor:* backfill bookkeeping that must
-# track the live-refetched candles, not the seed (see demo.rs SEED_TABLES).
+# track the live-refetched candles, not the seed (see demo.rs CLEAR_TABLES).
 TABLES=["instruments","transactions","watchlists","watchlist_members",
         "alerts","analyses","recommendations"]
 def lit(v):

@@ -1363,7 +1363,7 @@ async function placeAll(){
 }
 // Actions disabled on the shared public demo (cost-bearing or destructive).
 // The server also 403s these (demo_guard); this gives an instant, clear toast.
-const DEMO_BLOCKED = new Set(['briefingRun','reviewRun','marketBrief','analyzeIdeas',
+const DEMO_BLOCKED = new Set(['briefingRun','reviewRun','marketBrief','analyzeIdeas','halt',
   'importOpen','importPreview','importConfirm','newPortfolio','delPortfolio','switchPortfolio','manageOpen']);
 async function demoReset(){
   try{ await japi('POST','/api/demo/reset'); toast('DEMO RESET — restoring sample data'); await loadAll(); }
