@@ -738,7 +738,7 @@ function perfView(){
 function analystView(){
   // A percentage off a handful of calls implies a significance it doesn't have.
   // Below a minimum sample, lead with the raw count and flag it as small.
-  const t=M.track.tested, small=t>0 && t<10;
+  const t=M.track.tested, small=t>0 && t<20; // a % off <20 calls is still mostly noise (wide CI)
   const hit = t>0 ? (small ? M.track.favorable+'/'+t : Math.round(M.track.favorable/t*100)+'%') : '—';
   const hitSub = t>0 ? (small ? 'FAVORABLE · SMALL SAMPLE' : M.track.favorable+'/'+t+' FAVORABLE') : 'NO CALLS TESTED YET';
   const backendLabel = analystBadge();
