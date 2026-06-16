@@ -18,18 +18,34 @@
     --purple:#A877E0; --gray:#6C7686;
     --scrollthumb:#1A212B; --placeholder:#4C5666; --selection:rgba(230,169,62,0.25); color-scheme:dark;
   }
-  /* Light theme — these CSS vars mirror the JS THEMES.light values so the
-     CSS-driven chrome (body, scrollbars, selection, native form controls)
-     matches the JS-rendered views. Activated via <html data-theme="light">. */
+  /* Light palette. These CSS vars MUST stay in sync with JS THEMES.light — they
+     drive the CSS-only chrome (body, scrollbars, ::selection, native controls,
+     focus ring) that the JS render path never touches. Mirrored keys: bg,
+     panel, panel2, border, hairline, grid, text, bright, body, label, faint,
+     amber, green, red, blue, purple, gray, scrollthumb, placeholder, selection.
+     Accent hues are darkened vs dark mode for AA contrast on white. */
   :root[data-theme="light"]{
     --bg:#F4F6F9; --panel:#FFFFFF; --panel2:#F0F3F7; --border:#D9DEE6; --hairline:#E7EBF1;
     --grid:#E2E7EE; --text:#2B313B; --bright:#11151B; --body:#3F4854; --label:#6B7480;
-    --faint:#9AA3B0; --amber:#B8841C; --green:#1E9E5A; --red:#D93A35; --blue:#2E7DC4;
+    --faint:#717A87; --amber:#8A6310; --green:#0F7A43; --red:#C7332F; --blue:#2A72B5;
     --purple:#8A57C9; --gray:#7A828F;
-    --scrollthumb:#C8CFD9; --placeholder:#A9B2BF; --selection:rgba(184,132,28,0.22); color-scheme:light;
+    --scrollthumb:#C8CFD9; --placeholder:#A9B2BF; --selection:rgba(138,99,16,0.20); color-scheme:light;
+  }
+  /* System-light users before JS runs (no data-theme set yet) — repeats the
+     block above so the FIRST paint is already light (no dark flash). Keep the
+     two blocks identical; an inline head script would be DRYer but the UI-syntax
+     gate only checks the first script block, so CSS is the gate-safe place. */
+  @media (prefers-color-scheme: light){
+    :root:not([data-theme]){
+      --bg:#F4F6F9; --panel:#FFFFFF; --panel2:#F0F3F7; --border:#D9DEE6; --hairline:#E7EBF1;
+      --grid:#E2E7EE; --text:#2B313B; --bright:#11151B; --body:#3F4854; --label:#6B7480;
+      --faint:#717A87; --amber:#8A6310; --green:#0F7A43; --red:#C7332F; --blue:#2A72B5;
+      --purple:#8A57C9; --gray:#7A828F;
+      --scrollthumb:#C8CFD9; --placeholder:#A9B2BF; --selection:rgba(138,99,16,0.20); color-scheme:light;
+    }
   }
   *{margin:0;padding:0;box-sizing:border-box;}
-  html,body{background:var(--bg);transition:background-color 0.2s ease;}
+  html,body{background:var(--bg);}
   body{font-family:'JetBrains Mono',ui-monospace,'SF Mono',Menlo,Consolas,monospace;color:var(--text);font-size:13px;-webkit-font-smoothing:antialiased;}
   ::selection{background:var(--selection);}
   ::-webkit-scrollbar{width:8px;height:8px;}
@@ -53,22 +69,28 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
 // Two complete palettes. Every view renders by interpolating C.* into HTML, so
 // swapping which palette C points at (then re-rendering) re-themes the whole UI.
-// THEMES.light mirrors the CSS :root[data-theme="light"] vars above so the
-// CSS-driven chrome (body/scrollbars/selection) matches the JS-rendered views.
-// Accent hues are darkened in light mode for legible contrast on white.
+// The first ~17 base keys (bg..gray) plus scrollthumb/placeholder/selection are
+// ALSO defined as CSS vars in :root above (they drive native chrome JS can't
+// reach); those two definitions must stay in sync — see the CSS comment for the
+// mirrored key list. The remaining keys (border2..teal) are JS-render-only.
+// Light accents are darkened from dark mode for AA contrast on light surfaces.
 const THEMES = {
   dark: { bg:'#06080B', panel:'#0B0E13', panel2:'#080B10', border:'#161B22', hairline:'#0F141B', grid:'#10151C',
     text:'#D2D9E2', bright:'#EDF1F7', body:'#A8B2C0', label:'#7E8898', faint:'#5C6675', amber:'#E6A93E',
     green:'#2FBF71', red:'#FF5C57', blue:'#4A9EE0', purple:'#A877E0', gray:'#6C7686',
     border2:'#1A212B', tip:'#2A323E', line:'#2C3440', gray2:'#8A93A6', gray3:'#9BA5B4',
     amBorder:'#3A2F18', blBorder:'#1B2A44', amBorder2:'#2A2517', chip:'#11161D',
-    panelGrad:'#0B1018', stageBg:'#16324A', placeBg:'#1B7A45', warnGrad:'#1B1407', warnGrad2:'#2A1A0A' },
+    panelGrad:'#0B1018', stageBg:'#16324A', placeBg:'#1B7A45', warnGrad:'#1B1407', warnGrad2:'#2A1A0A',
+    scrim:'rgba(3,5,8,0.84)', shadow:'rgba(0,0,0,0.6)', teal:'#0E9AA8' },
   light: { bg:'#F4F6F9', panel:'#FFFFFF', panel2:'#F0F3F7', border:'#D9DEE6', hairline:'#E7EBF1', grid:'#E2E7EE',
-    text:'#2B313B', bright:'#11151B', body:'#3F4854', label:'#6B7480', faint:'#9AA3B0', amber:'#B8841C',
-    green:'#1E9E5A', red:'#D93A35', blue:'#2E7DC4', purple:'#8A57C9', gray:'#7A828F',
+    text:'#2B313B', bright:'#11151B', body:'#3F4854', label:'#6B7480', faint:'#717A87', amber:'#8A6310',
+    green:'#0F7A43', red:'#C7332F', blue:'#2A72B5', purple:'#8A57C9', gray:'#7A828F',
     border2:'#C8CFD9', tip:'#C2CAD5', line:'#B8C0CC', gray2:'#6B7480', gray3:'#59616E',
     amBorder:'#E5D2A8', blBorder:'#B9D2EC', amBorder2:'#E8DBB8', chip:'#E8ECF1',
-    panelGrad:'#EEF4FB', stageBg:'#DCE9F6', placeBg:'#1E9E5A', warnGrad:'#FBF3DF', warnGrad2:'#F7EAD2' },
+    panelGrad:'#EEF4FB', stageBg:'#DCE9F6', placeBg:'#0F7A43', warnGrad:'#FBF3DF', warnGrad2:'#F7EAD2',
+    scrim:'rgba(18,26,38,0.55)', shadow:'rgba(15,23,42,0.18)', teal:'#0E8A97' },
+  // NOTE: light placeBg == light green by design (the PLACE ALL button needs a
+  // green dark enough for white text to clear AA); they diverge in dark mode.
 };
 // Active palette + its semantic shorthands. Reassigned (not mutated) by
 // applyTheme; everything reads them at render time, so a re-render re-themes.
@@ -319,7 +341,7 @@ function connect(){
 
 //================================================================ derived
 function allocSlices(){
-  const COLORS = ['#E6A93E','#2FBF71','#4A9EE0','#A877E0','#0E9AA8','#FF5C57','#7E8898'];
+  const COLORS = [C.amber, C.green, C.blue, C.purple, C.teal, C.red, C.gray2];
   const held = M.positions.filter(p=>p.value!=null && p.value>0).sort((a,b)=>b.value-a.value);
   const tot = held.reduce((a,p)=>a+p.value,0) || 1;
   return held.map((p,i)=>({ sym:p.sym, frac:p.value/tot, color:COLORS[Math.min(i,COLORS.length-1)] }));
@@ -605,7 +627,7 @@ function candleHoverTip(arr, top){
   const hc=arr[S.hoverIdx], prev=arr[S.hoverIdx-1], base=prev?prev.c:hc.o, chg=base?(hc.c/base-1)*100:0, n=arr.length;
   const left=Math.max(13,Math.min(87,(S.hoverIdx+0.5)/n*100)).toFixed(1)+'%';
   const row=(l,v,c)=>'<div style="display:flex;justify-content:space-between;gap:16px;font-size:10.5px;line-height:1.65;"><span style="color:'+C.label+';">'+l+'</span><span style="color:'+(c||C.text)+';">'+v+'</span></div>';
-  return '<div style="position:absolute;top:'+top+'px;left:'+left+';transform:translateX(-50%);pointer-events:none;z-index:6;background:'+C.bg+';border:1px solid '+C.tip+';border-radius:5px;padding:8px 10px;min-width:124px;box-shadow:0 8px 24px rgba(0,0,0,0.6);">'+
+  return '<div style="position:absolute;top:'+top+'px;left:'+left+';transform:translateX(-50%);pointer-events:none;z-index:6;background:'+C.bg+';border:1px solid '+C.tip+';border-radius:5px;padding:8px 10px;min-width:124px;box-shadow:0 8px 24px '+C.shadow+';">'+
     '<div style="font-size:10px;color:'+C.body+';margin-bottom:6px;">'+esc(hc.date)+'</div>'+row('O',money(hc.o))+row('H',money(hc.h),UP)+row('L',money(hc.l),DN)+row('C',money(hc.c))+
     '<div style="border-top:1px solid '+C.border2+';margin-top:4px;padding-top:4px;">'+row('CHG',signedPct(chg),dirColor(chg))+'</div></div>';
 }
@@ -621,7 +643,7 @@ function eqHoverTip(){
   // [8%,92%] so it never spills off the panel edge at the first/last point.
   const n=M.hist.length, fx=8+(n>1?S.eqHoverIdx/(n-1):0)*(1000-16), left=Math.max(8,Math.min(92,fx/1000*100)).toFixed(2)+'%';
   const row=(l,v,c1,c2)=>'<div style="display:flex;justify-content:space-between;gap:16px;font-size:10.5px;line-height:1.6;"><span style="color:'+c1+';">'+l+'</span><span style="color:'+(c2||C.text)+';">'+v+'</span></div>';
-  return '<div style="position:absolute;top:4px;left:'+left+';transform:translateX(-50%);pointer-events:none;z-index:6;background:'+C.bg+';border:1px solid '+C.tip+';border-radius:5px;padding:7px 10px;min-width:132px;box-shadow:0 8px 24px rgba(0,0,0,0.6);">'+
+  return '<div style="position:absolute;top:4px;left:'+left+';transform:translateX(-50%);pointer-events:none;z-index:6;background:'+C.bg+';border:1px solid '+C.tip+';border-radius:5px;padding:7px 10px;min-width:132px;box-shadow:0 8px 24px '+C.shadow+';">'+
     '<div style="font-size:10px;color:'+C.body+';margin-bottom:5px;">'+esc(hp.date||'')+'</div>'+row('EQUITY',money(hp.equity),C.amber)+row('SPY',hp.benchmark!=null?money(hp.benchmark):'—',C.gray2)+row('DEPOSITED',money(hp.net_deposited),C.gray,C.gray3)+'</div>';
 }
 
@@ -1189,7 +1211,7 @@ function importModal(){
       (rows?'<div style="margin-top:10px;font-size:9.5px;letter-spacing:0.5px;color:'+C.label+';">PREVIEW (first '+sample.length+')</div>'+rows:'')+
       '</div>';
   }
-  return '<div data-act="importClose" style="position:fixed;inset:0;z-index:60;background:rgba(3,5,8,0.84);display:flex;align-items:center;justify-content:center;padding:40px;"><div data-stopbg="1" style="background:'+C.panel+';border:1px solid '+C.border2+';border-radius:8px;padding:22px 24px;width:600px;max-width:94vw;max-height:88vh;overflow:auto;">'+
+  return '<div data-act="importClose" style="position:fixed;inset:0;z-index:60;background:'+C.scrim+';display:flex;align-items:center;justify-content:center;padding:40px;"><div data-stopbg="1" style="background:'+C.panel+';border:1px solid '+C.border2+';border-radius:8px;padding:22px 24px;width:600px;max-width:94vw;max-height:88vh;overflow:auto;">'+
     '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;"><span style="font-size:13px;letter-spacing:1px;color:'+C.amber+';">IMPORT TRANSACTIONS</span><button data-act="importClose" style="font-family:inherit;font-size:12px;color:'+C.label+';background:transparent;border:1px solid '+C.border2+';border-radius:3px;padding:4px 12px;cursor:pointer;">✕ ESC</button></div>'+
     '<div style="font-size:9.5px;letter-spacing:1px;color:'+C.label+';margin-bottom:5px;">BROKER FORMAT</div>'+
     '<select id="importfmt" style="width:100%;background:'+C.bg+';border:1px solid '+C.border+';border-radius:4px;color:'+C.bright+';font-family:inherit;font-size:13px;padding:8px 10px;outline:none;margin-bottom:12px;">'+fmtOpts+'</select>'+
@@ -1225,7 +1247,7 @@ function manageModal(){
     return '<div style="display:flex;align-items:center;gap:10px;padding:11px 0;border-top:1px solid '+C.hairline+';"><span style="font-size:13px;color:'+C.bright+';min-width:110px;">'+esc(p.name)+'</span><span style="display:flex;align-items:center;">'+badges+'</span><span style="margin-left:auto;">'+action+'</span></div>';
   }).join('');
   const warn = '<div style="margin-top:8px;font-size:10.5px;color:'+C.faint+';line-height:1.5;">Deleting a portfolio permanently removes its dataset — holdings, transactions, orders, analyses — and erases its database file. This cannot be undone. To delete the one you\'re on, switch to another with the dropdown (top-right) first.</div>';
-  return '<div data-act="manageClose" style="position:fixed;inset:0;z-index:60;background:rgba(3,5,8,0.84);display:flex;align-items:center;justify-content:center;padding:40px;"><div data-stopbg="1" style="background:'+C.panel+';border:1px solid '+C.border2+';border-radius:8px;padding:22px 24px;width:520px;max-width:94vw;max-height:88vh;overflow:auto;">'+
+  return '<div data-act="manageClose" style="position:fixed;inset:0;z-index:60;background:'+C.scrim+';display:flex;align-items:center;justify-content:center;padding:40px;"><div data-stopbg="1" style="background:'+C.panel+';border:1px solid '+C.border2+';border-radius:8px;padding:22px 24px;width:520px;max-width:94vw;max-height:88vh;overflow:auto;">'+
     '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;"><span style="font-size:13px;letter-spacing:1px;color:'+C.amber+';">MANAGE PORTFOLIOS</span><button data-act="manageClose" style="font-family:inherit;font-size:12px;color:'+C.label+';background:transparent;border:1px solid '+C.border2+';border-radius:3px;padding:4px 12px;cursor:pointer;">✕ ESC</button></div>'+
     rows + warn +
     '<div style="display:flex;justify-content:flex-end;margin-top:16px;"><button data-act="newPortfolio" style="font-family:inherit;font-size:11px;font-weight:600;color:'+UP+';background:rgba(47,191,113,0.1);border:1px solid rgba(47,191,113,0.4);border-radius:4px;padding:8px 16px;cursor:pointer;">＋ NEW PORTFOLIO</button></div>'+
@@ -1234,14 +1256,14 @@ function manageModal(){
 
 function overlays(){
   let html='';
-  if(S.switching){ html += '<div style="position:fixed;inset:0;z-index:80;background:rgba(3,5,8,0.93);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;">'+
+  if(S.switching){ html += '<div style="position:fixed;inset:0;z-index:80;background:'+C.scrim+';display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;">'+
     '<div style="font-size:15px;letter-spacing:1px;color:'+C.amber+';">SWITCHING TO '+esc((S.switching||'').toUpperCase())+'…</div>'+
     '<div style="font-size:11px;letter-spacing:0.5px;color:'+C.label+';">restarting · reconnecting</div></div>'; }
   html += importModal();
   html += manageModal();
   if(S.showHelp){
     const rows=[['Focus command bar','/'],['Stage order from command','b 10 nvda ↵'],['Set ticket side','B / S'],['Toggle order ticket','T'],['Switch view','1 – 8'],['Move position selection','↑ ↓  or  j k'],['Load selected into ticket','↵'],['Toggle this help','?'],['Clear / blur','Esc']];
-    html += '<div data-act="closeHelp" style="position:fixed;inset:0;z-index:60;background:rgba(3,5,8,0.8);display:flex;align-items:center;justify-content:center;"><div style="background:'+C.panel+';border:1px solid '+C.border2+';border-radius:8px;padding:26px 30px;width:460px;max-width:90vw;"><div style="font-size:13px;letter-spacing:1px;color:'+C.amber+';margin-bottom:18px;">KEYBOARD SHORTCUTS</div><div style="display:flex;flex-direction:column;gap:11px;font-size:12.5px;">'+
+    html += '<div data-act="closeHelp" style="position:fixed;inset:0;z-index:60;background:'+C.scrim+';display:flex;align-items:center;justify-content:center;"><div style="background:'+C.panel+';border:1px solid '+C.border2+';border-radius:8px;padding:26px 30px;width:460px;max-width:90vw;"><div style="font-size:13px;letter-spacing:1px;color:'+C.amber+';margin-bottom:18px;">KEYBOARD SHORTCUTS</div><div style="display:flex;flex-direction:column;gap:11px;font-size:12.5px;">'+
       rows.map(r=>'<div style="display:flex;justify-content:space-between;gap:16px;"><span style="color:'+C.body+';">'+esc(r[0])+'</span><span style="color:'+C.amber+';font-weight:600;">'+esc(r[1])+'</span></div>').join('')+
       '</div><div style="margin-top:20px;font-size:11px;color:'+C.faint+';">esc or click anywhere to close</div></div></div>';
   }
@@ -1251,9 +1273,9 @@ function overlays(){
     if(S.expanded==='equity'){ body=equityPanelBig(470); }
     else if(S.expanded==='candle'){ const arr=selectedCandles(); body=(arr==='loading'||arr==null)?'<div style="height:480px;display:flex;align-items:center;justify-content:center;color:'+C.faint+';">loading…</div>':'<div style="position:relative;">'+buildCandle(arr,1000,480,{hoverIdx:S.hoverIdx,markers:fillMarkers(S.selSym,arr),avg:(M.positions.find(p=>p.sym===S.selSym)||{}).avg,showVolume:true})+candleHoverTip(arr,'8')+'</div>'; }
     else { const slices=allocSlices(); body='<div style="display:flex;align-items:center;gap:44px;justify-content:center;padding:24px 0;">'+buildDonut(slices,320)+'<div style="display:flex;flex-direction:column;gap:10px;min-width:240px;">'+slices.map(d=>'<div style="display:flex;align-items:center;justify-content:space-between;font-size:14px;"><span style="display:flex;align-items:center;gap:10px;"><span style="width:10px;height:10px;background:'+d.color+';"></span>'+esc(d.sym)+'</span><span style="color:'+C.label+';">'+(d.frac*100).toFixed(1)+'%</span></div>').join('')+'</div></div>'; }
-    html += '<div data-act="closeExpand" style="position:fixed;inset:0;z-index:60;background:rgba(3,5,8,0.86);display:flex;align-items:center;justify-content:center;padding:40px;"><div data-stopbg="1" style="background:'+C.panel+';border:1px solid '+C.border2+';border-radius:8px;padding:20px 22px;width:1120px;max-width:95vw;"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;"><span style="font-size:13px;letter-spacing:1px;color:'+C.amber+';">'+esc(title)+'</span><button data-act="closeExpand" style="font-family:inherit;font-size:12px;color:'+C.label+';background:transparent;border:1px solid '+C.border2+';border-radius:3px;padding:4px 12px;cursor:pointer;">✕ ESC</button></div>'+body+'</div></div>';
+    html += '<div data-act="closeExpand" style="position:fixed;inset:0;z-index:60;background:'+C.scrim+';display:flex;align-items:center;justify-content:center;padding:40px;"><div data-stopbg="1" style="background:'+C.panel+';border:1px solid '+C.border2+';border-radius:8px;padding:20px 22px;width:1120px;max-width:95vw;"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;"><span style="font-size:13px;letter-spacing:1px;color:'+C.amber+';">'+esc(title)+'</span><button data-act="closeExpand" style="font-family:inherit;font-size:12px;color:'+C.label+';background:transparent;border:1px solid '+C.border2+';border-radius:3px;padding:4px 12px;cursor:pointer;">✕ ESC</button></div>'+body+'</div></div>';
   }
-  if(S.toast){ html += '<div style="position:fixed;bottom:40px;left:50%;transform:translateX(-50%);z-index:55;font-family:inherit;font-size:12px;color:'+C.bg+';background:'+C.amber+';border-radius:4px;padding:9px 18px;box-shadow:0 10px 36px rgba(0,0,0,0.6);">'+esc(S.toast)+'</div>'; }
+  if(S.toast){ html += '<div style="position:fixed;bottom:40px;left:50%;transform:translateX(-50%);z-index:55;font-family:inherit;font-size:12px;color:'+C.bg+';background:'+C.amber+';border-radius:4px;padding:9px 18px;box-shadow:0 10px 36px '+C.shadow+';">'+esc(S.toast)+'</div>'; }
   return html;
 }
 function equityPanelBig(H){ // same as equityPanel but bigger labels handled by panel
@@ -1306,7 +1328,7 @@ function render(){
         '<span style="font-size:11px;color:'+marketColor+';display:flex;align-items:center;gap:6px;"><span style="width:6px;height:6px;border-radius:50%;background:'+marketColor+';"></span>'+(M.market==='open'?'MKT OPEN':'MKT CLOSED')+'</span>'+
         '<span style="font-size:11px;color:'+UP+';display:flex;align-items:center;gap:6px;"><span style="width:6px;height:6px;border-radius:50%;background:'+UP+';animation:pulse 1.4s ease infinite;"></span>'+clock+'</span>'+
         (M.demo?'':'<button data-act="importOpen" title="Import transactions from CSV (Fidelity, Schwab, Robinhood, IBKR, or generic)" style="font-family:inherit;font-size:10px;letter-spacing:0.5px;color:'+C.label+';background:transparent;border:1px solid '+C.border2+';padding:5px 10px;border-radius:4px;cursor:pointer;">⬆ IMPORT</button>')+
-        '<button data-act="toggleTheme" title="Toggle light / dark theme" aria-label="Toggle light or dark theme" style="font-family:inherit;font-size:13px;line-height:1;color:'+C.label+';background:transparent;border:1px solid '+C.border2+';padding:4px 9px;border-radius:4px;cursor:pointer;">'+(S.theme==='light'?'☾':'☀')+'</button>'+
+        '<button data-act="toggleTheme" aria-pressed="'+(S.theme==='light')+'" title="Switch to '+(S.theme==='light'?'dark':'light')+' theme" aria-label="Switch to '+(S.theme==='light'?'dark':'light')+' theme" style="font-family:inherit;font-size:13px;line-height:1;color:'+C.label+';background:transparent;border:1px solid '+C.border2+';padding:4px 9px;border-radius:4px;cursor:pointer;">'+(S.theme==='light'?'☾':'☀')+'</button>'+
         '<button data-act="halt" aria-pressed="'+S.halted+'" style="font-family:inherit;font-size:10px;letter-spacing:0.5px;color:'+haltColor+';background:'+haltBg+';border:1px solid '+haltColor+';padding:5px 10px;border-radius:4px;cursor:pointer;">'+haltLabel+'</button>'+
       '</div></header>'+
     demoBanner()+
